@@ -97,9 +97,10 @@ def create_decision_notice(conn, *, pending_id, binding_id, chat_id, message_id,
 def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
                      expect=("starting", "active"), notify=True):
     """统一终止事务(contracts §5.6 绑定范围;调用方已开事务)。CAS 带旧 status,胜者才级联:
-    ① 取消该绑定的业务发送(session_turn、approval_card、receipt_reaction、未发的
+    ① 取消该绑定的业务发送(session_turn、**仍 pending 审批**的 approval_card、receipt_reaction、未发的
        decision_notice(approved_pending_files))—— **保留**已决审批的 delivered/rejected/
-       attachment_failed(以及 expired/closed_undelivered)更新;
+       attachment_failed(以及 expired/closed_undelivered)更新;审批已决(approved/rejected/expired)
+       的 card job 不在此取消,留给各自的 _guard_ok / 核验收口(R2-m3);
     ② 仍 pending 的审批 → expired(其 inbox awaiting_approval → expired)+ decision_notice(expired);
     ③ approved ∧ inbox.materializing → inbox undeliverable + decision_notice(closed_undelivered);
     ④ deliveries enqueued → dropped;pending_bind 终态化;lifecycle_notice(close);
@@ -117,7 +118,10 @@ def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
 
     # ① 取消业务发送(pending/unknown;终态不动;已决审批的决策更新不动)。
     #    unknown 的取消要留痕 error='unbind-while-unknown':该消息**可能已送达**,status 据此显示。
-    scope = ("kind IN ('session_turn','receipt_reaction','approval_card') "
+    #    approval_card 只限其审批**仍 pending**(§5.6;在 ② 把它们 expired 之前判定),已决审批的 card 交给守卫。
+    scope = ("kind IN ('session_turn','receipt_reaction') "
+             "OR (kind='approval_card' AND EXISTS (SELECT 1 FROM pendings p "
+             "    WHERE p.pending_id=outbound_jobs.ref_pending_id AND p.state='pending')) "
              "OR (kind='decision_notice' AND expected_state='approved_pending_files')")
     conn.execute(
         "UPDATE outbound_jobs SET state='cancelled', error='unbind-while-unknown' "

@@ -190,6 +190,27 @@ class TestTerminate:
         new = env.conn.execute("SELECT state FROM outbound_jobs WHERE job_seq>?", (seq_before,)).fetchall()
         assert new and all(r["state"] == "pending" for r in new)
 
+    def test_terminate_cancels_only_cards_of_still_pending_approvals(self, env):
+        """R2-m3(§5.6 ①):终止只取消「仍 pending 审批」的 approval_card;审批已决(approved / rejected)
+        但 card job 仍 pending / unknown 的,留给各自的 _guard_ok / 核验收口,不在终止事务里一刀切。"""
+        bid = env.make_binding(status="active")
+        now = env.clock.wall_ms()
+        make_pending_message(env, bid, "pend.1", "awaiting_approval")                     # 审批仍 pending
+        make_pending_message(env, bid, "appr.1", "enqueued", pending_state="approved")     # 审批已批,card 未发
+        make_pending_message(env, bid, "rej.1", "rejected", pending_state="rejected")      # 审批已拒,card unknown
+        for pid, state in (("p_pend.1", "pending"), ("p_appr.1", "pending"), ("p_rej.1", "unknown")):
+            jobs.create_job(env.conn, kind="approval_card", chat_id=CHAT, binding_id=bid,
+                            idempotency_key="card:%s" % pid, ref_pending_id=pid, now=now)
+            if state != "pending":
+                env.conn.execute("UPDATE outbound_jobs SET state=?, had_unknown=1 WHERE idempotency_key=?",
+                                 (state, "card:%s" % pid))
+        assert lifecycle.terminate_binding(env.conn, bid, "user_unbind", env.clock)
+        st = {r["idempotency_key"]: (r["state"], r["error"]) for r in env.jobs("approval_card")}
+        assert st == {"card:p_pend.1": ("cancelled", "binding-terminated"),
+                      "card:p_appr.1": ("pending", None), "card:p_rej.1": ("unknown", None)}
+        assert env.conn.execute("SELECT state FROM pendings WHERE pending_id='p_pend.1'").fetchone()[0] == "expired"
+        assert env.conn.execute("SELECT state FROM pendings WHERE pending_id='p_appr.1'").fetchone()[0] == "approved"
+
     def test_terminate_cas_single_winner(self, env):
         bid = env.make_binding(status="active")
         assert lifecycle.terminate_binding(env.conn, bid, "user_unbind", env.clock)
