@@ -158,22 +158,11 @@ def skipped_of(plan):
             for e in plan if e["skip"] is not None]
 
 
-_NEW_STYLE_RE = re.compile(r"^f\d{2}-")
-
-
 def _lookup_published(entry, by_name, claimed):
-    """按 dest_name 反查已发布路径。旧命名回落(R2-m1 → R3-m1 收紧):**只在目录里完全没有新式名
-    (`fNN-…`)时**才回落,且只认净化后的原名精确匹配;不猜 `<n>-原名` 之类的旧去重形态(旧实现的序号
-    规则与本函数无法可靠对齐,猜错会把别的附件内容错配给当前条目)。有歧义 → None(payload 记 no_url,
-    media_paths 仍保留真实路径)。每个路径只认领一次。"""
+    """按 dest_name(`fNN-<id>-<name>`)精确反查已发布路径;每个路径只认领一次。
+    R4-m1:不再做任何旧命名回落 —— 数据目录是全新的(`~/.claude/data/slack-bridge`),不存在 R1-M7 之前
+    的旧式目录;任何启发式回落都会在原名碰巧像新式名时错配别的附件。找不到 → None(payload 记 no_url)。"""
     p = by_name.get(entry["dest_name"])
-    if p is not None and p not in claimed:
-        claimed.add(p)
-        return p
-    if any(_NEW_STYLE_RE.match(n) for n in by_name):
-        return None                      # 混合目录:新式名缺席就是缺席,绝不回落到别人的旧名
-    legacy = _safe_name(entry["name"], entry["index"])
-    p = by_name.get(legacy)
     if p is not None and p not in claimed:
         claimed.add(p)
         return p
@@ -181,8 +170,8 @@ def _lookup_published(entry, by_name, claimed):
 
 
 def describe_files(files, paths):
-    """payload `files[]`(contracts §4.3):可下载条目 → local_path(按 dest_name 反查 paths;新名缺席时
-    回落旧命名,见 `_lookup_published`),其余 → skipped_reason。paths 里找不到对应文件 → 保守按 no_url
+    """payload `files[]`(contracts §4.3):可下载条目 → local_path(按 dest_name 精确反查 paths),
+    其余 → skipped_reason。paths 里找不到对应文件 → 保守按 no_url
     记为 skipped(payload 只引用确实存在于发布目录里的路径)。"""
     by_name = {}
     for p in paths or []:

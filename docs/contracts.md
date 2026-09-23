@@ -430,3 +430,4 @@ ListenerCore(...) / InstanceFollower(...)                          # 不变
 | R3-M5 | `bin/slack_consumer.py::_SdkLogHandler.emit` 先对完整消息 `redact_secrets` 再单行化/截断(先截断会留下跨边界的 token 残片);守卫 `tests/test_secrets.py::TestSdkHandlerBoundary`。 |
 | R3-m1 | `lib/media.py::_lookup_published` 旧命名回落收紧:只在目录里**完全没有**新式名(`fNN-…`)时按净化原名精确回落;不猜 `<n>-原名` 旧去重序号;混合目录里新名缺席即 `no_url`(避免把别的附件的旧文件错配给当前条目)。 |
 | R3-m2 | `bin/daemon.py::refresh_secrets_if_rotated` 只有 `load_tokens` 成功后才提交 `seen["version"]`,读失败下一轮继续重试;守卫 `tests/test_daemon_plumbing.py::TestDaemonAssembly::test_secrets_refresh_retries_after_read_failure`。 |
+| R4-m1 | `lib/media.py::_lookup_published` **删除全部旧命名回落**(R2-m1/R3-m1 的启发式在原名碰巧像新式名时会错配);只认 `fNN-<id>-<name>` 精确匹配。理由:数据目录全新,不存在旧式目录;守卫 `tests/test_media.py::TestFilePlan::test_describe_files_matches_only_exact_new_style_names`。 |
