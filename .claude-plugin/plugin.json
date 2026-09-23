@@ -1,7 +1,7 @@
 {
-  "name": "feishu-bridge",
-  "version": "1.6.1",
-  "description": "把本地 Claude Code session 与飞书群一一绑定的 build-in-public 桥:群内 @bot 消息投递进 session,每轮最终输出自动转发回群;owner 消息直投,其他成员消息由 owner 点卡片审批。仅管群聊(chat_type=group),DM 桥另见 feishu-chat。",
+  "name": "slack-bridge",
+  "version": "0.1.0",
+  "description": "把本地 Claude Code session 与一个 Slack 会话(频道或 owner DM)一一绑定的 build-in-public 桥:频道内 @bot 的消息投递进 session,每轮最终输出自动转发回去;owner 消息直投,其他成员消息由 owner 点按钮审批。daemon 单点持 Socket Mode 连接,按绑定路由。",
   "author": {
     "name": "Yilun Zhang"
   }

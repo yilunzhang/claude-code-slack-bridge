@@ -2,7 +2,7 @@
   {
     "name": "listener",
     "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/listener.py\"",
-    "description": "feishu-bridge listener",
-    "when": "on-skill-invoke:feishu-bridge:bridge"
+    "description": "slack-bridge listener",
+    "when": "on-skill-invoke:slack-bridge:bridge"
   }
 ]

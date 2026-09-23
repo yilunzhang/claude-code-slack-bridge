@@ -1,19 +1,19 @@
 {
-  "name": "feishu-bridge",
-  "description": "Single-plugin marketplace for feishu-bridge: bind a local Claude Code session to a Feishu/Lark group (build-in-public bridge).",
+  "name": "slack-bridge",
+  "description": "Single-plugin marketplace for slack-bridge: bind a local Claude Code session to a Slack channel or owner DM (build-in-public bridge).",
   "owner": {
     "name": "Yilun Zhang",
     "url": "https://github.com/yilunzhang"
   },
   "plugins": [
     {
-      "name": "feishu-bridge",
-      "description": "把本地 Claude Code session 与飞书群一一绑定的 build-in-public 桥:群内 @bot 消息投递进 session,每轮最终输出自动转发回群;owner 消息直投,其他成员消息由 owner 点卡片审批。仅管群聊(chat_type=group)。",
+      "name": "slack-bridge",
+      "description": "把本地 Claude Code session 与一个 Slack 会话(频道或 owner DM)一一绑定的 build-in-public 桥:频道内 @bot 的消息投递进 session,每轮最终输出自动转发回去;owner 消息直投,其他成员消息由 owner 点按钮审批。",
       "source": "./",
-      "version": "1.6.1",
+      "version": "0.1.0",
       "category": "productivity",
-      "tags": ["feishu", "lark", "bridge", "build-in-public", "messaging"],
-      "homepage": "https://github.com/yilunzhang/claude-code-feishu-bridge",
+      "tags": ["slack", "bridge", "build-in-public", "messaging"],
+      "homepage": "https://github.com/yilunzhang/claude-code-slack-bridge",
       "license": "MIT"
     }
   ]

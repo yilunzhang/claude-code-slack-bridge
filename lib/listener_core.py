@@ -106,7 +106,7 @@ class ListenerCore:
             try:
                 payload = util.jdumps(self._compose_line(d))
             except Exception:
-                payload = util.jdumps({"type": "feishu_message",
+                payload = util.jdumps({"type": "slack_message",
                                        "delivery_seq": d["delivery_seq"],
                                        "message_id": d["message_id"]})
             self.printer(payload)  # 提交后才 print;print 崩溃 → 保持 leased(至多重复不丢)
@@ -143,7 +143,7 @@ class ListenerCore:
             payload = json.loads(d["payload_json"] or "{}")
         except ValueError:
             payload = {}
-        line = {"type": "feishu_message", "delivery_seq": d["delivery_seq"]}
+        line = {"type": "slack_message", "delivery_seq": d["delivery_seq"]}
         line.update(payload)
         line.setdefault("message_id", d["message_id"])
         return line

@@ -1,140 +1,238 @@
-"""feishu-bridge 常量(plan v7)。时间单位一律 ms,除非后缀 _S。"""
+"""slack-bridge 常量(plan 2026-09-23 R6 收敛版)。时间单位一律 ms,除非后缀 _S。
+
+命名纪律:
+- 本文件是 WP1–WP4 并行实现共享的**名字预声明**(plan「并行前提」),值可在各 WP 微调,名字不改。
+- 标注 `# LEGACY-FEISHU: remove in WP5` 的名字只为让旧模块 / 旧测试仍可导入,WP5 一并删除。
+"""
 import re
 
-# 出站 chunk 阈值(S9:20k CJK 单条 OK,阈值取 12000 字符)
-CHUNK_LIMIT = 12000
+# ======================================================================
+# 出站 chunk / 页脚
+# ======================================================================
+CHUNK_LIMIT = 12000              # 单条 chat.postMessage 正文上限(字符;Slack 硬限 40000,取保守值)
+FOOTER_RESERVE = 256             # util.chunk_text_with_footer 为页脚预留的上限参考(页脚 > 此值仍按实际长度算)
 
-# bind 握手 TTL(plan 4.1.4)
-PENDING_BIND_TTL_MS = 10 * 60 * 1000
+# ======================================================================
+# bind / 审批 / listener / daemon 节奏(继承 feishu-bridge plan v7)
+# ======================================================================
+PENDING_BIND_TTL_MS = 10 * 60 * 1000          # bind 握手 TTL
+PENDING_TTL_MS = 6 * 3600 * 1000              # member 审批 pending TTL(单条审批范围,recovery._expire_pendings)
 
-# member 审批 pending TTL(plan 未定数值;v1 取 6h)
-PENDING_TTL_MS = 6 * 3600 * 1000
-
-# listener 心跳节奏与新鲜度
 LISTENER_TICK_S = 2.0
 HEARTBEAT_FRESH_MS = 6_000       # "新鲜心跳"判定(激活门 / 多余副本判定)
 HEARTBEAT_GRACE_MS = 15_000      # 判死:心跳陈旧超此值进入 suspect
 SUSPECT_CONFIRM_MS = 15_000      # suspect 持续超此值才判死(两阶段)
 DAEMON_GAP_MS = 10_000           # daemon 循环间隔异常 gap 阈值(睡眠恢复检测)
 SUSPECT_WINDOW_MS = 30_000       # gap 后的宽限窗:暂停 listener 判死
+ACTIVATION_TIMEOUT_MS = 30_000   # confirmed starting 激活超时
+LEASE_MS = 30_000                # deliveries 租约
 
-# confirmed starting 激活超时(plan 4.1.6:超 30s 无新鲜心跳 → listener_never_ready)
-ACTIVATION_TIMEOUT_MS = 30_000
+RECOVERY_INTERVAL_MS = 60_000
+DEATH_SCAN_INTERVAL_MS = 5_000
+CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000
 
-# deliveries 租约
-LEASE_MS = 30_000
-
-# 入站快照/物化的有限重试(时间上限,由恢复工人驱动)
-RESOLVE_DEADLINE_MS = 10 * 60 * 1000
-MATERIALIZE_DEADLINE_MS = 10 * 60 * 1000
-
-# member 全链限速配额(plan 4.2.7 / §5)
+# member 全链限速配额
 MAX_UNDECIDED_PER_CHAT = 5
 SENDER_COOLDOWN_MS = 30_000
 NOTICE_COOLDOWN_MS = 60_000      # 未绑定/已关闭 chat 的提示回复冷却(per chat)
 INBOX_NONTERMINAL_CAP = 500      # 非终态 inbox 总量配额(非 owner 消息受限)
 
 # media
-MEDIA_MSG_QUOTA_BYTES = 100 * 1024 * 1024   # 单 message 物化配额
+MEDIA_MSG_QUOTA_BYTES = 100 * 1024 * 1024   # 单 message 物化配额(全部文件之和)
+MEDIA_FILE_MAX_BYTES = MEDIA_MSG_QUOTA_BYTES  # download_worker `max_bytes` 缺省
+DOWNLOAD_DEADLINE_S = 90         # 单文件下载**绝对**截止(父进程持有;worker 收到的是剩余秒数)
+MEDIA_RETRY_DEADLINE_MS = 10 * 60 * 1000     # materializing 预算:首次实际尝试起 10 分钟
+MEDIA_RETRY_BACKOFF_MS = 10_000              # 瞬态失败退避基数(min(10s·2^n, 5min))
+MEDIA_RETRY_BACKOFF_MAX_MS = 5 * 60 * 1000
+MATERIALIZE_REASONS = ("owner", "allowlist", "approved")
 
 # retention(终态行正文裁剪 / 终态 media TTL)
 RETENTION_MS = 7 * 24 * 3600 * 1000
+SLACK_EVENTS_RETENTION_MS = 24 * 3600 * 1000            # slack_events.consumed 保留 1 天
+SLACK_EVENTS_QUARANTINE_RETENTION_MS = 30 * 24 * 3600 * 1000  # quarantined 保留 30 天(status 高亮)
 
-# 出站
-SEND_TIMEOUT_S = 30
-MGET_TIMEOUT_S = 30
-DOWNLOAD_TIMEOUT_S = 120
-UNKNOWN_RETRY_DELAY_MS = 15_000
-MAX_SEND_ATTEMPTS = 2            # 首发 + unknown 同 key 自动重试一次(非 retryable / 非 session_turn)
-OUTBOUND_BATCH = 20
-# session_turn retryable 硬化(2026-07-18 事故根因修复):飞书后端 503/网络抖动窗可持续
-# 数分钟,而旧 15s 窗太薄 → 转发被静默丢弃 + 队头阻塞整群。发送带 idempotency-key(服务端
-# 去重)→ 可安全持久重试。仅 session_turn 生效;命名对齐 CARD_REARM_*;退避公式镜像 recovery.py。
-TURN_RETRYABLE_MAX_ATTEMPTS = 6       # 含首发;retryable session_turn 尝试上限(~2.4min 总窗)
-TURN_RETRY_BACKOFF_MS = 8_000         # 指数退避基数
-TURN_RETRY_BACKOFF_MAX_MS = 45_000    # 退避封顶
+# ======================================================================
+# 传输 / 出站(Slack)
+# ======================================================================
+SLACK_API_BASE = "https://slack.com/api/"
+SEND_TIMEOUT_S = 15              # SlackClient.call 缺省超时(连接+读)
+SOCKET_OP_TIMEOUT_S = 10         # consumer 内 Socket Mode / DB 操作超时
+CONSUMER_DB_BUSY_MS = 1_500      # consumer 每线程 connect_short(busy_ms);锁超时 → 不 ack
+CONSUMER_DISCONNECT_EXIT_S = 120 # consumer 看门狗:断连超此秒数 → exit 0(由 ConsumerManager 重拉)
+POST_MIN_INTERVAL_MS = 1_000     # postMessage 类每频道节流
 
-# daemon 节奏
-RECOVERY_INTERVAL_MS = 60_000
-DEATH_SCAN_INTERVAL_MS = 5_000
-CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000
+# 结果分类 → 时序
+VERIFY_SCHEDULE_MS = (5_000, 20_000, 60_000)  # unknown 后核验档位:首次 +5s;absent n=1 → +20s;n=2 → +60s
+VERIFY_LOOKBACK_MS = 60_000      # 核验查询 oldest = sending_at - 60s
+VERIFY_PAGE_LIMIT = 100
+VERIFY_MAX_PAGES = 3
+VERIFY_ERROR_CAP = 8             # 核验出错次数上限 → unconfirmed
+VERIFY_ERROR_BACKOFF_MS = 5_000  # 核验出错退避 min(5s·2^ve, 60s)
+VERIFY_ERROR_BACKOFF_MAX_MS = 60_000
+VERIFY_DEADLINE_MS = 600_000     # 距本轮 sending_at 超 10 分钟仍 unknown → unconfirmed
+VERIFY_ABSENT_RESEND_AT = 3      # 第三次**成功查询**未见才获得重发资格
+RESEND_ONCE = True               # 能力确证后最多自动重发一次
+RATELIMIT_CAP = 20               # ratelimit_count 上限 → had_unknown ? unconfirmed : failed
+TRANSIENT_CAP = 5                # transient_count(not_sent)上限 → 同上
+TRANSIENT_BACKOFF_MS = 5_000     # not_sent 退避 min(5s·2^tc, 45s)
+TRANSIENT_BACKOFF_MAX_MS = 45_000
+IDEMPOTENT_RETRY_DELAY_MS = 15_000  # 幂等类 unknown → 直接重发的延迟
 
-# bind marker
-MARKER_PREFIX = "[feishu-bridge-bind:"
+# attempt cap(_prepare 事务内检查;postMessage 类到 cap 只核验不发送,幂等类到 cap → failed)
+TURN_CAP = 6                     # session_turn
+CARD_CAP = 3                     # approval_card
+NOTICE_CAP = 3                   # lifecycle/inbound/unsupported/decision_notice(postMessage 形态)
+IDEMPOTENT_CAP = 3               # chat.update / reactions.add
 
-# 日志
-LOG_MAX_BYTES = 5 * 1024 * 1024
+# 传输形态分类(op_method 决定类别;decision_notice 二选一由 op_for 决定)
+POSTMESSAGE_METHODS = ("chat.postMessage",)
+IDEMPOTENT_METHODS = ("chat.update", "reactions.add")
+METADATA_EVENT_TYPE = "slack_bridge"          # metadata.event_type;event_payload = {"job_id": …}
+RECEIPT_REACTION = "eyes"                     # 👀
+PAYLOAD_KINDS = ("markdown_text", "text", "blocks", "reaction")
+MARKDOWN_MODE_DEFAULT = "markdown_text"       # cfg.markdown_mode ∈ {"markdown_text","text"};probe 写入
+MARKDOWN_REJECTED_ERROR = "markdown_rejected" # not_sent 子类:markdown_text 被 invalid_arguments 明确拒绝
 
-# busy_timeout(有界;I5)
-BUSY_TIMEOUT_DAEMON_MS = 5_000
-BUSY_TIMEOUT_HOOK_MS = 3_000
-# minor③:SessionEnd 关绑定 best-effort(daemon cc_gone 兜底)→ 更短等锁,锁竞争时快速让路。
-BUSY_TIMEOUT_SESSION_END_MS = 1_500
-# minor②:可观测计数(hook_drop_count)用极短等锁 —— 拿不到就算了,绝不叠加拖住 CC 退出。
-BUSY_TIMEOUT_OBS_MS = 300
-BUSY_TIMEOUT_LISTENER_MS = 3_000
+OUTBOUND_TERMINAL_STATES = ("sent", "failed", "cancelled", "unconfirmed")
 
-SCHEMA_VERSION = "1"
+# Slack 错误字符串分类表(其余一切 → unknown;见 slackapi.classify_send_error)
+PERMANENT_SEND_ERRORS = frozenset({
+    "channel_not_found", "not_in_channel", "is_archived", "msg_too_long", "no_text",
+    "invalid_blocks", "invalid_blocks_format", "invalid_arguments",  # invalid_arguments ∧ markdown_text → markdown_rejected(优先)
+    "invalid_metadata_format", "invalid_metadata_schema", "metadata_too_large",
+    "no_permission", "missing_scope", "ekm_access_denied", "restricted_action",
+    "restricted_action_read_only_channel", "restricted_action_thread_only_channel",
+    "restricted_action_non_threadable_channel", "team_access_not_granted", "user_is_bot",
+    "cant_update_message", "message_not_found", "edit_window_closed", "thread_not_found",
+    "too_many_reactions", "invalid_name", "bad_timestamp", "too_many_attachments",
+    "duplicate_channel_not_found", "duplicate_message_not_found",
+})
+# 请求已抵达 Slack 但结果不确定(服务端内部错)→ unknown(只核验)
+AMBIGUOUS_SEND_ERRORS = frozenset({
+    "internal_error", "fatal_error", "service_unavailable", "request_timeout",
+})
+# 请求在消息创建之前就被拒(鉴权族)= 肯定未发送 → not_sent(transient_count;门由 FingerprintGate 收)
+NOT_SENT_ERRORS = frozenset({
+    "not_authed", "invalid_auth", "account_inactive", "token_revoked", "token_expired",
+    "two_factor_setup_required", "org_login_required",
+})
+# 幂等类的"已达成"错误:reactions.add already_reacted = sent
+ALREADY_DONE_ERRORS = frozenset({"already_reacted"})
 
-# inbox 终态集合(禁 TTL 删 media 的判定等)
+# ======================================================================
+# 入站(events_api)
+# ======================================================================
+# message.subtype 允许集(None = 普通消息)。其余(message_changed/message_deleted/bot_message/
+# channel_join/…)一律 dropped。
+ACCEPT_SUBTYPES = frozenset({None, "file_share", "thread_broadcast"})
+EVENT_TYPES_ACCEPTED = ("message", "app_mention")
+# 附件下载主机白名单(download_worker:https ∧ (host ∈ FILE_HOSTS ∨ host.endswith(FILE_HOST_SUFFIXES)))
+FILE_HOSTS = frozenset({"files.slack.com"})
+FILE_HOST_SUFFIXES = (".slack.com",)
+FILE_SKIP_REASONS = ("hidden_by_limit", "tombstone", "check_file_info", "no_url", "too_large")
+
+# 白名单直投时 payload 的 approved_by 值。**不留 None** —— None 是 owner 本人的语义。
+APPROVED_BY_ALLOWLIST = "allowlist"
+
+# inbox 状态集合(schema.sql CHECK 同源)
 INBOX_TERMINAL_STATES = (
     "ignored_not_mentioned", "unsupported", "rejected", "expired", "enqueued",
     "undeliverable", "failed", "unbound", "session_closed",
 )
 INBOX_NONTERMINAL_STATES = (
-    "received", "resolving", "waiting_binding", "awaiting_approval",
-    "approved_materializing",
+    "received", "resolving", "waiting_binding", "awaiting_approval", "materializing",
 )
 
-# close_reason → inbound_notice 终态映射(§3/4.2.4/4.8;r7-①:bind_timeout→unbound;
-# bind_superseded=同实例 rebind 自愈关闭旧 starting,归"未绑定"类)
+# close_reason → inbound_notice 终态映射
 UNBOUND_CLOSE_REASONS = ("user_unbind", "bind_failed", "bind_timeout", "bind_superseded")
 SESSION_CLOSED_REASONS = ("cc_gone", "session_end", "listener_gone", "listener_never_ready")
 
-# 出站错误分类表(修复项4;集合可维护:权限/成员关系/能力/目标不存在=永久→failed,
-# 频控/令牌自刷类=瞬态→unknown(同 key 自动重试仍≤1 次);未知 code→unknown 留人工)
-PERMANENT_SEND_CODES = frozenset({
-    230002,    # bot/user 不在群(成员关系)
-    230013,    # bot 能力未启用
-    99991672,  # app 缺权限 scope
-    230099,    # 回复目标消息不存在/已撤回
-    99992402,  # field validation failed(参数校验;E4 真机实锤,含幂等键超长)
-})
-TRANSIENT_SEND_CODES = frozenset({
-    230020,    # 请求频控
-    99991661,  # tenant access token 失效(CLI 自刷新)
-    99991663,  # app access token 失效(CLI 自刷新)
-})
+# ======================================================================
+# 交互(block_actions)/ 审批
+# ======================================================================
+ACTION_APPROVE = "sb_approve"
+ACTION_REJECT = "sb_reject"
+ACTION_IDS = (ACTION_APPROVE, ACTION_REJECT)
+CARD_PREVIEW_LIMIT = 2900        # section plain_text ≤ 3000,留余量
+CARD_VALUE_MAX_BYTES = 2000      # button.value 上限(Slack 硬限 2000)
+DECISION_OUTCOMES = ("delivered", "approved_pending_files", "rejected", "expired",
+                     "attachment_failed", "closed_undelivered")
 
-# session_turn 持久重试的**无显式字段回退**允许集:仅当 lark-cli 未给出 error.retryable 时才用。
-# 只放官方明确可重试且值得持久退避的(频控);**故意不含 99991661/99991663 token 类** —— 官方
-# 契约标其不可重试(见 notify 契约),放进来会把认证失败当瞬态刷 6 次 + 误导告警(codex MAJOR-2)。
-# 有显式 error.retryable 时该字段优先,本集不参与(见 Outbound._is_retryable)。
-RETRYABLE_FALLBACK_CODES = frozenset({
-    230020,    # 请求频控
-})
+# ======================================================================
+# consumer / drain / followup(daemon_core)
+# ======================================================================
+SOCKET_KEY = "socket"                          # 单一 consumer key(替代 feishu 的两个事件 key)
+CONSUMER_READY_SENTINEL = "[socket] ready"     # consumer stderr 就绪哨兵(后跟 num_connections=N)
+CONSUMER_RC_OK = 0                             # EOF / SIGTERM
+CONSUMER_RC_TOKENS = 2                         # tokens.json 缺失/不可读/无 app_token
+CONSUMER_RC_AUTH = 3                           # 致命鉴权(invalid_auth 等)
+CONSUMER_RC_NO_SDK = 4                         # 缺 slack_sdk
+CONSUMER_RC_OTHER = 5
+CONSUMER_SKIP_BACKOFF_RCS = (CONSUMER_RC_AUTH, CONSUMER_RC_NO_SDK)  # _mark_exited 直接最大退避
 
-# approval_card 重臂(修复项3):failed → pending 退避重臂,总尝试上限
-CARD_REARM_MAX_ATTEMPTS = 5
-CARD_REARM_BACKOFF_MS = 30_000
-CARD_REARM_BACKOFF_MAX_MS = 10 * 60 * 1000
+DRAIN_BATCH = 50                 # 每 tick 取 staged ∧ next_drain_at 到期 的行数上限
+DRAIN_MAX_ATTEMPTS = 5           # drain_attempts ≥ 此值 → quarantined
+DRAIN_BACKOFF_MS = 2_000         # 业务抛异常退避 min(2s·2^n, 60s)
+DRAIN_BACKOFF_MAX_MS = 60_000
+FOLLOWUP_BUDGET_PER_TICK = (1, 5)   # (带下载的物化 ≤1 条, 纯文本 ≤5 条)每 tick
+FOLLOWUP_BUDGET_DOWNLOAD = FOLLOWUP_BUDGET_PER_TICK[0]
+FOLLOWUP_BUDGET_TEXT = FOLLOWUP_BUDGET_PER_TICK[1]
 
-# 版本漂移自愈的自检群(v1.5.0)。**硬编码常量,不做成配置项**:个人部署就一个靶子群,
-# 加 config key 是过度设计(codex plan r1 CUT)。**绝不回退到工作群** —— 那会在日常群里留下
-# "发了又撤回"的痕迹。自检消息留在此群即可(已有纪律:e2e 测试消息无需善后)。
-SELFCHECK_CHAT_ID = "oc_ef148370df62f0a61e113731c6c50eb3"   # feishu-bridge e2e 测试群(勿动)
+# download_worker 退出码(contracts §6)
+WORKER_RC_OK = 0
+WORKER_RC_ARGS = 2               # 参数错(永久)
+WORKER_RC_PERMANENT = 3          # 非 https / 主机不在白名单 / 任何 3xx / text/html / 超 max_bytes / 4xx 非 429
+WORKER_RC_TRANSIENT = 4          # DNS / 拒连 / 超时 / 连接中断
+WORKER_RC_HTTP_RETRY = 5         # 429 或 5xx
+WORKER_RC_DEADLINE = 124         # worker 自身到期(signal.alarm)
+WORKER_RC_ORPHAN = 125           # 父亡(getppid()==1)
+WORKER_ALARM_SLACK_S = 2         # alarm = timeout_s + 2
 
-SUPPORTED_MSG_TYPES = ("text", "image", "file", "post")
-MEDIA_MSG_TYPES = ("image", "file")
-# 白名单直投时 payload 的 approved_by 值。**不留 None** —— None 是 owner 本人的语义,
-# 混用会让 agent 把白名单成员的消息当成 owner 本人发的(信任级别不同)。
-APPROVED_BY_ALLOWLIST = "allowlist"
+# daemon_state 键名(contracts §4.5)
+VERIFY_CAPABILITY_KEY = "verify_capability"                    # unverified | ok | degraded:<err>
+VERIFY_CAPABILITY_VERSION_KEY = "verify_capability_tokens_version"
+GATE_KEY = "outbound_gate"
+GATE_VERSION_KEY = "outbound_gate_tokens_version"
+TOKENS_VERSION_SEEN_KEY = "tokens_version_seen"
+COOLDOWN_KEY_PREFIX = "cooldown:"
+VERIFY_CAP_UNVERIFIED = "unverified"
+VERIFY_CAP_OK = "ok"
 
-# 附件句柄(image_key / file_key)—— 从正文里认出可自取的资源 key。
-# 形如 `img_v3_02143_6ea09006-e575-47a2-89e7-4a683ace737g`(真机实测),也有不带版本号的
-# `img_…`/`file_…`。**故意放宽**:**漏判会重现原 bug(agent 看不见附件),误判只是多一条
-# 取不到的提示** —— 不对称,往宽取。故**不写 `(?:v\d+_)?` 那样的版本号组** —— 它匹配的字符
-# 全在后面的宽字符类里 = 死重,留着只会让人误以为它在钉版本号格式(codex impl r2 实证:
-# 把 `v\d+` 削成 `v\d` 全套仍绿,因为宽后缀本就吃得下 `v12_`)。
-# key 前缀决定 `--type`:`img_*`→image、`file_*`→file(与飞书资源 API 契约一致)。
-MEDIA_KEY_RE = re.compile(r"(?:img|file)_[A-Za-z0-9_-]+")
+# ======================================================================
+# 其它
+# ======================================================================
+MARKER_PREFIX = "[slack-bridge-bind:"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+
+# busy_timeout(有界;I5)
+BUSY_TIMEOUT_DAEMON_MS = 5_000
+BUSY_TIMEOUT_HOOK_MS = 3_000
+BUSY_TIMEOUT_SESSION_END_MS = 1_500
+BUSY_TIMEOUT_OBS_MS = 300
+BUSY_TIMEOUT_LISTENER_MS = 3_000
+
+SCHEMA_VERSION = "1"
+
+# ======================================================================
+# LEGACY-FEISHU(旧模块/旧测试仍引用;WP5 连同 runner.py/selfcheck.py/旧测试一并删除)
+# ======================================================================
+MGET_TIMEOUT_S = 30                                  # LEGACY-FEISHU: remove in WP5
+DOWNLOAD_TIMEOUT_S = 120                             # LEGACY-FEISHU: remove in WP5
+UNKNOWN_RETRY_DELAY_MS = 15_000                      # LEGACY-FEISHU: remove in WP5
+MAX_SEND_ATTEMPTS = 2                                # LEGACY-FEISHU: remove in WP5
+OUTBOUND_BATCH = 20                                  # LEGACY-FEISHU: remove in WP5
+TURN_RETRYABLE_MAX_ATTEMPTS = 6                      # LEGACY-FEISHU: remove in WP5
+TURN_RETRY_BACKOFF_MS = 8_000                        # LEGACY-FEISHU: remove in WP5
+TURN_RETRY_BACKOFF_MAX_MS = 45_000                   # LEGACY-FEISHU: remove in WP5
+RESOLVE_DEADLINE_MS = 10 * 60 * 1000                 # LEGACY-FEISHU: remove in WP5
+MATERIALIZE_DEADLINE_MS = 10 * 60 * 1000             # LEGACY-FEISHU: remove in WP5
+PERMANENT_SEND_CODES = frozenset({230002, 230013, 99991672, 230099, 99992402})  # LEGACY-FEISHU: remove in WP5
+TRANSIENT_SEND_CODES = frozenset({230020, 99991661, 99991663})                  # LEGACY-FEISHU: remove in WP5
+RETRYABLE_FALLBACK_CODES = frozenset({230020})       # LEGACY-FEISHU: remove in WP5
+CARD_REARM_MAX_ATTEMPTS = 5                          # LEGACY-FEISHU: remove in WP5
+CARD_REARM_BACKOFF_MS = 30_000                       # LEGACY-FEISHU: remove in WP5
+CARD_REARM_BACKOFF_MAX_MS = 10 * 60 * 1000           # LEGACY-FEISHU: remove in WP5
+SELFCHECK_CHAT_ID = "oc_ef148370df62f0a61e113731c6c50eb3"  # LEGACY-FEISHU: remove in WP5
+SUPPORTED_MSG_TYPES = ("text", "image", "file", "post")   # LEGACY-FEISHU: remove in WP5
+MEDIA_MSG_TYPES = ("image", "file")                  # LEGACY-FEISHU: remove in WP5
+MEDIA_KEY_RE = re.compile(r"(?:img|file)_[A-Za-z0-9_-]+")  # LEGACY-FEISHU: remove in WP5
