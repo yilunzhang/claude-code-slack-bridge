@@ -15,8 +15,8 @@ from lib import inbound as inbound_mod
 from lib.daemon_core import (RESTART_BACKOFF_MAX_MS, RESTART_BACKOFF_START_MS, SOCKET_KEY,
                              STARTUP_PHASES, ConsumerManager, DaemonCore, make_status_writer,
                              mark_consumers_down, record_daemon_identity, set_startup_state)
-from tests.conftest import CHAT, OWNER, TEAM
-from tests.helpers import FakeClock, block_action, envelope, message_event, ok
+from tests.conftest import BOT_USER, CHAT, OWNER, TEAM
+from tests.helpers import FakeClock, block_action, envelope, message_event, ok, posted, slack_file
 from tests.test_fingerprint import AUTH_OK, _rewrite_tokens
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -302,6 +302,69 @@ class TestFollowupsAndLoop:
         assert int(dbmod.get_state(env.conn, "consumer_stdout_lines", "0")) == 1
         assert env.conn.execute("SELECT COUNT(*) FROM slack_events").fetchone()[0] == 0
         assert env.conn.execute("SELECT COUNT(*) FROM inbox").fetchone()[0] == 0
+
+
+class TestFullLoopRealInboundRecovery:
+    """盲区补测(R1):**真** Recovery + **真** Inbound + 真 media.materialize + 假 worker 子进程,
+    走 DaemonCore.loop_iteration 全循环(首轮必触发 slow_tick)。断言:
+    ① 单 tick 下载 ≤ 1 条(slow_tick 不再另领一份预算,R1-m1);② 两个慢附件之间刷了心跳(R1-M6)。"""
+
+    def _owner_msg_with_files(self, env, urls):
+        files = [slack_file(id="F%d" % i, name="f%d.bin" % i, size=1, url_private_download=u)
+                 for i, u in enumerate(urls, 1)]
+        ev = message_event(channel=CHAT, user=OWNER, text="<@%s> files" % BOT_USER, files=files)
+        env.stage("events_api", envelope(ev))
+        return "%s:%s" % (ev["channel"], ev["ts"])
+
+    def _wire(self, env, tokens, monkeypatch, events):
+        import subprocess as sp
+        from lib import media
+        from tests.test_media import FAKE_WORKER
+        env.make_binding(status="active")
+        env.inbound.worker_path = FAKE_WORKER
+        env.inbound.heartbeat = lambda: events.append("beat")
+        env.client.on("reactions.add", lambda m, p: ok())
+        env.client.on("chat.postMessage", lambda m, p: posted(channel=p["channel"]))
+        real = sp.Popen
+
+        class Rec(real):
+            def __init__(self, argv, **kw):
+                events.append("spawn")
+                super().__init__(argv, **kw)
+
+        monkeypatch.setattr(media.subprocess, "Popen", Rec)
+
+    def test_per_tick_download_budget_is_one_even_when_slow_tick_fires(self, env, tokens, monkeypatch):
+        events = []
+        self._wire(env, tokens, monkeypatch, events)
+        mids = [self._owner_msg_with_files(env, ["https://files.slack.com/ok/1"]) for _ in range(3)]
+        assert env.core._last_slow == 0                       # 首轮 loop_iteration 必触发 slow_tick
+        env.core.loop_iteration()
+        states = [env.inbox_row(m)["state"] for m in mids]
+        assert states == ["enqueued", "materializing", "materializing"], states
+        assert events.count("spawn") == 1                     # 单 tick 只下载 1 条(旧实现:2)
+        env.clock.tick(1000)
+        env.core.loop_iteration()
+        assert [env.inbox_row(m)["state"] for m in mids] == ["enqueued", "enqueued", "materializing"]
+        assert events.count("spawn") == 2
+        env.clock.tick(constants.RECOVERY_INTERVAL_MS)        # 再触发一次 slow_tick 的轮次
+        env.core.loop_iteration()
+        assert [env.inbox_row(m)["state"] for m in mids] == ["enqueued"] * 3
+        assert events.count("spawn") == 3
+
+    def test_heartbeat_between_two_long_attachments_in_full_loop(self, env, tokens, monkeypatch):
+        events = []
+        self._wire(env, tokens, monkeypatch, events)
+        mid = self._owner_msg_with_files(env, ["https://files.slack.com/slow/0.15/1",
+                                               "https://files.slack.com/slow/0.15/2"])
+        env.core.loop_iteration()
+        assert env.inbox_row(mid)["state"] == "enqueued"
+        spawns = [i for i, e in enumerate(events) if e == "spawn"]
+        assert len(spawns) == 2
+        assert "beat" in events[spawns[0] + 1:spawns[1]]      # 两个附件之间刷了心跳
+        assert "beat" in events[spawns[1] + 1:]               # 整条之后也刷
+        payload = json.loads(env.deliveries()[0]["payload_json"])
+        assert [pathlib.Path(p).name for p in payload["media_paths"]] == ["f01-F1-f1.bin", "f02-F2-f2.bin"]
 
 
 class TestSuspectWindow:

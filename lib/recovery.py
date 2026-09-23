@@ -1,7 +1,9 @@
 """恢复工人(contracts §2.9 / §2.10 / §5.2 / §5.6):驱动一切非终态;重驱只用行上钉死的 binding_id;
 幂等 = DB 约束(唯一键 + 确定性 job 键 + 带旧状态 CAS)。
 - received/resolving/waiting_binding:无条件本地重驱,**永不因排队/停机而 failed**(无死线)。
-- materializing:按 `materialize_next_at` 到期与 followup 预算重驱(预算列在库上,重启不重置)。
+- materializing:**不在这里驱动**(R1-m1)。materializing 行的调度入口只有主循环的
+  `DaemonCore.run_followups → Inbound.drive_pending_rows(budget)`(按 `materialize_next_at` 到期 + 每 tick
+  预算取行;预算列在库上,重启不重置)。slow_tick 若再领一份预算,单 tick 就会下载 2 条(契约上限 1)。
 - `_expire_pendings`:**单条审批范围**(§5.6)—— 只碰该审批、其 inbox、其未发的 approval_card。
 - `_replenish_cards`:只在**缺** card job 时创建;**绝不**复活终态 job(无 _rearm_failed_cards)。
 - `_legacy_sending`:postMessage 类 → unknown/had_unknown=1/verify_after=now;幂等类按 cap 收口。
@@ -41,7 +43,7 @@ class Recovery:
         now = self.clock.wall_ms()
         self._redrive_resolving(now)
         self._replenish_cards(now)
-        self._redrive_materializing(now)
+        # materializing 行**不在此重驱**:唯一调度入口是主循环 run_followups(单 tick 下载 ≤ 1 条)。
         self._expire_pendings(now)
         lifecycle.expire_stale_pending_binds(self.conn, self.clock)
         self._close_orphan_starting(now)
@@ -54,10 +56,6 @@ class Recovery:
     def _redrive_resolving(self, now):
         """received/resolving/waiting_binding 本地重驱;无死线、零网络。"""
         return self.inbound.drive_local_rows()
-
-    def _redrive_materializing(self, now, budget=constants.FOLLOWUP_BUDGET_PER_TICK):
-        """materializing 按 next_at 到期 + 同一预算重驱;超预算/MediaError 的终态由 inbound 收口。"""
-        return self.inbound.drive_materializing_rows(budget)
 
     def _replenish_cards(self, now):
         """awaiting 中的审批**缺** card job → 补建(同键幂等);已 sent 未回填 card_message_id → 补回填。

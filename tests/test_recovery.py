@@ -93,16 +93,21 @@ class TestMaterializingRedrive:
         return p, ev
 
     def test_redrive_succeeds_later_within_budget(self, env):
+        """materializing 的重驱走唯一入口 drive_pending_rows(主循环 run_followups);
+        slow_tick 只做本地重驱等,**不下载**(R1-m1)。"""
         p, ev = self._approved_files(env)
         calls = []
         env.inbound.materializer = none_materializer(calls)
         env.recovery.slow_tick()
+        assert env.inbox_row(mid_of(ev))["state"] == "materializing" and calls == []   # slow_tick 不下载
+        env.inbound.drive_pending_rows()
         assert env.inbox_row(mid_of(ev))["state"] == "materializing" and len(calls) == 1
-        env.recovery.slow_tick()                                  # 未到 next_at → 不重试
+        env.inbound.drive_pending_rows()                          # 未到 next_at → 不重试
+        env.recovery.slow_tick()
         assert len(calls) == 1
         env.clock.tick(constants.MEDIA_RETRY_BACKOFF_MS)
         env.inbound.materializer = ok_materializer(calls)
-        env.recovery.slow_tick()
+        env.inbound.drive_pending_rows()
         assert env.inbox_row(mid_of(ev))["state"] == "enqueued" and len(env.deliveries()) == 1
         keys = [j["idempotency_key"] for j in env.jobs("decision_notice")]
         assert keys[-1] == "dec:%s:delivered" % p["pending_id"]
@@ -111,24 +116,39 @@ class TestMaterializingRedrive:
         from tests.conftest import Env
         p, ev = self._approved_files(env)
         env.inbound.materializer = none_materializer([])
-        env.recovery.slow_tick()
+        env.inbound.drive_pending_rows()
         started = env.inbox_row(mid_of(ev))["materialize_started_at"]
         assert started == env.clock.wall_ms()
         env2 = Env(conn, cfg, clock, client, prober, data_dir)       # 重启:预算列不重置
         env2.inbound.materializer = none_materializer([])
         clock.tick(constants.MEDIA_RETRY_DEADLINE_MS + 1)
-        env2.recovery.slow_tick()
+        env2.recovery.slow_tick()                                    # 不碰 materializing 行
+        assert env2.inbox_row(mid_of(ev))["state"] == "materializing"
+        env2.inbound.drive_pending_rows()
         row = env2.inbox_row(mid_of(ev))
         assert row["state"] == "failed" and row["materialize_started_at"] == started
         assert [j["idempotency_key"] for j in env2.jobs("decision_notice")][-1] == \
             "dec:%s:attachment_failed" % p["pending_id"]
         assert counter(env2, "media_budget_exhausted") == 1
 
+    def test_slow_tick_never_downloads(self, env):
+        """R1-m1:slow_tick 不得领取 followup 预算 —— 到期的 materializing 行由主循环唯一驱动。"""
+        p, ev = self._approved_files(env)
+        calls = []
+        env.inbound.materializer = none_materializer(calls)
+        for _ in range(3):
+            env.recovery.slow_tick()
+            env.clock.tick(constants.RECOVERY_INTERVAL_MS)
+        assert calls == [] and env.inbox_row(mid_of(ev))["state"] == "materializing"
+        assert not hasattr(env.recovery, "_redrive_materializing")
+
     def test_terminated_binding_goes_undeliverable(self, env):
         p, ev = self._approved_files(env)
         env.conn.execute("UPDATE bindings SET status='closed', close_reason='cc_gone' WHERE binding_id=?",
                          (p["binding_id"],))
-        env.recovery.slow_tick()
+        env.recovery.slow_tick()                                  # 不碰 materializing 行(R1-m1)
+        assert env.inbox_row(mid_of(ev))["state"] == "materializing"
+        env.inbound.drive_pending_rows()                          # 唯一入口:绑定非 active → 不下载直接收口
         assert env.inbox_row(mid_of(ev))["state"] == "undeliverable"
         assert [j["idempotency_key"] for j in env.jobs("decision_notice")][-1] == \
             "dec:%s:closed_undelivered" % p["pending_id"]
