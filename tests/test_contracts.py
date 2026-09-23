@@ -469,7 +469,6 @@ def test_download_worker_exists():
 # ======================================================================
 # WP3:outbound
 # ======================================================================
-@WP3
 def test_op_for_is_pure_and_maps_decision_notice(cfg):
     from lib import outbound
     base = {"job_id": "j", "kind": "decision_notice", "chat_id": CHAT, "reply_to": "1.1",
@@ -488,7 +487,6 @@ def test_op_for_is_pure_and_maps_decision_notice(cfg):
     assert outbound.op_for(frozen, cfg) == ("chat.postMessage", CHAT, None, "text")  # 冻结原样返回
 
 
-@WP3
 def test_startup_scan_sending_postmessage_becomes_unknown_had_unknown(env):
     bid = env.make_binding(status="active", chat_id=CHAT)
     env.conn.execute(
@@ -500,7 +498,6 @@ def test_startup_scan_sending_postmessage_becomes_unknown_had_unknown(env):
     assert j["state"] == "unknown" and j["had_unknown"] == 1 and j["verify_after"] is not None
 
 
-@WP3
 def test_prepare_freezes_op_columns(env):
     bid = env.make_binding(status="active", chat_id=CHAT)
     env.conn.execute(

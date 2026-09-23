@@ -1,1001 +1,1585 @@
-"""出站(plan 4.5):per-kind 守卫线性化 / chunk 组内外序 / 契约解析 / unknown 同 key 重试一次。"""
+"""出站状态机(docs/contracts.md §2):op_for 纯函数 / 传输形态 / §2.5 转移表逐行 / §2.6 核验逐行 /
+_prepare 顺序与冻结断言 / 冷却预检与节流 / 排序(组内、跨组、同 chat 通知)/ 守卫表 / startup_scan / 告警。
+全部离线:FakeSlackClient 未注册方法即 AssertionError(绝不静默放过外呼)。"""
 import json
 
 import pytest
 
-from tests.conftest import CHAT
-from tests.helpers import FakeRunResult, ok_envelope, err_envelope, network_err_envelope
-from lib import constants, jobs
+from lib import constants, db as dbmod, jobs, outbound, texts
+from lib.outbound import Outbound
+from tests.conftest import BOT_ID, CHAT, MEMBER, OWNER
+from tests.helpers import err, http5xx, next_ts, not_sent, ok, posted, ratelimited, timeout
+
+C = constants
+PM = "chat.postMessage"
+UPD = "chat.update"
+REACT = "reactions.add"
+HIST = "conversations.history"
+REPL = "conversations.replies"
 
 
-def mk_job(env, kind="session_turn", key=None, binding_id=None, chat_id=CHAT,
-           body="hello", turn_group=None, chunk_index=None, **kw):
-    key = key or f"k:{kind}:{env.conn.execute('SELECT COUNT(*) FROM outbound_jobs').fetchone()[0]}"
-    jobs.create_job(env.conn, kind=kind, chat_id=chat_id, idempotency_key=key,
-                    binding_id=binding_id, body=body, turn_group=turn_group,
-                    chunk_index=chunk_index, now=env.clock.wall_ms(), **kw)
+# ======================================================================
+# helpers
+# ======================================================================
+def row(env, key):
     return env.conn.execute("SELECT * FROM outbound_jobs WHERE idempotency_key=?", (key,)).fetchone()
 
 
-def job_state(env, key):
-    return env.conn.execute(
-        "SELECT * FROM outbound_jobs WHERE idempotency_key=?", (key,)).fetchone()
+def by_id(env, job_id):
+    return env.conn.execute("SELECT * FROM outbound_jobs WHERE job_id=?", (job_id,)).fetchone()
 
 
-def arm_send_ok(env, prefix=("im", "+messages-send")):
-    counter = {"n": 0}
+def mk_job(env, kind="session_turn", key=None, binding_id=None, chat_id=CHAT, body="hello",
+           turn_group=None, chunk_index=None, **kw):
+    if key is None:
+        n = env.conn.execute("SELECT COUNT(*) FROM outbound_jobs").fetchone()[0]
+        key = "k:%s:%d" % (kind, n)
+    jobs.create_job(env.conn, kind=kind, chat_id=chat_id, idempotency_key=key, binding_id=binding_id,
+                    body=body, turn_group=turn_group, chunk_index=chunk_index,
+                    now=env.clock.wall_ms(), **kw)
+    return row(env, key)
 
-    def fn(args, cwd):
-        counter["n"] += 1
-        return ok_envelope({"message_id": f"om_sent_{counter['n']}"}, notice="rate hint")
 
-    env.runner.on_prefix(list(prefix), fn)
-    return counter
+def mk_turn(env, bid, group="g", idx=0, body="hello", chat_id=CHAT):
+    return mk_job(env, key=jobs.key_turn(group, idx), binding_id=bid, chat_id=chat_id, body=body,
+                  turn_group=group, chunk_index=idx)
 
 
-class TestSendContract:
-    def test_session_turn_sends_text_with_key(self, env):
+def set_cols(env, key, **cols):
+    sets = ", ".join("%s=?" % k for k in cols)
+    env.conn.execute("UPDATE outbound_jobs SET %s WHERE idempotency_key=?" % sets, (*cols.values(), key))
+
+
+def freeze_turn(env, key, payload_kind="markdown_text"):
+    """把一条 turn 的 op_* 冻结成 postMessage 顶层(模拟已发过一次)。"""
+    set_cols(env, key, op_method=PM, op_target=CHAT, op_thread_ts=None, op_payload_kind=payload_kind)
+
+
+def counter(env, key):
+    return int(dbmod.get_state(env.conn, key, "0") or 0)
+
+
+def run_ticks(env, n, gap=C.POST_MIN_INTERVAL_MS):
+    total = 0
+    for _ in range(n):
+        total += env.outbound.tick()
+        env.clock.tick(gap)
+    return total
+
+
+def seq(*results):
+    """依次返回 results(耗尽后重复最后一个);元素可为 CallResult 或 fn(params)->CallResult。"""
+    it = list(results)
+
+    def fn(method, params):
+        r = it.pop(0) if len(it) > 1 else it[0]
+        return r(params) if callable(r) else r
+    return fn
+
+
+def post_ok(params):
+    return posted(channel=params["channel"])
+
+
+def arm_post(env, *results):
+    env.client.on(PM, seq(*(results or (post_ok,))))
+
+
+def set_verify_ok(env, version=None):
+    dbmod.set_state(env.conn, C.VERIFY_CAPABILITY_KEY, C.VERIFY_CAP_OK)
+    dbmod.set_state(env.conn, C.VERIFY_CAPABILITY_VERSION_KEY,
+                    version if version is not None else env.client.tokens_version)
+
+
+def hit_msg(job_id, ts=None, bot_id=BOT_ID):
+    return {"type": "message", "bot_id": bot_id, "ts": ts or next_ts(), "text": "x",
+            "metadata": {"event_type": C.METADATA_EVENT_TYPE, "event_payload": {"job_id": job_id}}}
+
+
+def history(messages=(), has_more=False, cursor=None):
+    d = {"messages": list(messages), "has_more": has_more}
+    if cursor:
+        d["response_metadata"] = {"next_cursor": cursor}
+    return ok(d)
+
+
+def alerts(env):
+    return [j for j in env.jobs("session_turn") if (j["turn_group"] or "").startswith("__sendfail__:")]
+
+
+def inbox(env, mid, state, bid=None, thread_ts=None, reply_thread_ts=None):
+    env.conn.execute(
+        "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,sender_user_id,message_type,thread_ts,"
+        "reply_thread_ts,state,ts) VALUES(?,?,?,?,?,?,?,?,?,0)",
+        ("Ev-" + mid, mid, CHAT, bid, MEMBER, "app_mention", thread_ts, reply_thread_ts, state))
+
+
+def pending(env, pid, mid, bid, state="pending", card=None, decided_by=None):
+    env.conn.execute(
+        "INSERT INTO pendings(pending_id,message_id,binding_id,nonce,card_message_id,state,decided_by,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?)", (pid, mid, bid, "n" * 32, card, state, decided_by, env.clock.wall_ms()))
+    return env.conn.execute("SELECT * FROM pendings WHERE pending_id=?", (pid,)).fetchone()
+
+
+def member_pending(env, bid, pid="p1", thread_ts=None):
+    """成员消息 inbox + pendings(pending)+ approval_card job(线程 = reply_thread_ts)。不依赖 WP2。"""
+    ts = next_ts()
+    mid = "%s:%s" % (CHAT, ts)
+    rtt = thread_ts or ts
+    inbox(env, mid, "awaiting_approval", bid, thread_ts=thread_ts, reply_thread_ts=rtt)
+    p = pending(env, pid, mid, bid)
+    body = texts.build_approval_card(pid, "n" * 32, MEMBER, "run <task>")
+    jobs.create_job(env.conn, kind="approval_card", chat_id=CHAT, binding_id=bid,
+                    idempotency_key=jobs.key_card(pid), reply_to=rtt, ref_pending_id=pid,
+                    ref_message_id=mid, body=body, now=env.clock.wall_ms())
+    return p
+
+
+def decision_job(env, bid, pid, outcome, card=None, pstate="rejected", istate="rejected", decided_by=OWNER):
+    mid = "%s:%s" % (CHAT, next_ts())
+    inbox(env, mid, istate, bid, reply_thread_ts=mid.split(":")[1])
+    pending(env, pid, mid, bid, state=pstate, card=card, decided_by=decided_by)
+    key = jobs.key_dec(pid, outcome)
+    jobs.create_job(env.conn, kind="decision_notice", chat_id=CHAT, binding_id=bid, idempotency_key=key,
+                    reply_to=mid.split(":")[1], ref_pending_id=pid, ref_message_id=mid,
+                    expected_state=outcome, body=texts.decision_notice_body(outcome), now=env.clock.wall_ms())
+    return key
+
+
+def reaction_job(env, bid, ref_ts=None, delivery_state="enqueued"):
+    ts = ref_ts or next_ts()
+    mid = "%s:%s" % (CHAT, ts)
+    inbox(env, mid, "enqueued", bid)
+    env.conn.execute("INSERT INTO deliveries(binding_id,message_id,payload_json,state) VALUES(?,?,'{}',?)",
+                     (bid, mid, delivery_state))
+    dseq = env.conn.execute("SELECT MAX(delivery_seq) FROM deliveries").fetchone()[0]
+    key = jobs.key_rc(dseq)
+    jobs.create_job(env.conn, kind="receipt_reaction", chat_id=CHAT, binding_id=bid, idempotency_key=key,
+                    ref_delivery_seq=dseq, ref_message_id=ts, now=env.clock.wall_ms())
+    return key, ts
+
+
+def send_unknown(env, bid, group="g", then=()):
+    """一条 turn:首次 postMessage 超时 → unknown(had_unknown=1, verify_after=now+5s)。返回 job 行。"""
+    arm_post(env, timeout(), *(then or (post_ok,)))
+    key = jobs.key_turn(group, 0)
+    mk_turn(env, bid, group=group)
+    env.outbound.tick()
+    r = row(env, key)
+    assert r["state"] == "unknown" and r["had_unknown"] == 1
+    assert r["verify_after"] == env.clock.wall_ms() + C.VERIFY_SCHEDULE_MS[0]
+    assert len(env.client.calls_for(PM)) == 1
+    return r
+
+
+def verify_tick(env, ms=None):
+    """推进到下一次核验到期并 tick。"""
+    r = env.conn.execute("SELECT MIN(verify_after) FROM outbound_jobs WHERE state='unknown'").fetchone()[0]
+    if ms is None:
+        ms = max(0, (r or env.clock.wall_ms()) - env.clock.wall_ms())
+    env.clock.tick(ms)
+    env.outbound.tick()
+
+
+# ======================================================================
+# op_for / 类别 / cap(§2.2 / §2.3)
+# ======================================================================
+class TestOpFor:
+    def test_table_by_kind(self, cfg):
+        base = {"job_id": "j", "chat_id": CHAT, "reply_to": "1.1", "ref_pending_id": None, "ref_message_id": None,
+                "body": None, "op_method": None, "op_target": None, "op_thread_ts": None, "op_payload_kind": None,
+                "had_unknown": 0, "attempt_count": 0, "state": "pending", "card_message_id": None}
+        f = lambda **kw: outbound.op_for(dict(base, **kw), cfg)  # noqa: E731
+        assert f(kind="session_turn") == (PM, CHAT, None, "markdown_text")
+        assert f(kind="lifecycle_notice") == (PM, CHAT, None, "text")            # 顶层,忽略 reply_to
+        assert f(kind="inbound_notice") == (PM, CHAT, "1.1", "text")
+        assert f(kind="unsupported_notice") == (PM, CHAT, "1.1", "text")
+        assert f(kind="approval_card") == (PM, CHAT, "1.1", "blocks")
+        assert f(kind="decision_notice") == (PM, CHAT, "1.1", "text")
+        assert f(kind="decision_notice", card_message_id=CHAT + ":9.9") == (UPD, CHAT + ":9.9", None, "blocks")
+        assert f(kind="receipt_reaction") == (REACT, CHAT, None, "reaction")
+        with pytest.raises(ValueError):
+            f(kind="nope")
+
+    def test_markdown_mode_from_cfg_and_frozen_wins(self, cfg):
+        view = {"kind": "session_turn", "chat_id": CHAT, "reply_to": None, "op_method": None,
+                "op_target": None, "op_thread_ts": None, "op_payload_kind": None, "card_message_id": None}
+        cfg["markdown_mode"] = "text"
+        assert outbound.op_for(view, cfg)[3] == "text"
+        cfg["markdown_mode"] = "garbage"
+        assert outbound.op_for(view, cfg)[3] == C.MARKDOWN_MODE_DEFAULT
+        frozen = dict(view, op_method=PM, op_target="C_OLD", op_thread_ts="7.7", op_payload_kind="markdown_text")
+        cfg["markdown_mode"] = "text"
+        assert outbound.op_for(frozen, cfg) == (PM, "C_OLD", "7.7", "markdown_text")  # 冻结后不因 cfg 变化重选
+
+    def test_category_and_cap(self):
+        assert outbound.category_of(PM) == "postMessage"
+        assert outbound.category_of(UPD) == outbound.category_of(REACT) == "idempotent"
+        assert outbound.category_of("x") is None
+        assert outbound.cap_for("session_turn", "postMessage") == C.TURN_CAP
+        assert outbound.cap_for("approval_card", "postMessage") == C.CARD_CAP
+        assert outbound.cap_for("decision_notice", "postMessage") == C.NOTICE_CAP
+        assert outbound.cap_for("decision_notice", "idempotent") == C.IDEMPOTENT_CAP
+
+
+# ======================================================================
+# 传输形态(§2.2 / §4.4)
+# ======================================================================
+class TestTransmitShapes:
+    def test_session_turn_markdown_text_shape(self, env):
         bid = env.make_binding(status="active")
-        arm_send_ok(env)
-        j = mk_job(env, binding_id=bid, key="turn:g1:0", turn_group="g1", chunk_index=0)
+        arm_post(env, lambda p: posted(channel=p["channel"], ts="1700000000.000999"))
+        mk_turn(env, bid, body="**hi**")
         assert env.outbound.tick() == 1
-        row = job_state(env, "turn:g1:0")
-        assert row["state"] == "sent" and row["sent_message_id"] == "om_sent_1"
-        args, _ = env.runner.calls_matching("im", "+messages-send")[0]
-        assert args[args.index("--chat-id") + 1] == CHAT
-        # session_turn 走 --markdown(可信群前提,2026-07-17),不走 --text
-        assert args[args.index("--markdown") + 1] == "hello"
-        assert "--text" not in args
-        from lib import util
-        wire_key = args[args.index("--idempotency-key") + 1]
-        assert wire_key == util.short_key("turn:g1:0") and len(wire_key) <= 40  # E4b
+        r = row(env, "turn:g:0")
+        assert r["state"] == "sent" and r["sent_message_id"] == CHAT + ":1700000000.000999"
+        assert r["sent_at"] == env.clock.wall_ms() and r["attempt_count"] == 1 and r["error"] is None
+        assert (r["op_method"], r["op_target"], r["op_thread_ts"], r["op_payload_kind"]) == (PM, CHAT, None, "markdown_text")
+        p = env.client.calls_for(PM)[0]
+        assert p["channel"] == CHAT and p["markdown_text"] == "**hi**" and "text" not in p
+        assert p["unfurl_links"] is False and p["unfurl_media"] is False and "thread_ts" not in p
+        assert p["metadata"] == {"event_type": "slack_bridge", "event_payload": {"job_id": r["job_id"]}}
 
-    def test_missing_message_id_is_unknown_then_retry_same_key(self, env):
+    def test_session_turn_text_when_cfg_text(self, env):
         bid = env.make_binding(status="active")
-        calls = []
-
-        def fn(args, cwd):
-            calls.append(args)
-            if len(calls) == 1:
-                return ok_envelope({})  # 缺 message_id → UNKNOWN 非成功(F10)
-            return ok_envelope({"message_id": "om_ok"})
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
+        env.cfg["markdown_mode"] = "text"
+        arm_post(env)
+        mk_turn(env, bid, body="plain")
         env.outbound.tick()
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "unknown" and row["attempt_count"] == 1
-        assert row["next_attempt_at"] is not None
-        env.clock.tick(constants.UNKNOWN_RETRY_DELAY_MS + 1)
+        p = env.client.calls_for(PM)[0]
+        assert p["text"] == "plain" and "markdown_text" not in p
+        assert row(env, "turn:g:0")["op_payload_kind"] == "text"
+
+    def test_lifecycle_notice_top_level_text(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env)
+        mk_job(env, kind="lifecycle_notice", key="lc:%s:bound" % bid, binding_id=bid, expected_state="active",
+               body=texts.LC_BOUND, reply_to="9.9")
         env.outbound.tick()
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "sent" and row["sent_message_id"] == "om_ok"
-        # 同 key 重试(S4 服务端幂等)
-        assert calls[0][calls[0].index("--idempotency-key") + 1] == \
-               calls[1][calls[1].index("--idempotency-key") + 1]
+        p = env.client.calls_for(PM)[0]
+        assert p["text"] == texts.LC_BOUND and "thread_ts" not in p and "markdown_text" not in p
 
-    def test_retryable_timeout_persists_beyond_two_attempts(self, env):
-        """旧「2 次后终局」已废(2026-07-18 事故修复):timeout=retryable session_turn →
-        指数退避持久重试(远超 2 次),靠 idempotency-key 安全。见 TestSessionTurnRetryableHardening 全景。"""
-        bid = env.make_binding(status="active")
-        n = {"c": 0}
-
-        def fn(a, c):
-            n["c"] += 1
-            return FakeRunResult(rc=1, stdout="", timed_out=True)
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.outbound.tick()                          # attempt1 → +8s
-        env.clock.tick(constants.TURN_RETRY_BACKOFF_MS + 1)
-        env.outbound.tick()                          # attempt2 → +16s
-        env.clock.tick(2 * constants.TURN_RETRY_BACKOFF_MS + 1)
-        env.outbound.tick()                          # attempt3 —— 旧实现到此绝不会有第 3 次
-        row = job_state(env, "turn:g:0")
-        assert n["c"] == 3 and row["state"] == "unknown" and row["attempt_count"] == 3
-
-    def test_explicit_error_code_is_failed(self, env):
-        bid = env.make_binding(status="active")
-        env.runner.on_prefix(["im", "+messages-send"], lambda a, c: err_envelope(230002, "perm"))
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
+    def test_inbound_notice_threads_to_reply_to(self, env):
+        mid = "%s:1.1" % CHAT
+        inbox(env, mid, "unbound")
+        arm_post(env)
+        mk_job(env, kind="inbound_notice", key=jobs.key_notice(mid, "unbound"), ref_message_id=mid,
+               expected_state="unbound", body=texts.inbound_notice_body("unbound"), reply_to="1.1")
         env.outbound.tick()
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "failed" and "230002" in row["error"]
+        p = env.client.calls_for(PM)[0]
+        assert p["thread_ts"] == "1.1" and p["text"] == texts.inbound_notice_body("unbound")
 
-    def test_startup_scan_sending_to_unknown(self, env):
+    def test_approval_card_blocks_text_thread_and_backfill(self, env):
         bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.conn.execute("UPDATE outbound_jobs SET state='sending', attempt_count=1 "
-                         "WHERE idempotency_key='turn:g:0'")
+        p = member_pending(env, bid, thread_ts="1700000000.000001")
+        arm_post(env, lambda q: posted(channel=q["channel"], ts="1700000000.000777"))
+        env.outbound.tick()
+        card = row(env, "card:p1")
+        assert card["state"] == "sent" and card["op_payload_kind"] == "blocks"
+        q = env.client.calls_for(PM)[0]
+        expected = json.loads(texts.build_approval_card("p1", "n" * 32, MEMBER, "run <task>"))
+        assert q["blocks"] == expected["blocks"] and q["text"] == expected["text"]
+        assert q["thread_ts"] == "1700000000.000001" and "markdown_text" not in q
+        assert q["blocks"][1]["text"]["text"] == "run &lt;task&gt;"  # 成员预览保持转义
+        pr = env.conn.execute("SELECT card_message_id FROM pendings WHERE pending_id='p1'").fetchone()
+        assert pr[0] == CHAT + ":1700000000.000777"
+        assert p["card_message_id"] is None  # 发前为空
+
+    def test_card_backfill_only_when_null(self, env):
+        bid = env.make_binding(status="active")
+        member_pending(env, bid)
+        arm_post(env, lambda q: posted(channel=q["channel"], ts="2.2"))
+        j = row(env, "card:p1")
+        assert env.outbound._prepare(j) == "send"
+        # 发送期间 owner 点击已回填(confirmed-by-click)→ 不覆盖
+        env.conn.execute("UPDATE pendings SET card_message_id=? WHERE pending_id='p1'", (CHAT + ":1.1",))
+        env.outbound._send_and_finalize(j["job_id"])
+        assert env.conn.execute("SELECT card_message_id FROM pendings").fetchone()[0] == CHAT + ":1.1"
+
+    def test_decision_update_shape_when_card_known(self, env):
+        bid = env.make_binding(status="active")
+        key = decision_job(env, bid, "p1", "rejected", card=CHAT + ":5.5")
+        env.client.on(UPD, lambda m, q: ok({"channel": q["channel"], "ts": q["ts"]}))
+        env.outbound.tick()
+        r = row(env, key)
+        assert r["state"] == "sent" and r["sent_message_id"] == CHAT + ":5.5"
+        assert (r["op_method"], r["op_target"], r["op_thread_ts"], r["op_payload_kind"]) == (UPD, CHAT + ":5.5", None, "blocks")
+        q = env.client.calls_for(UPD)[0]
+        assert q["channel"] == CHAT and q["ts"] == "5.5"
+        assert q["blocks"] == texts.decision_update_blocks("rejected", OWNER)
+        assert q["text"] == texts.decision_update_text("rejected")
+        assert all(b["type"] != "actions" for b in q["blocks"])
+        assert env.client.calls_for(PM) == []
+
+    def test_decision_postmessage_fallback_when_card_unknown(self, env):
+        bid = env.make_binding(status="active")
+        key = decision_job(env, bid, "p1", "rejected", card=None)
+        arm_post(env)
+        env.outbound.tick()
+        r = row(env, key)
+        assert r["state"] == "sent" and r["op_method"] == PM and r["op_payload_kind"] == "text"
+        q = env.client.calls_for(PM)[0]
+        assert q["text"] == texts.decision_notice_body("rejected") and q["thread_ts"] == r["reply_to"]
+        assert q["metadata"]["event_payload"]["job_id"] == r["job_id"]
+
+    def test_reaction_shape_and_already_reacted(self, env):
+        bid = env.make_binding(status="active")
+        key, ts = reaction_job(env, bid)
+        env.client.on(REACT, lambda m, q: err("already_reacted"))
+        env.outbound.tick()
+        r = row(env, key)
+        assert r["state"] == "sent" and r["op_method"] == REACT and r["op_payload_kind"] == "reaction"
+        q = env.client.calls_for(REACT)[0]
+        assert q == {"channel": CHAT, "timestamp": ts, "name": "eyes"}
+        assert alerts(env) == []
+
+    def test_reaction_ref_message_id_with_channel_prefix(self, env):
+        bid = env.make_binding(status="active")
+        key, ts = reaction_job(env, bid)
+        set_cols(env, key, ref_message_id="%s:%s" % (CHAT, ts))
+        env.client.on(REACT, lambda m, q: ok())
+        env.outbound.tick()
+        assert env.client.calls_for(REACT)[0]["timestamp"] == ts and row(env, key)["state"] == "sent"
+
+    def test_transmit_uses_frozen_op_not_cfg(self, env):
+        """§2.7:had_unknown=1 后 cfg.markdown_mode 变化不得重选形态。"""
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        mk_turn(env, bid)
+        freeze_turn(env, "turn:g:0", payload_kind="markdown_text")
+        set_cols(env, "turn:g:0", had_unknown=1)
+        env.cfg["markdown_mode"] = "text"
+        arm_post(env)
+        env.outbound.tick()
+        q = env.client.calls_for(PM)[0]
+        assert "markdown_text" in q and "text" not in q
+        assert row(env, "turn:g:0")["op_payload_kind"] == "markdown_text"
+
+
+# ======================================================================
+# §2.5 转移表(逐行)
+# ======================================================================
+class TestTransitionTable:
+    def test_wait_send_branch_restores_pending_and_ac(self, env):
+        """任意 | wait(发送分支):真实 _prepare → call(wait) → _finalize:sending 不残留、ac 不变、不动 count。"""
+        bid = env.make_binding(status="active")
+        j = mk_turn(env, bid)
+        assert env.outbound._prepare(j) == "send"
+        r = row(env, "turn:g:0")
+        assert r["state"] == "sending" and r["attempt_count"] == 1 and r["op_method"] == PM
+        until = env.clock.wall_ms() + 5000
+        env.client.cooldown_store.publish(PM, until)  # 竞态:检查与调用之间其它进程发布冷却
+        env.outbound._send_and_finalize(r["job_id"])
+        r = row(env, "turn:g:0")
+        assert r["state"] == "pending" and r["attempt_count"] == 0 and r["next_attempt_at"] == until
+        assert r["transient_count"] == 0 and r["ratelimit_count"] == 0 and r["had_unknown"] == 0
+        assert env.client.calls == [] and env.client.waits == [(PM, until)]
+        assert counter(env, "cooldown_waits") == 1
+        env.clock.tick(5001)
+        arm_post(env)
+        assert env.outbound.tick() == 1
+        r = row(env, "turn:g:0")
+        assert r["state"] == "sent" and r["attempt_count"] == 1
+
+    def test_postmessage_sent(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env)
+        mk_turn(env, bid)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "sent" and r["sent_message_id"].startswith(CHAT + ":") and r["verify_after"] is None
+
+    def test_permanent_failed_had_unknown_0_turn_alerts(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env, err("channel_not_found"), post_ok)
+        mk_turn(env, bid)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "failed" and r["error"] == "channel_not_found" and r["attempt_count"] == 1
+        a = alerts(env)
+        assert len(a) == 1 and a[0]["body"] == texts.send_failure_alert_body()
+        assert a[0]["idempotency_key"] == "turn:__sendfail__:%s:0" % r["job_id"]
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()
+        assert by_id(env, a[0]["job_id"])["state"] == "sent"  # 告警本身照常发出
+
+    def test_permanent_failed_card_no_alert(self, env):
+        bid = env.make_binding(status="active")
+        member_pending(env, bid)
+        arm_post(env, err("msg_too_long"))
+        env.outbound.tick()
+        assert row(env, "card:p1")["state"] == "failed" and alerts(env) == []
+
+    def test_permanent_failed_had_unknown_1_unconfirmed(self, env):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        mk_turn(env, bid)
+        freeze_turn(env, "turn:g:0")
+        set_cols(env, "turn:g:0", had_unknown=1)
+        arm_post(env, err("channel_not_found"))
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["had_unknown"] == 1
+        a = alerts(env)
+        assert len(a) == 1 and a[0]["body"] == texts.unconfirmed_alert_body()
+
+    def test_markdown_rejected_had_unknown_0_retries_as_text(self, env):
+        bid = env.make_binding(status="active")
+
+        def fn(q):
+            return err("invalid_arguments") if "markdown_text" in q else posted(channel=q["channel"])
+        arm_post(env, fn)
+        mk_turn(env, bid, body="**b**")
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        # 同一 attempt 内不发第二个请求;ac-1 不计 transient;op_* 归零待下一次 _prepare 记 text
+        assert len(env.client.calls_for(PM)) == 1
+        assert r["state"] == "pending" and r["attempt_count"] == 0 and r["transient_count"] == 0
+        assert r["next_attempt_at"] == env.clock.wall_ms() and r["error"] == "markdown_rejected"
+        assert r["op_payload_kind"] is None and r["op_method"] is None and r["had_unknown"] == 0
+        assert env.cfg["markdown_mode"] == "text"
+        assert json.loads(env.cfg.path.read_text())["markdown_mode"] == "text"  # 已持久化
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "sent" and r["op_payload_kind"] == "text" and r["attempt_count"] == 1
+        q = env.client.calls_for(PM)[1]
+        assert q["text"] == "**b**" and "markdown_text" not in q
+
+    def test_markdown_rejected_had_unknown_1_unconfirmed(self, env):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        mk_turn(env, bid)
+        freeze_turn(env, "turn:g:0", payload_kind="markdown_text")
+        set_cols(env, "turn:g:0", had_unknown=1)
+        arm_post(env, err("invalid_arguments"))
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["error"] == "markdown_rejected"
+        assert r["op_payload_kind"] == "markdown_text"       # 不得改形态(R4-m1)
+        assert env.cfg["markdown_mode"] == "markdown_text"   # 不动配置
+        assert len(alerts(env)) == 1 and len(env.client.calls_for(PM)) == 1
+
+    def test_invalid_arguments_on_text_is_plain_failed(self, env):
+        bid = env.make_binding(status="active")
+        env.cfg["markdown_mode"] = "text"
+        arm_post(env, err("invalid_arguments"))
+        mk_turn(env, bid)
+        env.outbound.tick()
+        assert row(env, "turn:g:0")["state"] == "failed"   # markdown_rejected 仅限 markdown_text 形态
+
+    def test_ratelimited_restores_ac_and_waits(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env, ratelimited(retry_after=3), post_ok)
+        mk_turn(env, bid)
+        t0 = env.clock.wall_ms()
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "pending" and r["attempt_count"] == 0 and r["ratelimit_count"] == 1
+        assert r["next_attempt_at"] == t0 + 3000 and r["transient_count"] == 0
+        assert counter(env, "ratelimit_hits") == 1
+        env.clock.tick(1000)
+        env.outbound.tick()
+        assert len(env.client.calls_for(PM)) == 1 and row(env, "turn:g:0")["state"] == "pending"
+        env.clock.tick(2001)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "sent" and r["attempt_count"] == 1 and len(env.client.calls_for(PM)) == 2
+
+    def test_ratelimited_next_is_max_with_cooldown(self, env):
+        bid = env.make_binding(status="active")
+        env.client.cooldown_store.publish(PM, env.clock.wall_ms() + 30_000)  # 先有更长冷却(其它方法调用发布)
+        env.clock.tick(31_000)
+        arm_post(env, ratelimited(retry_after=1))
+        mk_turn(env, bid)
+        # 发布一条更长的冷却再 finalize:next = max(now+RA, cooldown)
+        j = row(env, "turn:g:0")
+        assert env.outbound._prepare(j) == "send"
+        far = env.clock.wall_ms() + 20_000
+        res = env.client.call(PM, {"channel": CHAT})  # 触发 429 → 冷却 now+1000
+        env.client.cooldown_store.publish(PM, far)
+        env.outbound._finalize(env.outbound._job_view(j["job_id"]), res, "ratelimited", env.clock.wall_ms())
+        assert row(env, "turn:g:0")["next_attempt_at"] == far
+
+    def test_ratelimit_cap_failed_when_had_unknown_0(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env, ratelimited(retry_after=1))
+        mk_turn(env, bid)
+        set_cols(env, "turn:g:0", ratelimit_count=C.RATELIMIT_CAP - 1)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "failed" and r["ratelimit_count"] == C.RATELIMIT_CAP and r["attempt_count"] == 0
+        assert len(alerts(env)) == 1 and alerts(env)[0]["body"] == texts.send_failure_alert_body()
+
+    def test_ratelimit_cap_unconfirmed_when_had_unknown_1(self, env):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        arm_post(env, ratelimited(retry_after=1))
+        mk_turn(env, bid)
+        freeze_turn(env, "turn:g:0")
+        set_cols(env, "turn:g:0", ratelimit_count=C.RATELIMIT_CAP - 1, had_unknown=1)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed"
+        assert alerts(env)[0]["body"] == texts.unconfirmed_alert_body()
+
+    def test_not_sent_transient_backoff_schedule(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env, not_sent("dns"), not_sent("connection_refused"), post_ok)
+        mk_turn(env, bid)
+        t0 = env.clock.wall_ms()
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "pending" and r["attempt_count"] == 0 and r["transient_count"] == 1
+        assert r["next_attempt_at"] == t0 + C.TRANSIENT_BACKOFF_MS and r["error"] == "dns"
+        env.clock.tick(C.TRANSIENT_BACKOFF_MS + 1)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["transient_count"] == 2 and r["next_attempt_at"] == env.clock.wall_ms() + 2 * C.TRANSIENT_BACKOFF_MS
+        env.clock.tick(2 * C.TRANSIENT_BACKOFF_MS + 1)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "sent" and r["attempt_count"] == 1 and r["ratelimit_count"] == 0
+        assert len(env.client.calls_for(PM)) == 3
+
+    def test_not_sent_auth_error_code_is_transient(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env, err("invalid_auth"))
+        mk_turn(env, bid)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "pending" and r["transient_count"] == 1 and r["had_unknown"] == 0
+
+    def test_transient_backoff_capped_at_max(self, env, monkeypatch):
+        bid = env.make_binding(status="active")
+        arm_post(env, not_sent())
+        mk_turn(env, bid)
+        set_cols(env, "turn:g:0", transient_count=3)   # 5s·2^3 = 40s(cap=5 时正常上限恰好不触 45s 顶)
+        monkeypatch.setattr(C, "TRANSIENT_BACKOFF_MAX_MS", 30_000)
+        env.outbound.tick()
+        assert row(env, "turn:g:0")["next_attempt_at"] == env.clock.wall_ms() + 30_000
+
+    def test_transient_cap_terminal_failed(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env, not_sent())
+        mk_turn(env, bid)
+        set_cols(env, "turn:g:0", transient_count=C.TRANSIENT_CAP - 1)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "failed" and r["transient_count"] == C.TRANSIENT_CAP
+        assert len(alerts(env)) == 1 and alerts(env)[0]["body"] == texts.send_failure_alert_body()
+
+    def test_transient_cap_terminal_unconfirmed_when_had_unknown(self, env):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        arm_post(env, not_sent())
+        mk_turn(env, bid)
+        freeze_turn(env, "turn:g:0")
+        set_cols(env, "turn:g:0", transient_count=C.TRANSIENT_CAP - 1, had_unknown=1)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["transient_count"] == C.TRANSIENT_CAP
+        assert alerts(env)[0]["body"] == texts.unconfirmed_alert_body()
+
+    @pytest.mark.parametrize("res", [timeout(), http5xx(503), err("internal_error"), err("some_new_code"),
+                                     err("http_redirect", http_status=302)])
+    def test_unknown_schedules_verify_never_blind_resends(self, env, res):
+        bid = env.make_binding(status="active")
+        arm_post(env, res, post_ok)
+        env.client.on(HIST, lambda m, q: history([]))
+        mk_turn(env, bid)
+        t0 = env.clock.wall_ms()
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["had_unknown"] == 1 and r["attempt_count"] == 1
+        assert r["verify_after"] == t0 + C.VERIFY_SCHEDULE_MS[0] and r["next_attempt_at"] is None
+        # 无论 tick 多少次、多久,该 job 绝不出现第二个 postMessage(告警是另一 job_id 的消息,不算)
+        for _ in range(200):
+            env.clock.tick(5_000)
+            env.outbound.tick()
+        mine = [q for q in env.client.calls_for(PM) if q["metadata"]["event_payload"]["job_id"] == r["job_id"]]
+        assert len(mine) == 1
+        assert row(env, "turn:g:0")["state"] == "unconfirmed"  # 能力 unverified → 三次未见即 unconfirmed
+
+    def test_idempotent_unknown_retries_then_cap_failed(self, env):
+        bid = env.make_binding(status="active")
+        key = decision_job(env, bid, "p1", "rejected", card=CHAT + ":5.5")
+        env.client.on(UPD, lambda m, q: http5xx())
+        t0 = env.clock.wall_ms()
+        env.outbound.tick()
+        r = row(env, key)
+        assert r["state"] == "unknown" and r["attempt_count"] == 1 and r["had_unknown"] == 0
+        assert r["next_attempt_at"] == t0 + C.IDEMPOTENT_RETRY_DELAY_MS and r["verify_after"] is None
+        for _ in range(3):
+            env.clock.tick(C.IDEMPOTENT_RETRY_DELAY_MS + 1)
+            env.outbound.tick()
+        r = row(env, key)
+        assert r["state"] == "failed" and r["attempt_count"] == C.IDEMPOTENT_CAP
+        assert len(env.client.calls_for(UPD)) == C.IDEMPOTENT_CAP  # _prepare 在第 4 次前拦住
+        assert alerts(env) == []
+
+    def test_idempotent_failed_no_alert(self, env):
+        bid = env.make_binding(status="active")
+        key = decision_job(env, bid, "p1", "rejected", card=CHAT + ":5.5")
+        env.client.on(UPD, lambda m, q: err("message_not_found"))
+        env.outbound.tick()
+        assert row(env, key)["state"] == "failed" and alerts(env) == []
+
+    def test_idempotent_ratelimited_and_not_sent_backoff(self, env):
+        bid = env.make_binding(status="active")
+        key, _ = reaction_job(env, bid)
+        env.client.on(REACT, seq(ratelimited(retry_after=2), not_sent(), ok()))
+        env.outbound.tick()
+        r = row(env, key)
+        assert r["state"] == "pending" and r["ratelimit_count"] == 1 and r["attempt_count"] == 0
+        env.clock.tick(2001)
+        env.outbound.tick()
+        r = row(env, key)
+        assert r["state"] == "pending" and r["transient_count"] == 1 and r["attempt_count"] == 0
+        env.clock.tick(C.TRANSIENT_BACKOFF_MS + 1)
+        env.outbound.tick()
+        assert row(env, key)["state"] == "sent"
+
+    def test_cooldown_consumed_five_times_not_failed(self, env):
+        """冷却 wait 不消耗任何预算(R3-P2):5 次冷却后既不 failed,ac 也不变。"""
+        bid = env.make_binding(status="active")
+        mk_turn(env, bid)
+        for _ in range(5):
+            until = env.clock.wall_ms() + 1000
+            env.client.cooldown_store.publish(PM, until)
+            env.outbound.tick()
+            r = row(env, "turn:g:0")
+            assert r["state"] == "pending" and r["next_attempt_at"] == until and r["attempt_count"] == 0
+            env.clock.tick(1001)
+        # 竞态版本:_prepare 之后才发布冷却 → call 返回 wait
+        for _ in range(5):
+            j = row(env, "turn:g:0")
+            assert env.outbound._prepare(j) == "send"
+            until = env.clock.wall_ms() + 1000
+            env.client.cooldown_store.publish(PM, until)
+            env.outbound._send_and_finalize(j["job_id"])
+            r = row(env, "turn:g:0")
+            assert r["state"] == "pending" and r["attempt_count"] == 0
+            env.clock.tick(1001)
+        r = row(env, "turn:g:0")
+        assert r["transient_count"] == 0 and r["ratelimit_count"] == 0 and env.client.calls == []
+        assert counter(env, "cooldown_waits") == 5
+        arm_post(env)
+        env.outbound.tick()
+        assert row(env, "turn:g:0")["state"] == "sent"
+
+
+# ======================================================================
+# §2.6 核验(逐行)
+# ======================================================================
+class TestVerify:
+    def test_hit_via_history_metadata(self, env):
+        bid = env.make_binding(status="active")
+        r = send_unknown(env, bid)
+        sending_at = r["sending_at"]
+        ts = next_ts()
+        env.client.on(HIST, lambda m, q: history([
+            {"type": "message", "bot_id": "B_OTHER", "ts": "1.1"},
+            hit_msg(r["job_id"], ts)]))
+        verify_tick(env)
+        r2 = row(env, "turn:g:0")
+        assert r2["state"] == "sent" and r2["sent_message_id"] == CHAT + ":" + ts and r2["verify_after"] is None
+        assert counter(env, "verify_hit") == 1 and len(env.client.calls_for(PM)) == 1
+        q = env.client.calls_for(HIST)[0]
+        assert q["channel"] == CHAT and q["inclusive"] is True and q["include_all_metadata"] is True
+        assert q["limit"] == C.VERIFY_PAGE_LIMIT and "ts" not in q
+        assert q["oldest"] == "%.6f" % ((sending_at - C.VERIFY_LOOKBACK_MS) / 1000.0)
+
+    def test_hit_via_replies_for_threaded_card(self, env):
+        bid = env.make_binding(status="active")
+        member_pending(env, bid, thread_ts="1700000000.000001")
+        arm_post(env, timeout())
+        env.outbound.tick()
+        card = row(env, "card:p1")
+        assert card["state"] == "unknown" and card["op_thread_ts"] == "1700000000.000001"
+        ts = next_ts()
+        env.client.on(REPL, lambda m, q: history([hit_msg(card["job_id"], ts)]))
+        verify_tick(env)
+        card = row(env, "card:p1")
+        assert card["state"] == "sent" and card["sent_message_id"] == CHAT + ":" + ts
+        q = env.client.calls_for(REPL)[0]
+        assert q["channel"] == CHAT and q["ts"] == "1700000000.000001" and q["include_all_metadata"] is True
+        assert env.client.calls_for(HIST) == []
+        assert env.conn.execute("SELECT card_message_id FROM pendings").fetchone()[0] == CHAT + ":" + ts
+
+    def test_absent_schedule_n1_n2(self, env):
+        bid = env.make_binding(status="active")
+        r = send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: history([]))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_absent_count"] == 1 and r["verify_error_count"] == 0
+        assert r["verify_after"] == env.clock.wall_ms() + C.VERIFY_SCHEDULE_MS[1]
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_absent_count"] == 2
+        assert r["verify_after"] == env.clock.wall_ms() + C.VERIFY_SCHEDULE_MS[2]
+        assert counter(env, "verify_absent") == 2 and r["verify_round"] == 0 and r["resend_count"] == 0
+
+    def test_two_errors_one_absent_do_not_resend(self, env):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        send_unknown(env, bid)
+        env.client.on(HIST, seq(http5xx(), timeout(), history([])))
+        verify_tick(env)   # error 1
+        r = row(env, "turn:g:0")
+        assert r["verify_error_count"] == 1 and r["verify_absent_count"] == 0
+        assert r["verify_after"] == env.clock.wall_ms() + C.VERIFY_ERROR_BACKOFF_MS
+        verify_tick(env)   # error 2
+        r = row(env, "turn:g:0")
+        assert r["verify_error_count"] == 2 and r["verify_after"] == env.clock.wall_ms() + 2 * C.VERIFY_ERROR_BACKOFF_MS
+        verify_tick(env)   # absent 1(错误不凑数)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_absent_count"] == 1 and r["verify_error_count"] == 2
+        assert r["resend_count"] == 0 and len(env.client.calls_for(PM)) == 1
+        # 还要两次成功未见才获准重发
+        verify_tick(env)
+        assert row(env, "turn:g:0")["verify_absent_count"] == 2 and len(env.client.calls_for(PM)) == 1
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "pending" and r["resend_count"] == 1 and len(env.client.calls_for(PM)) == 1
+
+    def test_two_absents_restart_third_absent_resends(self, env):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        r0 = send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: history([]))
+        verify_tick(env)
+        verify_tick(env)
+        assert row(env, "turn:g:0")["verify_absent_count"] == 2
+        # 模拟重启:新 Outbound 实例 + startup_scan,不得扰动已排程的核验
+        env.outbound = Outbound(env.conn, env.cfg, env.client, env.clock)
         env.outbound.startup_scan()
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "unknown" and row["next_attempt_at"] is not None
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_absent_count"] == 2 and r["verify_after"] > env.clock.wall_ms()
+        verify_tick(env)   # 第三次成功未见 → 获准重发(同一 CAS 内切轮、归零)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "pending" and r["next_attempt_at"] == env.clock.wall_ms()
+        assert r["resend_count"] == 1 and r["verify_round"] == 1
+        assert r["verify_absent_count"] == 0 and r["verify_error_count"] == 0 and r["verify_after"] is None
+        assert r["had_unknown"] == 1 and counter(env, "verify_resent") == 1
+        assert len(env.client.calls_for(PM)) == 1  # 获准 ≠ 已发
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "sent" and r["attempt_count"] == 2 and r["job_id"] == r0["job_id"]
+        calls = env.client.calls_for(PM)
+        assert len(calls) == 2 and calls[0]["metadata"] == calls[1]["metadata"]  # job_id 重发后不变
+
+    def test_unverified_capability_three_absents_unconfirmed(self, env):
+        bid = env.make_binding(status="active")
+        assert dbmod.get_state(env.conn, C.VERIFY_CAPABILITY_KEY) == "unverified"
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: history([]))
+        for _ in range(3):
+            verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["resend_count"] == 0 and r["verify_round"] == 0
+        assert counter(env, "verify_unconfirmed") == 1 and len(env.client.calls_for(PM)) == 1
+        assert alerts(env)[0]["body"] == texts.unconfirmed_alert_body()
+
+    def test_capability_version_mismatch_three_absents_unconfirmed(self, env):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env, version="some-other-version")
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: history([]))
+        for _ in range(3):
+            verify_tick(env)
+        assert row(env, "turn:g:0")["state"] == "unconfirmed" and len(env.client.calls_for(PM)) == 1
+
+    def test_capability_degraded_three_absents_unconfirmed(self, env):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        dbmod.set_state(env.conn, C.VERIFY_CAPABILITY_KEY, "degraded:missing_scope")
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: history([]))
+        for _ in range(3):
+            verify_tick(env)
+        assert row(env, "turn:g:0")["state"] == "unconfirmed" and len(env.client.calls_for(PM)) == 1
+
+    def test_resend_only_once_second_round_unconfirmed(self, env):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        send_unknown(env, bid, then=(timeout(),))  # 重发也超时
+        env.client.on(HIST, lambda m, q: history([]))
+        for _ in range(3):
+            verify_tick(env)
+        assert row(env, "turn:g:0")["state"] == "pending"
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_round"] == 1 and r["attempt_count"] == 2
+        assert len(env.client.calls_for(PM)) == 2
+        for _ in range(3):
+            verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["resend_count"] == 1 and len(env.client.calls_for(PM)) == 2
+
+    def test_resend_refused_when_tokens_version_changed(self, env):
+        """R5-S1:获准重发后凭据换了 → _prepare 用本次实际凭据复验 → 拒发、unconfirmed。"""
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: history([]))
+        for _ in range(3):
+            verify_tick(env)
+        assert row(env, "turn:g:0")["state"] == "pending"
+        env.client.set_tokens_version("fake-v2")   # FingerprintGate 重载凭据(探测版本仍是 v1)
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["error"].startswith("resend-refused")
+        assert len(env.client.calls_for(PM)) == 1   # 没有第二次 POST
+        assert alerts(env)[0]["body"] == texts.unconfirmed_alert_body()
+
+    def test_error_cap_unconfirmed(self, env):
+        bid = env.make_binding(status="active")
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: http5xx())
+        for i in range(C.VERIFY_ERROR_CAP - 1):
+            verify_tick(env)
+            r = row(env, "turn:g:0")
+            assert r["state"] == "unknown" and r["verify_error_count"] == i + 1 and r["verify_absent_count"] == 0
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["verify_error_count"] == C.VERIFY_ERROR_CAP
+        assert counter(env, "verify_unconfirmed") == 1 and len(alerts(env)) == 1
+
+    def test_error_backoff_capped(self, env):
+        bid = env.make_binding(status="active")
+        send_unknown(env, bid)
+        set_cols(env, "turn:g:0", verify_error_count=5)
+        env.client.on(HIST, lambda m, q: timeout())
+        verify_tick(env)
+        assert row(env, "turn:g:0")["verify_after"] == env.clock.wall_ms() + C.VERIFY_ERROR_BACKOFF_MAX_MS
+
+    def test_deadline_unconfirmed(self, env):
+        bid = env.make_binding(status="active")
+        send_unknown(env, bid)
+        set_cols(env, "turn:g:0", sending_at=env.clock.wall_ms() - C.VERIFY_DEADLINE_MS - 1)
+        env.client.on(HIST, lambda m, q: http5xx())
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["verify_error_count"] == 1
+
+    def test_ratelimited_stays_unknown_counts_untouched(self, env):
+        bid = env.make_binding(status="active")
+        send_unknown(env, bid)
+        set_cols(env, "turn:g:0", verify_absent_count=2, verify_error_count=1)
+        env.client.on(HIST, lambda m, q: ratelimited(retry_after=7))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_after"] == env.clock.wall_ms() + 7000
+        assert r["verify_absent_count"] == 2 and r["verify_error_count"] == 1 and r["resend_count"] == 0
+        assert counter(env, "ratelimit_hits") == 1
+
+    def test_wait_stays_unknown_precheck_and_race(self, env):
+        """核验分支 wait:tick 预检只写 verify_after;竞态 call(wait) 也只写 verify_after;绝不回 pending。"""
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        r = send_unknown(env, bid)
+        set_cols(env, "turn:g:0", verify_absent_count=2)   # 下一次成功未见就会获准重发
+        env.clock.tick(C.VERIFY_SCHEDULE_MS[0])
+        until = env.clock.wall_ms() + 9000
+        env.client.cooldown_store.publish(HIST, until)
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_after"] == until and r["verify_absent_count"] == 2
+        assert env.client.waits == [] and env.client.calls_for(HIST) == []   # 预检未到 client
+        # 竞态:预检之后发布冷却 → call 返回 wait
+        set_cols(env, "turn:g:0", verify_after=env.clock.wall_ms())
+        env.client.on(HIST, lambda m, q: history([]))
+        env.client.cooldown_store.publish(HIST, until)
+        assert env.outbound._verify_unknown(env.outbound._job_view(r["job_id"])) == "wait"
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_after"] == until
+        assert r["verify_absent_count"] == 2 and r["verify_error_count"] == 0 and r["resend_count"] == 0
+        assert env.client.waits == [(HIST, until)] and counter(env, "cooldown_waits") == 1
+        assert len(env.client.calls_for(PM)) == 1
+
+    @pytest.mark.parametrize("code", ["not_in_channel", "channel_not_found"])
+    def test_channel_error_unconfirmed_only_this_job_capability_unchanged(self, env, code):
+        """频道级永久错(VERIFY_CHANNEL_ERRORS):只本 job unconfirmed(+告警),verify_capability 不动,
+        其它频道的 job 仍可获准重发。"""
+        bid_a = env.make_binding(status="active", chat_id=CHAT, session_id="sA", cc_pid=1111, cc_start="t1")
+        bid_b = env.make_binding(status="active", chat_id="C_B", session_id="sB", cc_pid=2222, cc_start="t2")
+        set_verify_ok(env)
+        arm_post(env, timeout(), timeout(), post_ok)   # A、B 首发超时;之后(A 的告警)正常发出
+        mk_turn(env, bid_a, group="ga", chat_id=CHAT)
+        mk_turn(env, bid_b, group="gb", chat_id="C_B")
+        env.outbound.tick()
+        ra, rb = row(env, "turn:ga:0"), row(env, "turn:gb:0")
+        assert ra["state"] == "unknown" and rb["state"] == "unknown"
+        env.client.on(HIST, lambda m, q: err(code) if q["channel"] == CHAT else history([]))
+        verify_tick(env)   # 两者同时到期:A 频道错 → unconfirmed;B 成功未见 n=1
+        ra = row(env, "turn:ga:0")
+        assert ra["state"] == "unconfirmed" and code in ra["error"]
+        assert dbmod.get_state(env.conn, C.VERIFY_CAPABILITY_KEY) == C.VERIFY_CAP_OK   # 能力不动
+        assert [a["chat_id"] for a in alerts(env)] == [CHAT] and alerts(env)[0]["body"] == texts.unconfirmed_alert_body()
+        assert counter(env, "verify_unconfirmed") == 1
+        verify_tick(env)
+        verify_tick(env)   # B 第三次成功未见 → 仍获准重发(能力未被 A 的频道错拖累)
+        rb = row(env, "turn:gb:0")
+        assert rb["state"] == "pending" and rb["resend_count"] == 1 and rb["verify_round"] == 1
+        ids = [q["metadata"]["event_payload"]["job_id"] for q in env.client.calls_for(PM)]
+        assert ids.count(ra["job_id"]) == 1 and ids.count(rb["job_id"]) == 1   # 各一次首发;B 尚未重发
+        assert alerts(env)[0]["state"] == "sent"
+
+    @pytest.mark.parametrize("code", ["missing_scope", "invalid_auth"])
+    def test_global_error_unconfirmed_and_degrades_capability(self, env, code):
+        """能力级永久错(VERIFY_GLOBAL_DEGRADE_ERRORS,含 NOT_SENT_ERRORS 族的 invalid_auth):
+        本 job unconfirmed + verify_capability=degraded:<err>。"""
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: err(code))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and code in r["error"]
+        assert dbmod.get_state(env.conn, C.VERIFY_CAPABILITY_KEY) == "degraded:%s" % code
+        assert len(env.client.calls_for(PM)) == 1 and len(alerts(env)) == 1
+
+    @pytest.mark.parametrize("code", ["msg_too_long", "some_new_code", "internal_error"])
+    def test_other_error_codes_stay_in_error_branch(self, env, code):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: err(code))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_error_count"] == 1 and r["verify_absent_count"] == 0
+        assert dbmod.get_state(env.conn, C.VERIFY_CAPABILITY_KEY) == C.VERIFY_CAP_OK
+
+    def test_pagination_cursor_then_hit(self, env):
+        bid = env.make_binding(status="active")
+        r = send_unknown(env, bid)
+        ts = next_ts()
+        env.client.on(HIST, seq(history([], has_more=True, cursor="c1"), history([hit_msg(r["job_id"], ts)])))
+        verify_tick(env)
+        assert row(env, "turn:g:0")["state"] == "sent"
+        calls = env.client.calls_for(HIST)
+        assert len(calls) == 2 and "cursor" not in calls[0] and calls[1]["cursor"] == "c1"
+
+    def test_pagination_exhausted_is_error_not_absent(self, env):
+        bid = env.make_binding(status="active")
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: history([], has_more=True, cursor="more"))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_error_count"] == 1 and r["verify_absent_count"] == 0
+        assert len(env.client.calls_for(HIST)) == C.VERIFY_MAX_PAGES
+
+    def test_hit_requires_bot_id_event_type_and_job_id(self, env):
+        bid = env.make_binding(status="active")
+        r = send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: history([
+            hit_msg(r["job_id"], bot_id="B_OTHER"),
+            hit_msg("other-job"),
+            dict(hit_msg(r["job_id"]), metadata={"event_type": "other", "event_payload": {"job_id": r["job_id"]}}),
+            {"type": "message", "bot_id": BOT_ID, "ts": "1.1"},
+        ]))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_absent_count"] == 1
+
+    def test_stale_round_cas_is_noop(self, env):
+        bid = env.make_binding(status="active")
+        r = send_unknown(env, bid)
+        view = env.outbound._job_view(r["job_id"])
+        env.client.on(HIST, lambda m, q: history([hit_msg(r["job_id"])]))
+        set_cols(env, "turn:g:0", verify_round=1)   # 期间已切轮
+        assert env.outbound._verify_unknown(view) == "stale"
+        assert row(env, "turn:g:0")["state"] == "unknown"
 
 
-class TestGuards:
-    def test_session_turn_binding_not_active_cancelled(self, env):
+# ======================================================================
+# _prepare 顺序 / cap / 冻结断言(§2.4)
+# ======================================================================
+class TestPrepare:
+    def test_guard_before_cap_and_cap_before_capability(self, env):
         bid = env.make_binding(status="closed", close_reason="user_unbind")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.outbound.tick()
-        assert job_state(env, "turn:g:0")["state"] == "cancelled"
-        assert env.runner.calls == []
+        mk_turn(env, bid)
+        set_cols(env, "turn:g:0", attempt_count=C.TURN_CAP)
+        assert env.outbound._prepare(row(env, "turn:g:0")) == "cancelled"   # 守卫先于 cap
+        assert row(env, "turn:g:0")["state"] == "cancelled" and alerts(env) == []
 
-    def test_approval_card_guard_and_backfill(self, env):
-        from tests.test_approval import member_pending
-        p = member_pending(env)
-        env.runner.on_prefix(["im", "+messages-reply"],
-                             lambda a, c: ok_envelope({"message_id": "om_card_1"}))
-        env.outbound.tick()
-        card = job_state(env, f"card:{p['pending_id']}")
-        assert card["state"] == "sent"
-        args, _ = env.runner.calls_matching("im", "+messages-reply")[0]
-        assert args[args.index("--message-id") + 1] == "om_1"
-        assert args[args.index("--msg-type") + 1] == "interactive"
-        # 发出后回填 card_message_id
-        pr = env.conn.execute("SELECT card_message_id FROM pendings WHERE pending_id=?",
-                              (p["pending_id"],)).fetchone()
-        assert pr[0] == "om_card_1"
-
-    def test_approval_card_cancelled_if_decided(self, env):
-        from tests.test_approval import member_pending
-        p = member_pending(env)
-        env.conn.execute("UPDATE pendings SET state='rejected' WHERE pending_id=?",
-                         (p["pending_id"],))
-        env.outbound.tick()
-        assert job_state(env, f"card:{p['pending_id']}")["state"] == "cancelled"
-
-    def test_approval_card_cancelled_if_already_backfilled(self, env):
-        from tests.test_approval import member_pending
-        p = member_pending(env)
-        env.conn.execute("UPDATE pendings SET card_message_id='om_prev' WHERE pending_id=?",
-                         (p["pending_id"],))
-        env.outbound.tick()
-        assert job_state(env, f"card:{p['pending_id']}")["state"] == "cancelled"
-
-    def test_decision_notice_guard_by_pending_state(self, env):
+    def test_cap_postmessage_terminal_by_had_unknown(self, env):
         bid = env.make_binding(status="active")
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts) "
-            "VALUES('ev_1','om_1',?,?,'rejected',0)", (CHAT, bid))
-        env.conn.execute(
-            "INSERT INTO pendings(pending_id,message_id,binding_id,nonce,state) "
-            "VALUES('p1','om_1',?,'n','rejected')", (bid,))
-        arm_send_ok(env)
-        mk_job(env, kind="decision_notice", key="dec:p1:rejected", binding_id=bid,
-               ref_pending_id="p1", expected_state="rejected")
-        mk_job(env, kind="decision_notice", key="dec:p1:approved", binding_id=bid,
-               ref_pending_id="p1", expected_state="approved")
-        env.outbound.tick()
-        assert job_state(env, "dec:p1:rejected")["state"] == "sent"
-        assert job_state(env, "dec:p1:approved")["state"] == "cancelled"
+        mk_turn(env, bid, group="a")
+        set_cols(env, "turn:a:0", attempt_count=C.TURN_CAP)
+        assert env.outbound._prepare(row(env, "turn:a:0")) == "terminal"
+        assert row(env, "turn:a:0")["state"] == "failed" and len(alerts(env)) == 1
+        env.conn.execute("UPDATE outbound_jobs SET state='cancelled' WHERE turn_group LIKE '__sendfail__:%'")  # 告警不挡 b 组
+        mk_turn(env, bid, group="b")
+        freeze_turn(env, "turn:b:0")
+        set_cols(env, "turn:b:0", attempt_count=C.TURN_CAP, had_unknown=1)   # cap 先于能力复验:能力 unverified 也无关
+        assert env.outbound._prepare(row(env, "turn:b:0")) == "terminal"
+        assert row(env, "turn:b:0")["state"] == "unconfirmed"
+        member_pending(env, bid)
+        set_cols(env, "card:p1", attempt_count=C.CARD_CAP)
+        assert env.outbound._prepare(row(env, "card:p1")) == "terminal"
+        assert row(env, "card:p1")["state"] == "failed"
+        assert env.client.calls == []
 
-    def test_lifecycle_notice_guard(self, env):
+    def test_corrupt_negative_attempt_count_terminal(self, env):
         bid = env.make_binding(status="active")
-        arm_send_ok(env)
-        mk_job(env, kind="lifecycle_notice", key=f"lc:{bid}:bound", binding_id=bid,
-               expected_state="active")
-        mk_job(env, kind="lifecycle_notice", key=f"lc:{bid}:user_unbind", binding_id=bid,
-               expected_state="closed:user_unbind")
-        env.outbound.tick()
-        assert job_state(env, f"lc:{bid}:bound")["state"] == "sent"
-        assert job_state(env, f"lc:{bid}:user_unbind")["state"] == "cancelled"
+        mk_turn(env, bid)
+        set_cols(env, "turn:g:0", attempt_count=-1)
+        assert env.outbound._prepare(row(env, "turn:g:0")) == "terminal"
+        assert row(env, "turn:g:0")["state"] == "failed"
 
-    def test_inbound_and_unsupported_notice_guards(self, env):
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) "
-            "VALUES('ev_1','om_1',?,'unbound',0)", (CHAT,))
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) "
-            "VALUES('ev_2','om_2',?,'enqueued',0)", (CHAT,))
-        arm_send_ok(env)
-        mk_job(env, kind="inbound_notice", key="notice:om_1:unbound",
-               ref_message_id="om_1", expected_state="unbound")
-        mk_job(env, kind="unsupported_notice", key="un:om_2",
-               ref_message_id="om_2", expected_state="unsupported")
-        env.outbound.tick()
-        assert job_state(env, "notice:om_1:unbound")["state"] == "sent"
-        assert job_state(env, "un:om_2")["state"] == "cancelled"  # inbox 状态不符
-
-    def test_receipt_reaction_guard_and_no_retry(self, env):
+    def test_idempotent_cap_failed_before_send(self, env):
         bid = env.make_binding(status="active")
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts) "
-            "VALUES('ev_1','om_1',?,?,'enqueued',0)", (CHAT, bid))
-        env.conn.execute(
-            "INSERT INTO deliveries(binding_id,message_id,payload_json,state) "
-            "VALUES(?,'om_1','{}','enqueued')", (bid,))
-        seq = env.conn.execute("SELECT delivery_seq FROM deliveries").fetchone()[0]
-        env.runner.on_prefix(["im", "reactions", "create"],
-                             lambda a, c: FakeRunResult(rc=1, stdout="", timed_out=True))
-        mk_job(env, kind="receipt_reaction", key=f"rc:{seq}", binding_id=bid,
-               ref_delivery_seq=seq, ref_message_id="om_1", body="GLANCE")
+        key = decision_job(env, bid, "p1", "rejected", card=CHAT + ":5.5")
+        set_cols(env, key, state="unknown", attempt_count=C.IDEMPOTENT_CAP, next_attempt_at=env.clock.wall_ms(),
+                 op_method=UPD, op_target=CHAT + ":5.5", op_payload_kind="blocks")
         env.outbound.tick()
-        assert job_state(env, f"rc:{seq}")["state"] == "failed"  # 失败即 failed 不重试
+        assert row(env, key)["state"] == "failed" and env.client.calls == []
 
-    def test_receipt_reaction_cancelled_on_dropped_delivery(self, env):
+    def test_freeze_assertion_missing_op_is_unconfirmed(self, env):
         bid = env.make_binding(status="active")
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts) "
-            "VALUES('ev_1','om_1',?,?,'enqueued',0)", (CHAT, bid))
-        env.conn.execute(
-            "INSERT INTO deliveries(binding_id,message_id,payload_json,state) "
-            "VALUES(?,'om_1','{}','dropped')", (bid,))
-        seq = env.conn.execute("SELECT delivery_seq FROM deliveries").fetchone()[0]
-        mk_job(env, kind="receipt_reaction", key=f"rc:{seq}", binding_id=bid,
-               ref_delivery_seq=seq, ref_message_id="om_1", body="GLANCE")
+        set_verify_ok(env)
+        mk_turn(env, bid)
+        set_cols(env, "turn:g:0", had_unknown=1)   # had_unknown=1 却无冻结 op_* → 编程错误,fail-closed
+        assert env.outbound._prepare(row(env, "turn:g:0")) == "terminal"
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["error"] == "op-freeze-mismatch" and env.client.calls == []
+
+    def test_freeze_assertion_mismatch_is_unconfirmed(self, env, monkeypatch):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        mk_turn(env, bid)
+        freeze_turn(env, "turn:g:0", payload_kind="markdown_text")
+        set_cols(env, "turn:g:0", had_unknown=1)
+        real = outbound.op_for
+        monkeypatch.setattr(outbound, "op_for", lambda v, cfg: (PM, CHAT, None, "text") if v["had_unknown"] else real(v, cfg))
+        arm_post(env)
         env.outbound.tick()
-        assert job_state(env, f"rc:{seq}")["state"] == "cancelled"
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unconfirmed" and r["error"] == "op-freeze-mismatch"
+        assert env.client.calls == [] and r["op_payload_kind"] == "markdown_text"
 
-    def test_reaction_success_argv_shape(self, env):
+    def test_had_unknown_never_cleared(self, env):
         bid = env.make_binding(status="active")
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts) "
-            "VALUES('ev_1','om_1',?,?,'enqueued',0)", (CHAT, bid))
-        env.conn.execute(
-            "INSERT INTO deliveries(binding_id,message_id,payload_json,state) "
-            "VALUES(?,'om_1','{}','enqueued')", (bid,))
-        seq = env.conn.execute("SELECT delivery_seq FROM deliveries").fetchone()[0]
-        env.runner.on_prefix(["im", "reactions", "create"],
-                             lambda a, c: ok_envelope({"reaction_id": "r1"}))
-        mk_job(env, kind="receipt_reaction", key=f"rc:{seq}", binding_id=bid,
-               ref_delivery_seq=seq, ref_message_id="om_1", body="GLANCE")
+        set_verify_ok(env)
+        r = send_unknown(env, bid, then=(ratelimited(retry_after=1), post_ok))
+        env.client.on(HIST, lambda m, q: history([]))
+        for _ in range(3):
+            verify_tick(env)
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()                      # 重发 → 429 → pending
+        assert row(env, "turn:g:0")["state"] == "pending" and row(env, "turn:g:0")["had_unknown"] == 1
+        env.clock.tick(1001)
         env.outbound.tick()
-        assert job_state(env, f"rc:{seq}")["state"] == "sent"
-        args, _ = env.runner.calls_matching("im", "reactions", "create")[0]
-        params = json.loads(args[args.index("--params") + 1])
-        data = json.loads(args[args.index("--data") + 1])
-        assert params == {"message_id": "om_1"}
-        assert data == {"reaction_type": {"emoji_type": "GLANCE"}}
+        r = row(env, "turn:g:0")
+        assert r["state"] == "sent" and r["had_unknown"] == 1 and r["verify_round"] == 1
 
-
-class TestOrdering:
-    def test_chunks_in_group_strict_order(self, env):
+    def test_prepare_returns_gone_for_terminal(self, env):
         bid = env.make_binding(status="active")
-        sent = []
+        mk_turn(env, bid)
+        set_cols(env, "turn:g:0", state="sent")
+        assert env.outbound._prepare(row(env, "turn:g:0")) == "gone"
+        assert env.outbound._prepare({"job_id": "nope"}) == "gone"
 
-        def fn(args, cwd):
-            body = args[args.index("--markdown") + 1]  # session_turn 走 --markdown
-            sent.append(body)
-            return ok_envelope({"message_id": f"om_{len(sent)}"})
+    def test_prepare_skips_unknown_postmessage(self, env):
+        bid = env.make_binding(status="active")
+        r = send_unknown(env, bid)
+        set_cols(env, "turn:g:0", next_attempt_at=env.clock.wall_ms())   # 即便有 next 也不从 unknown 发送
+        assert env.outbound._prepare(r) == "skip"
+        assert row(env, "turn:g:0")["state"] == "unknown"
 
-        env.runner.on_prefix(["im", "+messages-send"], fn)
+
+# ======================================================================
+# 冷却预检 / 节流(§2.4-7 / §2.8)
+# ======================================================================
+class TestCooldownAndPacing:
+    def test_cooled_new_job_never_enters_sending(self, env):
+        bid = env.make_binding(status="active")
+        until = env.clock.wall_ms() + 8000
+        env.client.cooldown_store.publish(PM, until)
+        mk_turn(env, bid)
+        assert env.outbound.tick() == 0
+        r = row(env, "turn:g:0")
+        assert r["state"] == "pending" and r["next_attempt_at"] == until and r["attempt_count"] == 0
+        assert r["op_method"] is None   # 未进 _prepare,未冻结
+        assert env.client.calls == [] and env.client.waits == []
+        env.clock.tick(8001)
+        arm_post(env)
+        assert env.outbound.tick() == 1
+
+    def test_cooled_decision_update_does_not_enter_sending(self, env):
+        """卡片身份已知的新 decision_notice 遇 chat.update 冷却 → 不进 sending(投影 + 纯函数解析方法)。"""
+        bid = env.make_binding(status="active")
+        key = decision_job(env, bid, "p1", "rejected", card=CHAT + ":5.5")
+        until = env.clock.wall_ms() + 4000
+        env.client.cooldown_store.publish(UPD, until)
+        arm_post(env)   # postMessage 未冷却:若误判类别会发出去
+        env.outbound.tick()
+        r = row(env, key)
+        assert r["state"] == "pending" and r["next_attempt_at"] == until and env.client.calls == []
+
+    def test_cooldown_on_other_method_does_not_block(self, env):
+        bid = env.make_binding(status="active")
+        env.client.cooldown_store.publish(UPD, env.clock.wall_ms() + 4000)
+        arm_post(env)
+        mk_turn(env, bid)
+        assert env.outbound.tick() == 1
+
+    def test_post_pacing_one_per_second_per_channel(self, env):
         for i in range(3):
-            mk_job(env, binding_id=bid, key=f"turn:g:{i}", body=f"chunk{i}",
-                   turn_group="g", chunk_index=i)
-        env.outbound.tick()
-        assert sent == ["chunk0", "chunk1", "chunk2"]
+            mid = "%s:%d.1" % (CHAT, i)
+            inbox(env, mid, "unbound")
+            mk_job(env, kind="inbound_notice", key=jobs.key_notice(mid, "unbound"), ref_message_id=mid,
+                   expected_state="unbound", body="n%d" % i)
+        arm_post(env)
+        assert env.outbound.tick() == 1
+        assert env.outbound.tick() == 0          # 同一秒内不再发
+        env.clock.tick(C.POST_MIN_INTERVAL_MS - 1)
+        assert env.outbound.tick() == 0
+        env.clock.tick(1)
+        assert env.outbound.tick() == 1
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        assert env.outbound.tick() == 1
+        assert [q["text"] for q in env.client.calls_for(PM)] == ["n0", "n1", "n2"]
 
-    def test_chunk_blocked_while_prev_unknown(self, env):
+    def test_pacing_independent_across_channels_and_idempotent(self, env):
+        bid_a = env.make_binding(status="active", chat_id="C_A", session_id="sA", cc_pid=1111, cc_start="t1")
+        bid_b = env.make_binding(status="active", chat_id="C_B", session_id="sB", cc_pid=2222, cc_start="t2")
+        env.conn.execute("UPDATE outbound_jobs SET state='cancelled'")
+        arm_post(env)
+        mk_turn(env, bid_a, group="ga", chat_id="C_A")
+        mk_turn(env, bid_b, group="gb", chat_id="C_B")
+        key, _ = reaction_job(env, bid_a)
+        env.client.on(REACT, lambda m, q: ok())
+        assert env.outbound.tick() == 3
+
+
+# ======================================================================
+# 排序(§2.8)
+# ======================================================================
+class TestOrdering:
+    def test_chunks_strict_order_across_ticks(self, env):
         bid = env.make_binding(status="active")
-        calls = {"n": 0}
+        arm_post(env)
+        for i in range(3):
+            mk_turn(env, bid, idx=i, body="c%d" % i)
+        assert env.outbound.tick() == 1   # 每频道节流:一 tick 一块
+        run_ticks(env, 3)
+        assert [q["markdown_text"] for q in env.client.calls_for(PM)] == ["c0", "c1", "c2"]
+        assert all(row(env, "turn:g:%d" % i)["state"] == "sent" for i in range(3))
 
-        def fn(args, cwd):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return FakeRunResult(rc=1, stdout="", timed_out=True)  # chunk0 unknown
-            return ok_envelope({"message_id": f"om_{calls['n']}"})
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        mk_job(env, binding_id=bid, key="turn:g:0", body="c0", turn_group="g", chunk_index=0)
-        mk_job(env, binding_id=bid, key="turn:g:1", body="c1", turn_group="g", chunk_index=1)
-        env.outbound.tick()
-        assert job_state(env, "turn:g:0")["state"] == "unknown"
-        assert job_state(env, "turn:g:1")["state"] == "pending"  # 前块非 sent 后块不发
-        env.clock.tick(constants.UNKNOWN_RETRY_DELAY_MS + 1)
-        env.outbound.tick()
-        assert job_state(env, "turn:g:0")["state"] == "sent"
-        assert job_state(env, "turn:g:1")["state"] == "sent"
+    def test_chunk_blocked_while_prev_unknown_then_flows_after_hit(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env, timeout(), post_ok)
+        mk_turn(env, bid, idx=0, body="c0")
+        mk_turn(env, bid, idx=1, body="c1")
+        run_ticks(env, 2)
+        assert row(env, "turn:g:0")["state"] == "unknown" and row(env, "turn:g:1")["state"] == "pending"
+        assert len(env.client.calls_for(PM)) == 1
+        jid = row(env, "turn:g:0")["job_id"]
+        env.client.on(HIST, lambda m, q: history([hit_msg(jid)]))
+        verify_tick(env)
+        assert row(env, "turn:g:0")["state"] == "sent"
+        run_ticks(env, 2)
+        assert row(env, "turn:g:1")["state"] == "sent" and len(env.client.calls_for(PM)) == 2
 
     def test_chunk_after_failed_prev_cancelled(self, env):
         bid = env.make_binding(status="active")
-        env.runner.on_prefix(["im", "+messages-send"], lambda a, c: err_envelope(230002))
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        mk_job(env, binding_id=bid, key="turn:g:1", turn_group="g", chunk_index=1)
-        env.outbound.tick()
-        env.outbound.tick()
-        assert job_state(env, "turn:g:0")["state"] == "failed"
-        assert job_state(env, "turn:g:1")["state"] == "cancelled"
+        arm_post(env, err("channel_not_found"))
+        mk_turn(env, bid, idx=0)
+        mk_turn(env, bid, idx=1)
+        run_ticks(env, 2)
+        assert row(env, "turn:g:0")["state"] == "failed"
+        r1 = row(env, "turn:g:1")
+        assert r1["state"] == "cancelled" and r1["error"] == "prev-chunk-failed"
 
-    def test_turn_groups_ordered_unknown_blocks_next_group(self, env):
+    def test_pending_backoff_group_blocks_later_group(self, env):
         bid = env.make_binding(status="active")
-        env.runner.on_prefix(["im", "+messages-send"],
-                             lambda a, c: FakeRunResult(rc=1, stdout="", timed_out=True))
-        mk_job(env, binding_id=bid, key="turn:gA:0", turn_group="gA", chunk_index=0)
-        mk_job(env, binding_id=bid, key="turn:gB:0", turn_group="gB", chunk_index=0)
-        env.outbound.tick()                          # gA attempt1 unknown(+8s);gB 被挡
-        env.clock.tick(constants.TURN_RETRY_BACKOFF_MS + 1)
-        env.outbound.tick()                          # gA attempt2 unknown(+16s,retryable 重试中,非终局)
-        # gA 仍 unknown(退避未到)→ 前组 unknown 期间后组不发(HOL 排序保持)
-        assert job_state(env, "turn:gA:0")["state"] == "unknown"
-        assert job_state(env, "turn:gB:0")["state"] == "pending"  # 前组 unknown 后组不发
+        arm_post(env, ratelimited(retry_after=3), post_ok)
+        mk_turn(env, bid, group="gA")
+        mk_turn(env, bid, group="gB")
+        env.outbound.tick()
+        assert row(env, "turn:gA:0")["state"] == "pending"   # 退避中的 pending 组
+        env.clock.tick(1000)
+        env.outbound.tick()
+        assert row(env, "turn:gB:0")["state"] == "pending" and len(env.client.calls_for(PM)) == 1
+        env.clock.tick(2001)
+        env.outbound.tick()
+        assert row(env, "turn:gA:0")["state"] == "sent" and row(env, "turn:gB:0")["state"] == "pending"
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()
+        assert row(env, "turn:gB:0")["state"] == "sent"
+
+    def test_unknown_group_blocks_later_group(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env, timeout(), post_ok)
+        env.client.on(HIST, lambda m, q: history([]))
+        mk_turn(env, bid, group="gA")
+        mk_turn(env, bid, group="gB")
+        run_ticks(env, 3)
+        assert row(env, "turn:gA:0")["state"] == "unknown" and row(env, "turn:gB:0")["state"] == "pending"
+        assert len(env.client.calls_for(PM)) == 1
+
+    def test_group_cancelled_after_unconfirmed_next_turn_sends(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env, timeout(), post_ok)
+        for i in range(3):
+            mk_turn(env, bid, group="gA", idx=i, body="a%d" % i)
+        mk_turn(env, bid, group="gB", body="b0")
+        env.outbound.tick()
+        assert row(env, "turn:gA:0")["state"] == "unknown"
+        env.client.on(HIST, lambda m, q: err("channel_not_found"))   # 核验永久错 → unconfirmed
+        verify_tick(env)
+        assert row(env, "turn:gA:0")["state"] == "unconfirmed"
+        for i in (1, 2):
+            r = row(env, "turn:gA:%d" % i)
+            assert r["state"] == "cancelled" and r["error"] == "prev-unconfirmed"
+        assert counter(env, "group_cancelled_after_unconfirmed") == 1
+        assert row(env, "turn:gB:0")["state"] == "sent"   # 同一 tick 里下一轮已放行
+        bodies = sorted(a["body"] for a in alerts(env))
+        assert bodies == sorted([texts.unconfirmed_alert_body(), texts.group_cancelled_alert_body()])
+        assert sum(1 for a in alerts(env) if a["body"] == texts.group_cancelled_alert_body()) == 1
+        run_ticks(env, 3)
+        assert all(a["state"] == "sent" for a in alerts(env))
+        assert len(env.client.calls_for(PM)) == 4   # a0、b0、两条告警;a1/a2 绝不发
+
+    def test_group_cancel_via_order_gate_on_legacy_unconfirmed(self, env):
+        """前块被外部置为 unconfirmed(未经 _set_unconfirmed)→ 后块 _prepare 的顺序门在同一事务取消余块。"""
+        bid = env.make_binding(status="active")
+        for i in range(3):
+            mk_turn(env, bid, idx=i)
+        set_cols(env, "turn:g:0", state="unconfirmed")
+        assert env.outbound._prepare(row(env, "turn:g:1")) == "cancelled"
+        assert row(env, "turn:g:1")["state"] == "cancelled" and row(env, "turn:g:2")["state"] == "cancelled"
+        assert counter(env, "group_cancelled_after_unconfirmed") == 1
+        assert [a["body"] for a in alerts(env)] == [texts.group_cancelled_alert_body()]
 
     def test_other_binding_not_blocked(self, env):
-        bid_a = env.make_binding(status="active", chat_id="oc_A", session_id="sA",
-                                 cc_pid=1111, cc_start="t1")
-        bid_b = env.make_binding(status="active", chat_id="oc_B", session_id="sB",
-                                 cc_pid=2222, cc_start="t2")
-        env.conn.execute("UPDATE outbound_jobs SET state='cancelled'")  # 清 lifecycle 噪声
-        calls = {"n": 0}
-
-        def fn(args, cwd):
-            calls["n"] += 1
-            chat = args[args.index("--chat-id") + 1]
-            if chat == "oc_A":
-                return FakeRunResult(rc=1, stdout="", timed_out=True)
-            return ok_envelope({"message_id": "om_b"})
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        mk_job(env, binding_id=bid_a, chat_id="oc_A", key="turn:ga:0", turn_group="ga", chunk_index=0)
-        mk_job(env, binding_id=bid_b, chat_id="oc_B", key="turn:gb:0", turn_group="gb", chunk_index=0)
+        bid_a = env.make_binding(status="active", chat_id="C_A", session_id="sA", cc_pid=1111, cc_start="t1")
+        bid_b = env.make_binding(status="active", chat_id="C_B", session_id="sB", cc_pid=2222, cc_start="t2")
+        env.conn.execute("UPDATE outbound_jobs SET state='cancelled'")
+        arm_post(env, lambda q: timeout() if q["channel"] == "C_A" else posted(channel=q["channel"]))
+        mk_turn(env, bid_a, group="ga", chat_id="C_A")
+        mk_turn(env, bid_b, group="gb", chat_id="C_B")
         env.outbound.tick()
-        assert job_state(env, "turn:ga:0")["state"] == "unknown"
-        assert job_state(env, "turn:gb:0")["state"] == "sent"
+        assert row(env, "turn:ga:0")["state"] == "unknown" and row(env, "turn:gb:0")["state"] == "sent"
 
     def test_notices_same_chat_ordered_by_job_seq(self, env):
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) VALUES('e1','om_1',?, 'unbound',0)",
-            (CHAT,))
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) VALUES('e2','om_2',?, 'unbound',0)",
-            (CHAT,))
-        calls = {"n": 0}
+        for i in (1, 2):
+            inbox(env, "%s:%d.1" % (CHAT, i), "unbound")
+        arm_post(env, timeout(), post_ok)
+        for i in (1, 2):
+            mid = "%s:%d.1" % (CHAT, i)
+            mk_job(env, kind="inbound_notice", key=jobs.key_notice(mid, "unbound"), ref_message_id=mid,
+                   expected_state="unbound")
+        run_ticks(env, 2)
+        k1, k2 = ("notice:%s:%d.1:unbound" % (CHAT, i) for i in (1, 2))
+        assert row(env, k1)["state"] == "unknown" and row(env, k2)["state"] == "pending"
+        env.client.on(HIST, lambda m, q: history([hit_msg(row(env, k1)["job_id"])]))
+        verify_tick(env)
+        run_ticks(env, 2)
+        assert row(env, k1)["state"] == "sent" and row(env, k2)["state"] == "sent"
 
-        def fn(args, cwd):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return FakeRunResult(rc=1, stdout="", timed_out=True)
-            return ok_envelope({"message_id": "om_x"})
 
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        mk_job(env, kind="inbound_notice", key="notice:om_1:unbound",
-               ref_message_id="om_1", expected_state="unbound")
-        mk_job(env, kind="inbound_notice", key="notice:om_2:unbound",
-               ref_message_id="om_2", expected_state="unbound")
+# ======================================================================
+# 守卫表(与 feishu-bridge 相同的 per-kind 表;decision_notice 按 §5.5 六种 outcome)
+# ======================================================================
+class TestGuards:
+    def test_session_turn_binding_not_active_cancelled(self, env):
+        bid = env.make_binding(status="closed", close_reason="user_unbind")
+        mk_turn(env, bid)
         env.outbound.tick()
-        assert job_state(env, "notice:om_1:unbound")["state"] == "unknown"
-        assert job_state(env, "notice:om_2:unbound")["state"] == "pending"  # 同 chat 按序
+        assert row(env, "turn:g:0")["state"] == "cancelled" and env.client.calls == []
 
-
-class TestErrorClassification:
-    """修复项4:表驱动错误分类:永久集→failed;瞬态集→unknown(仍≤1 次同 key 重试);未知→unknown。"""
-
-    def _job(self, env):
+    def test_approval_card_cancelled_if_decided(self, env):
         bid = env.make_binding(status="active")
-        return mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-
-    def test_permanent_code_failed(self, env):
-        self._job(env)
-        env.runner.on_prefix(["im", "+messages-send"], lambda a, c: err_envelope(230002))
+        member_pending(env, bid)
+        env.conn.execute("UPDATE pendings SET state='rejected' WHERE pending_id='p1'")
         env.outbound.tick()
-        assert job_state(env, "turn:g:0")["state"] == "failed"
+        assert row(env, "card:p1")["state"] == "cancelled" and env.client.calls == []
 
-    def test_transient_code_persists_with_backoff(self, env):
-        """230020(频控)=瞬态 retryable session_turn → 指数退避持久重试(不再 ≤1 次)。"""
-        self._job(env)
-        calls = {"n": 0}
-
-        def fn(args, cwd):
-            calls["n"] += 1
-            return err_envelope(230020, "req too frequent")  # 频控=瞬态
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        env.outbound.tick()                          # a1 +8s
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "unknown" and row["next_attempt_at"] is not None
-        env.clock.tick(constants.TURN_RETRY_BACKOFF_MS + 1)
-        env.outbound.tick()                          # a2 +16s
-        env.clock.tick(2 * constants.TURN_RETRY_BACKOFF_MS + 1)
-        env.outbound.tick()                          # a3 —— 旧实现停在 2
-        assert calls["n"] == 3
-        assert job_state(env, "turn:g:0")["state"] == "unknown"
-
-    def test_unknown_code_nonretryable_failed_after_two(self, env):
-        """未知 code = 非 retryable → MAX_SEND_ATTEMPTS 次后转 failed(放行后续)+ 告警,
-        不再永久 unknown 队头阻塞(2026-07-18 HOL 修复)。"""
-        self._job(env)
-        calls = {"n": 0}
-
-        def fn(args, cwd):
-            calls["n"] += 1
-            return err_envelope(123456789)
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        env.outbound.tick()                          # a1 → unknown,非 retryable 平退避 15s
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "unknown"
-        assert row["next_attempt_at"] - env.clock.wall_ms() == constants.UNKNOWN_RETRY_DELAY_MS
-        env.clock.tick(constants.UNKNOWN_RETRY_DELAY_MS + 1)
-        env.outbound.tick()                          # a2 → ac=2>=MAX → failed + 告警
-        assert calls["n"] == 2
-        assert job_state(env, "turn:g:0")["state"] == "failed"
-        assert env.conn.execute(
-            "SELECT 1 FROM outbound_jobs WHERE turn_group LIKE '__sendfail__:%'").fetchone() is not None
-
-
-class TestPendingBackoffGate:
-    def test_pending_with_future_next_attempt_not_sent(self, env):
-        """修复项3配套:重臂后的 pending 带 next_attempt_at,未到期不发。"""
+    def test_approval_card_cancelled_if_already_backfilled(self, env):
         bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.conn.execute(
-            "UPDATE outbound_jobs SET next_attempt_at=? WHERE idempotency_key='turn:g:0'",
-            (env.clock.wall_ms() + 60_000,))
-        arm_send_ok(env)
-        assert env.outbound.tick() == 0
-        env.clock.tick(60_001)
+        member_pending(env, bid)
+        env.conn.execute("UPDATE pendings SET card_message_id=? WHERE pending_id='p1'", (CHAT + ":1.1",))
+        env.outbound.tick()
+        assert row(env, "card:p1")["state"] == "cancelled"
+
+    def test_approval_card_cancelled_if_binding_closed(self, env):
+        bid = env.make_binding(status="active")
+        member_pending(env, bid)
+        env.conn.execute("UPDATE bindings SET status='closed', close_reason='user_unbind' WHERE binding_id=?", (bid,))
+        env.outbound.tick()
+        assert row(env, "card:p1")["state"] == "cancelled"
+
+    @pytest.mark.parametrize("outcome,pstate,istate,expect", [
+        ("delivered", "approved", "enqueued", "sent"),
+        ("delivered", "approved", "materializing", "cancelled"),
+        ("delivered", "pending", "enqueued", "cancelled"),
+        ("approved_pending_files", "approved", "materializing", "sent"),
+        ("approved_pending_files", "approved", "enqueued", "cancelled"),
+        ("rejected", "rejected", "rejected", "sent"),
+        ("rejected", "approved", "rejected", "cancelled"),
+        ("expired", "expired", "expired", "sent"),
+        ("expired", "pending", "awaiting_approval", "cancelled"),
+        ("attachment_failed", "approved", "failed", "sent"),
+        ("attachment_failed", "approved", "materializing", "cancelled"),
+        ("closed_undelivered", "approved", "undeliverable", "sent"),
+        ("closed_undelivered", "approved", "failed", "cancelled"),
+    ])
+    def test_decision_notice_six_outcomes_guard(self, env, outcome, pstate, istate, expect):
+        bid = env.make_binding(status="active")
+        key = decision_job(env, bid, "p1", outcome, card=CHAT + ":5.5", pstate=pstate, istate=istate)
+        env.client.on(UPD, lambda m, q: ok({"channel": q["channel"], "ts": q["ts"]}))
+        env.outbound.tick()
+        assert row(env, key)["state"] == expect
+        if expect == "sent":
+            assert env.client.calls_for(UPD)[0]["blocks"] == texts.decision_update_blocks(outcome, OWNER)
+        else:
+            assert env.client.calls == []
+
+    def test_decision_notice_unknown_outcome_cancelled(self, env):
+        bid = env.make_binding(status="active")
+        mid = "%s:1.1" % CHAT
+        inbox(env, mid, "rejected", bid)
+        pending(env, "p1", mid, bid, state="rejected")
+        mk_job(env, kind="decision_notice", key="dec:p1:bogus", binding_id=bid, ref_pending_id="p1",
+               expected_state="bogus")
+        env.outbound.tick()
+        assert row(env, "dec:p1:bogus")["state"] == "cancelled"
+
+    def test_lifecycle_notice_guard(self, env):
+        bid = env.make_binding(status="active")
+        arm_post(env)
+        mk_job(env, kind="lifecycle_notice", key="lc:%s:bound" % bid, binding_id=bid, expected_state="active")
+        mk_job(env, kind="lifecycle_notice", key="lc:%s:user_unbind" % bid, binding_id=bid,
+               expected_state="closed:user_unbind")
+        run_ticks(env, 2)
+        assert row(env, "lc:%s:bound" % bid)["state"] == "sent"
+        assert row(env, "lc:%s:user_unbind" % bid)["state"] == "cancelled"
+
+    def test_inbound_and_unsupported_notice_guards(self, env):
+        inbox(env, "%s:1.1" % CHAT, "unbound")
+        inbox(env, "%s:2.1" % CHAT, "enqueued")
+        arm_post(env)
+        mk_job(env, kind="inbound_notice", key="notice:%s:1.1:unbound" % CHAT, ref_message_id="%s:1.1" % CHAT,
+               expected_state="unbound")
+        mk_job(env, kind="unsupported_notice", key="un:%s:2.1" % CHAT, ref_message_id="%s:2.1" % CHAT,
+               expected_state="unsupported")
+        run_ticks(env, 2)
+        assert row(env, "notice:%s:1.1:unbound" % CHAT)["state"] == "sent"
+        assert row(env, "un:%s:2.1" % CHAT)["state"] == "cancelled"
+
+    def test_receipt_reaction_cancelled_on_dropped_delivery(self, env):
+        bid = env.make_binding(status="active")
+        key, _ = reaction_job(env, bid, delivery_state="dropped")
+        env.outbound.tick()
+        assert row(env, key)["state"] == "cancelled" and env.client.calls == []
+
+
+# ======================================================================
+# allowlist / gate
+# ======================================================================
+class TestAllowlistAndGate:
+    def test_out_of_list_cancelled_even_when_gate_degraded(self, env):
+        bid = env.make_binding(status="active")
+        mk_turn(env, bid)
+        env.cfg["chat_allowlist"] = ["C_OTHER"]
+        dbmod.set_state(env.conn, C.GATE_KEY, "degraded:identity_unverified")
+        env.outbound.tick()
+        assert row(env, "turn:g:0")["state"] == "cancelled" and env.client.calls == []
+
+    def test_in_list_blocked_by_degraded_gate(self, env):
+        bid = env.make_binding(status="active")
+        mk_turn(env, bid)
+        env.cfg["chat_allowlist"] = [CHAT]
+        dbmod.set_state(env.conn, C.GATE_KEY, "mismatch")
+        assert env.outbound.tick() == 0 and row(env, "turn:g:0")["state"] == "pending"
+        dbmod.set_state(env.conn, C.GATE_KEY, "ok")
+        arm_post(env)
         assert env.outbound.tick() == 1
 
-
-class TestReactionContract:
-    def test_reaction_ok_without_reaction_id_is_failed(self, env):
-        """修复项9:reaction 成功必须解析出 .data.reaction_id,缺=failed(仍不重试)。"""
+    def test_gate_closed_also_pauses_verification(self, env):
         bid = env.make_binding(status="active")
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts) "
-            "VALUES('ev_1','om_1',?,?,'enqueued',0)", (CHAT, bid))
-        env.conn.execute(
-            "INSERT INTO deliveries(binding_id,message_id,payload_json,state) "
-            "VALUES(?,'om_1','{}','enqueued')", (bid,))
-        seq = env.conn.execute("SELECT delivery_seq FROM deliveries").fetchone()[0]
-        env.runner.on_prefix(["im", "reactions", "create"], lambda a, c: ok_envelope({}))
-        mk_job(env, kind="receipt_reaction", key=f"rc:{seq}", binding_id=bid,
-               ref_delivery_seq=seq, ref_message_id="om_1", body="GLANCE")
+        send_unknown(env, bid)
+        dbmod.set_state(env.conn, C.GATE_KEY, "degraded:auth_error")
+        env.clock.tick(C.VERIFY_SCHEDULE_MS[0])
         env.outbound.tick()
-        assert job_state(env, f"rc:{seq}")["state"] == "failed"
+        assert env.client.calls_for(HIST) == [] and row(env, "turn:g:0")["state"] == "unknown"
 
 
-class TestE4StderrEnvelope:
-    """E4a:错误信封在 stderr(stdout 空),code 嵌套 .error.code;分类照走永久/瞬态表。"""
-
-    def _job(self, env, key="turn:g:0"):
+# ======================================================================
+# startup_scan(§2.9)
+# ======================================================================
+class TestStartupScan:
+    def test_sending_postmessage_to_unknown_verify_only_even_at_cap(self, env):
         bid = env.make_binding(status="active")
-        return mk_job(env, binding_id=bid, key=key, turn_group="g", chunk_index=0)
-
-    def test_stderr_permanent_code_failed(self, env):
-        from tests.helpers import stderr_err_envelope
-        self._job(env)
-        env.runner.on_prefix(["im", "+messages-send"],
-                             lambda a, c: stderr_err_envelope(99992402))
+        set_verify_ok(env)
+        mk_turn(env, bid)
+        freeze_turn(env, "turn:g:0")
+        set_cols(env, "turn:g:0", state="sending", attempt_count=C.TURN_CAP, sending_at=env.clock.wall_ms())
+        env.outbound.startup_scan()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["had_unknown"] == 1 and r["verify_after"] == env.clock.wall_ms()
+        assert r["next_attempt_at"] is None
+        env.client.on(HIST, lambda m, q: history([]))
+        for _ in range(3):
+            verify_tick(env)
         env.outbound.tick()
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "failed" and "99992402" in row["error"]
+        assert row(env, "turn:g:0")["state"] == "unconfirmed" and env.client.calls_for(PM) == []
 
-    def test_stderr_transient_code_unknown_with_retry(self, env):
-        from tests.helpers import stderr_err_envelope
-        self._job(env)
-        env.runner.on_prefix(["im", "+messages-send"],
-                             lambda a, c: stderr_err_envelope(230020, subtype="rate_limited",
-                                                              msg="req too frequent"))
-        env.outbound.tick()
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "unknown" and row["next_attempt_at"] is not None
-
-    def test_failure_logs_raw_streams(self, env):
-        """E4a 可观测性:unknown/failed 把 rc/stdout/stderr 截断记入 daemon.log。"""
-        from tests.helpers import stderr_err_envelope
-        logs = []
-        env.outbound.log = logs.append
-        self._job(env)
-        env.runner.on_prefix(["im", "+messages-send"],
-                             lambda a, c: stderr_err_envelope(99992402))
-        env.outbound.tick()
-        joined = "\n".join(logs)
-        assert "rc=" in joined and "99992402" in joined and "turn:g:0" in joined
-
-
-class TestE4ShortKey:
-    """E4b:飞书 uuid 参数上限 ~50 字符 → wire 短键 ≤40;DB 逻辑键与 UNIQUE 语义不变。"""
-
-    def test_short_key_properties(self):
-        from lib import util
-        k1 = util.short_key("notice:om_" + "a" * 40 + ":session_closed")
-        k2 = util.short_key("notice:om_" + "a" * 40 + ":session_closed")
-        k3 = util.short_key("notice:om_" + "b" * 40 + ":session_closed")
-        assert k1 == k2 and k1 != k3
-        assert len(k1) <= 40 and k1.startswith("fb:")
-
-    def test_long_logical_key_transmitted_as_short_key(self, env):
-        """真形状:fake 对 >50 字符 key 返回 99992402 stderr 信封,逼实现走短键。"""
-        from tests.helpers import stderr_err_envelope
-        from lib import util
-        long_mid = "om_" + "a" * 40
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) VALUES('e1',?,?,?,0)",
-            (long_mid, CHAT, "session_closed"))
-        logical = f"notice:{long_mid}:session_closed"
-        assert len(logical) > 50  # 逻辑键必超限
-        mk_job(env, kind="inbound_notice", key=logical,
-               ref_message_id=long_mid, expected_state="session_closed", body="提示")
-        wire_keys = []
-
-        def fn(args, cwd):
-            key = args[args.index("--idempotency-key") + 1]
-            wire_keys.append(key)
-            if len(key) > 50:
-                return stderr_err_envelope(99992402)  # 真机行为:超长键被拒
-            return ok_envelope({"message_id": "om_ok"})
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        env.outbound.tick()
-        row = job_state(env, logical)
-        assert row["state"] == "sent"  # 走短键才可能成功
-        assert wire_keys == [util.short_key(logical)]
-        assert len(wire_keys[0]) <= 40
-        # DB 存逻辑键,UNIQUE 语义不变
-        assert row["idempotency_key"] == logical
-
-    def test_retry_uses_same_short_key(self, env):
-        from lib import util
+    def test_sending_idempotent_below_cap_rearmed(self, env):
         bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        seen = []
-
-        def fn(args, cwd):
-            seen.append(args[args.index("--idempotency-key") + 1])
-            if len(seen) == 1:
-                return FakeRunResult(rc=1, stdout="", timed_out=True)
-            return ok_envelope({"message_id": "om_ok"})
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
+        key, ts = reaction_job(env, bid)
+        set_cols(env, key, state="sending", attempt_count=1, op_method=REACT, op_target=CHAT, op_payload_kind="reaction")
+        env.outbound.startup_scan()
+        r = row(env, key)
+        assert r["state"] == "unknown" and r["next_attempt_at"] == env.clock.wall_ms() and r["had_unknown"] == 0
+        env.client.on(REACT, lambda m, q: ok())
         env.outbound.tick()
-        env.clock.tick(constants.UNKNOWN_RETRY_DELAY_MS + 1)
-        env.outbound.tick()
-        assert seen[0] == seen[1] == util.short_key("turn:g:0")  # S4 同键重试语义保持
+        assert row(env, key)["state"] == "sent" and row(env, key)["attempt_count"] == 2
 
-
-class TestAllowlistOutboundGate:
-    def test_out_of_list_job_cancelled(self, env):
-        """r3-1③:allowlist 生效且 job.chat_id 不在列 → cancelled,零外发。"""
+    def test_idempotent_crash_at_cap_no_fourth_request(self, env):
         bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.cfg["chat_allowlist"] = ["oc_other"]
-        env.outbound.tick()
-        assert job_state(env, "turn:g:0")["state"] == "cancelled"
-        assert env.runner.calls == []
-
-    def test_in_list_job_sends(self, env):
-        bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.cfg["chat_allowlist"] = [CHAT]
-        arm_send_ok(env)
-        assert env.outbound.tick() == 1
-
-
-class TestAllowlistBeforeGate:
-    def test_out_of_list_job_cancelled_even_when_gate_degraded(self, env):
-        """r4-3:allowlist 列外 job 无论 fingerprint 门状态都确定性 cancelled。"""
-        from lib import db as dbmod
-        bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.cfg["chat_allowlist"] = ["oc_other"]
-        dbmod.set_state(env.conn, "outbound_gate", "degraded:identity_unverified")
-        env.outbound.tick()
-        assert job_state(env, "turn:g:0")["state"] == "cancelled"
-        assert env.runner.calls == []
-
-    def test_in_list_job_still_blocked_by_degraded_gate(self, env):
-        """对照:列内 job 在 degraded 门下仍停摆(不 cancel,保持 pending)。"""
-        from lib import db as dbmod
-        bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.cfg["chat_allowlist"] = [CHAT]
-        dbmod.set_state(env.conn, "outbound_gate", "degraded:version_mismatch")
-        assert env.outbound.tick() == 0
-        assert job_state(env, "turn:g:0")["state"] == "pending"
-
-
-class TestWireFlagsByKind:
-    """出站 wire flag 按 kind(2026-07-17):session_turn=--markdown(可信群前提),
-    通知=--text,审批卡=转义 interactive。"""
-
-    def test_session_turn_uses_markdown_not_text(self, env):
-        bid = env.make_binding(status="active")
-        arm_send_ok(env)
-        mk_job(env, kind="session_turn", key="turn:g:0", binding_id=bid,
-               turn_group="g", chunk_index=0, body="# 标题\n- a\n```py\nx=1\n```")
-        env.outbound.tick()
-        args, _ = env.runner.calls_matching("im", "+messages-send")[0]
-        assert "--markdown" in args and "--text" not in args
-        assert args[args.index("--markdown") + 1].startswith("# 标题")
-
-    def test_lifecycle_notice_uses_text_not_markdown(self, env):
-        bid = env.make_binding(status="active")
-        arm_send_ok(env)
-        mk_job(env, kind="lifecycle_notice", key=f"lc:{bid}:bound", binding_id=bid,
-               expected_state="active", body="✅ 已绑定")
-        env.outbound.tick()
-        args, _ = env.runner.calls_matching("im", "+messages-send")[0]
-        assert "--text" in args and "--markdown" not in args
-
-    def test_inbound_notice_uses_text_not_markdown(self, env):
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) "
-            "VALUES('e1','om_1',?,'unbound',0)", (CHAT,))
-        arm_send_ok(env)
-        mk_job(env, kind="inbound_notice", key="notice:om_1:unbound",
-               ref_message_id="om_1", expected_state="unbound", body="⚠️ 未绑定")
-        env.outbound.tick()
-        args, _ = env.runner.calls_matching("im", "+messages-send")[0]
-        assert "--text" in args and "--markdown" not in args
-
-    def test_approval_card_stays_escaped_interactive(self, env):
-        from tests.test_approval import member_pending
-        p = member_pending(env)
-        env.runner.on_prefix(["im", "+messages-reply"],
-                             lambda a, c: ok_envelope({"message_id": "om_card"}))
-        env.outbound.tick()
-        args, _ = env.runner.calls_matching("im", "+messages-reply")[0]
-        assert args[args.index("--msg-type") + 1] == "interactive"
-        assert "--markdown" not in args and "--text" not in args  # 成员预览绝不 markdown 渲染
-
-
-# retryable session_turn 持久退避的完整退避时间线(基数 8s、×2、封顶 45s、上限 6 次)
-_RETRY_DELAYS = [8_000, 16_000, 32_000, 45_000, 45_000]  # 尝试 1..5 后的 next_attempt 退避
-
-
-def _alert_row(env):
-    return env.conn.execute(
-        "SELECT * FROM outbound_jobs WHERE turn_group LIKE '__sendfail__:%'").fetchone()
-
-
-def _alert_count(env):
-    return env.conn.execute(
-        "SELECT COUNT(*) FROM outbound_jobs WHERE turn_group LIKE '__sendfail__:%'").fetchone()[0]
-
-
-class TestSessionTurnRetryableHardening:
-    """2026-07-18 事故根因修复:retryable(503/网络/频控/超时)session_turn 持久指数退避重试;
-    耗尽 → failed(放行后续 turn,不再终态 unknown 队头阻塞)+ 群内可见告警。靠 idempotency-key
-    保证重发去重、转 failed 安全。仅 session_turn 生效。"""
-
-    def _turn(self, env, key="turn:g:0", group="g", body="hello", **kw):
-        bid = kw.pop("bid", None) or env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key=key, turn_group=group, chunk_index=0, body=body, **kw)
-        return bid
-
-    def test_503_backoff_schedule_then_exhaust_to_failed_and_alert(self, env):
-        self._turn(env)
-        calls = {"n": 0}
-
-        def fn(a, c):
-            calls["n"] += 1
-            return network_err_envelope(503)
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        for i, d in enumerate(_RETRY_DELAYS, start=1):
+        key, ts = reaction_job(env, bid)
+        set_cols(env, key, state="sending", attempt_count=C.IDEMPOTENT_CAP, op_method=REACT, op_target=CHAT,
+                 op_payload_kind="reaction", sending_at=env.clock.wall_ms())
+        env.outbound.startup_scan()
+        assert row(env, key)["state"] == "failed"
+        env.client.on(REACT, lambda m, q: ok())
+        for _ in range(3):
+            env.clock.tick(C.IDEMPOTENT_RETRY_DELAY_MS + 1)
             env.outbound.tick()
-            row = job_state(env, "turn:g:0")
-            assert row["state"] == "unknown", f"attempt {i} state"
-            assert row["attempt_count"] == i, f"attempt {i} count"
-            assert row["next_attempt_at"] - env.clock.wall_ms() == d, f"attempt {i} backoff"
-            env.clock.tick(d + 1)
-        env.outbound.tick()                          # 第 6 次 → 耗尽
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "failed" and row["attempt_count"] == 6
-        assert calls["n"] == 6
-        assert "exhausted after 6" in (row["error"] or "")
-        alert = _alert_row(env)
-        assert alert is not None and alert["kind"] == "session_turn"
-        assert alert["chunk_index"] == 0 and "未能确认送达" in alert["body"]
+        assert env.client.calls == []
 
-    def test_retryable_send_uses_same_idempotency_key_each_attempt(self, env):
-        from lib import util
-        self._turn(env)
-        seen = []
-
-        def fn(a, c):
-            seen.append(a[a.index("--idempotency-key") + 1])
-            return network_err_envelope(503)
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        for d in _RETRY_DELAYS:
-            env.outbound.tick()
-            env.clock.tick(d + 1)
-        env.outbound.tick()
-        assert len(seen) == 6
-        assert set(seen) == {util.short_key("turn:g:0")}   # 全程同键 → 服务端去重
-
-    def test_exhausted_turn_unblocks_later_group(self, env):
-        """HOL 修复核心:gA 503 耗尽 → failed 后,gB 放行(旧实现会被终态 unknown 永久阻塞)。"""
+    def test_unknown_without_timing_rearmed_by_category(self, env):
         bid = env.make_binding(status="active")
-
-        def fn(a, c):
-            body = a[a.index("--markdown") + 1]
-            return network_err_envelope(503) if body == "AAA" else ok_envelope({"message_id": "om_b"})
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        mk_job(env, binding_id=bid, key="turn:gA:0", turn_group="gA", chunk_index=0, body="AAA")
-        mk_job(env, binding_id=bid, key="turn:gB:0", turn_group="gB", chunk_index=0, body="BBB")
-        for d in _RETRY_DELAYS:
-            env.outbound.tick()
-            assert job_state(env, "turn:gB:0")["state"] == "pending"  # gA unknown 期间 gB 被挡
-            env.clock.tick(d + 1)
-        env.outbound.tick()                          # gA 耗尽→failed;同 tick gB 放行
-        assert job_state(env, "turn:gA:0")["state"] == "failed"
-        if job_state(env, "turn:gB:0")["state"] != "sent":
-            env.outbound.tick()
-        assert job_state(env, "turn:gB:0")["state"] == "sent"
-
-    def test_alert_turn_exhaustion_does_not_cascade(self, env):
-        """防级联:告警 turn(哨兵 turn_group)自身持续 503 耗尽 → failed,但绝不再生第二条告警。"""
-        bid = env.make_binding(status="active")
-        env.runner.on_prefix(["im", "+messages-send"], lambda a, c: network_err_envelope(503))
-        tg = "__sendfail__:jobX"
-        mk_job(env, binding_id=bid, key=jobs.key_turn(tg, 0), turn_group=tg, chunk_index=0,
-               body="alert")
-        for d in _RETRY_DELAYS:
-            env.outbound.tick()
-            env.clock.tick(d + 1)
-        env.outbound.tick()
-        row = env.conn.execute("SELECT * FROM outbound_jobs WHERE turn_group=?", (tg,)).fetchone()
-        assert row["state"] == "failed"
-        assert _alert_count(env) == 1                # 仍只有原告警一条,无级联
-
-    def test_alert_sent_as_markdown_with_key(self, env):
-        bid = env.make_binding(status="active")
-        mode = {"v": "fail"}
-
-        def fn(a, c):
-            if mode["v"] == "fail":
-                return network_err_envelope(503)
-            return ok_envelope({"message_id": "om_ok"})
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0, body="orig")
-        for d in _RETRY_DELAYS:
-            env.outbound.tick()
-            env.clock.tick(d + 1)
-        env.outbound.tick()                          # 耗尽→failed+告警入队
-        assert job_state(env, "turn:g:0")["state"] == "failed"
-        mode["v"] = "ok"                             # 后端恢复 → 告警应发出
-        env.outbound.tick()
-        alert_calls = [a for a, _ in env.runner.calls_matching("im", "+messages-send")
-                       if "--markdown" in a and "未能确认送达" in a[a.index("--markdown") + 1]]
-        assert alert_calls, "告警未以 --markdown 发出"
-        a = alert_calls[0]
-        assert "--idempotency-key" in a and a[a.index("--chat-id") + 1] == CHAT
-        assert "--text" not in a
-        assert _alert_row(env)["state"] == "sent"
-
-    def test_permanent_code_failed_without_alert(self, env):
-        """对照:永久 code(230002 不在群)→ failed,**不**发告警(渠道本身可能已坏,告警无意义)。"""
-        self._turn(env)
-        env.runner.on_prefix(["im", "+messages-send"], lambda a, c: err_envelope(230002))
-        env.outbound.tick()
-        assert job_state(env, "turn:g:0")["state"] == "failed"
-        assert _alert_count(env) == 0
-
-    def test_crash_loop_bounded_by_startup_scan(self, env):
-        """删 tick/_prepare 的 attempt_count 卡后的崩溃循环兜底:sending 崩溃且 attempt_count 达
-        硬上限 → startup_scan 失败出局(不无限重臂);上限以下 → 正常重臂 unknown。"""
-        bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.conn.execute(
-            "UPDATE outbound_jobs SET state='sending', attempt_count=? "
-            "WHERE idempotency_key='turn:g:0'", (constants.TURN_RETRYABLE_MAX_ATTEMPTS,))
+        mk_turn(env, bid)
+        freeze_turn(env, "turn:g:0")
+        set_cols(env, "turn:g:0", state="unknown", attempt_count=1)
+        k_ok, _ = reaction_job(env, bid)
+        set_cols(env, k_ok, state="unknown", attempt_count=1, op_method=REACT, op_target=CHAT, op_payload_kind="reaction")
+        k_cap, _ = reaction_job(env, bid)
+        set_cols(env, k_cap, state="unknown", attempt_count=C.IDEMPOTENT_CAP, op_method=REACT, op_target=CHAT,
+                 op_payload_kind="reaction")
         env.outbound.startup_scan()
-        assert job_state(env, "turn:g:0")["state"] == "failed"
-        mk_job(env, binding_id=bid, key="turn:h:0", turn_group="h", chunk_index=0)
-        env.conn.execute(
-            "UPDATE outbound_jobs SET state='sending', attempt_count=1 "
-            "WHERE idempotency_key='turn:h:0'")
-        env.outbound.startup_scan()
-        r = job_state(env, "turn:h:0")
-        assert r["state"] == "unknown" and r["next_attempt_at"] is not None
+        now = env.clock.wall_ms()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_after"] == now and r["had_unknown"] == 1
+        assert row(env, k_ok)["state"] == "unknown" and row(env, k_ok)["next_attempt_at"] == now
+        assert row(env, k_cap)["state"] == "failed"
 
-    def test_explicit_retryable_false_not_persisted(self, env):
-        """codex MAJOR-2:官方 error.retryable=false(如 99991661 token 失效)绝不因本地码表被翻成
-        retryable → 走非 retryable 上限(2)后 failed+告警,不刷 6 次。"""
-        self._turn(env)
-        calls = {"n": 0}
-
-        def fn(a, c):
-            calls["n"] += 1
-            return FakeRunResult(4, "", json.dumps({"ok": False, "error": {
-                "type": "authentication", "code": 99991661, "retryable": False}}))
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        env.outbound.tick()                          # a1 → unknown,非 retryable 平退避 15s
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "unknown"
-        assert row["next_attempt_at"] - env.clock.wall_ms() == constants.UNKNOWN_RETRY_DELAY_MS
-        env.clock.tick(constants.UNKNOWN_RETRY_DELAY_MS + 1)
-        env.outbound.tick()                          # a2 → 达上限 2 → failed+告警
-        assert calls["n"] == 2
-        assert job_state(env, "turn:g:0")["state"] == "failed"
-        assert _alert_row(env) is not None
-
-    def test_network_error_without_code_is_retryable(self, env):
-        """codex MINOR-2:无 numeric code 的 network 错误信封也应持久重试(判定不只看 code 分支)。"""
-        self._turn(env)
-        calls = {"n": 0}
-
-        def fn(a, c):
-            calls["n"] += 1
-            return FakeRunResult(4, "", json.dumps(
-                {"ok": False, "error": {"type": "network", "retryable": True}}))   # 无 code
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        env.outbound.tick()
-        env.clock.tick(_RETRY_DELAYS[0] + 1)
-        env.outbound.tick()
-        env.clock.tick(_RETRY_DELAYS[1] + 1)
-        env.outbound.tick()                          # 第 3 次 —— 证明持久(非 2 次即停)
-        row = job_state(env, "turn:g:0")
-        assert calls["n"] == 3 and row["state"] == "unknown" and row["attempt_count"] == 3
-
-    def test_network_type_without_retryable_field_is_retryable(self, env):
-        """type=network 但无 retryable 字段、无 code → 靠 network-type 回退仍持久重试。"""
-        self._turn(env)
-        calls = {"n": 0}
-
-        def fn(a, c):
-            calls["n"] += 1
-            return FakeRunResult(4, "", json.dumps({"ok": False, "error": {"type": "network"}}))
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        env.outbound.tick()
-        env.clock.tick(_RETRY_DELAYS[0] + 1)
-        env.outbound.tick()
-        env.clock.tick(_RETRY_DELAYS[1] + 1)
-        env.outbound.tick()
-        assert calls["n"] == 3 and job_state(env, "turn:g:0")["attempt_count"] == 3
-
-    def test_legacy_terminal_unknown_session_turn_rearmed_by_startup(self, env):
-        """codex BLOCKER-2:升级前遗留的终态 session_turn unknown(next=NULL)被 startup_scan 重臂,
-        交新策略收口 → 不再永久 HOL(建立库级 invariant,不靠手工修复)。"""
+    def test_pending_at_cap_terminal_by_had_unknown(self, env):
         bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:old:0", turn_group="old", chunk_index=0)
-        env.conn.execute(
-            "UPDATE outbound_jobs SET state='unknown', attempt_count=2, next_attempt_at=NULL "
-            "WHERE idempotency_key='turn:old:0'")
-        arm_send_ok(env)
-        assert env.outbound.tick() == 0                       # 重臂前:tick 选不中(next IS NULL)
-        assert job_state(env, "turn:old:0")["state"] == "unknown"
+        mk_turn(env, bid, group="a")
+        set_cols(env, "turn:a:0", attempt_count=C.TURN_CAP)
+        member_pending(env, bid)
+        freeze_turn(env, "card:p1", payload_kind="blocks")
+        set_cols(env, "card:p1", attempt_count=C.CARD_CAP, had_unknown=1)
+        mk_turn(env, bid, group="b")
+        set_cols(env, "turn:b:0", attempt_count=C.TURN_CAP - 1)
         env.outbound.startup_scan()
-        r = job_state(env, "turn:old:0")
-        assert r["state"] == "unknown" and r["next_attempt_at"] is not None
-        env.outbound.tick()
-        assert job_state(env, "turn:old:0")["state"] == "sent"
+        assert row(env, "turn:a:0")["state"] == "failed" and len(alerts(env)) == 1
+        assert row(env, "card:p1")["state"] == "unconfirmed"
+        assert row(env, "turn:b:0")["state"] == "pending"
 
-    def test_nonsession_crash_at_cap_stays_terminal_unknown(self, env):
-        """codex BLOCKER-1:非 session_turn 崩溃于 sending 且达旧上限(2)→ startup_scan 收为终态
-        unknown(next=NULL),**行为不变**(不转 failed、不刷到 6)。"""
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) "
-            "VALUES('e1','om_1',?,'unbound',0)", (CHAT,))
-        mk_job(env, kind="inbound_notice", key="notice:om_1:unbound",
-               ref_message_id="om_1", expected_state="unbound", body="x")
-        env.conn.execute(
-            "UPDATE outbound_jobs SET state='sending', attempt_count=? "
-            "WHERE idempotency_key='notice:om_1:unbound'", (constants.MAX_SEND_ATTEMPTS,))
-        env.outbound.startup_scan()
-        r = job_state(env, "notice:om_1:unbound")
-        assert r["state"] == "unknown" and r["next_attempt_at"] is None   # 终态,旧语义不变
-
-    def test_crash_at_cap_session_turn_failed_with_alert(self, env):
-        """codex R2 MAJOR-2:session_turn 崩溃于第 6 次发送(sending,ac=6)→ startup_scan 转 failed
-        **且发告警**(与耗尽分支一致,不静默丢失)。"""
+    def test_sending_without_frozen_op_is_frozen_then_reconciled(self, env):
         bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.conn.execute(
-            "UPDATE outbound_jobs SET state='sending', attempt_count=? "
-            "WHERE idempotency_key='turn:g:0'", (constants.TURN_RETRYABLE_MAX_ATTEMPTS,))
+        mk_turn(env, bid)
+        set_cols(env, "turn:g:0", state="sending", attempt_count=1)
+        key = decision_job(env, bid, "p1", "rejected", card=CHAT + ":5.5")
+        set_cols(env, key, state="sending", attempt_count=1)
         env.outbound.startup_scan()
-        assert job_state(env, "turn:g:0")["state"] == "failed"
-        assert _alert_row(env) is not None and _alert_count(env) == 1
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["op_method"] == PM and r["had_unknown"] == 1
+        d = row(env, key)
+        assert d["state"] == "unknown" and d["op_method"] == UPD and d["next_attempt_at"] == env.clock.wall_ms()
 
-    def test_legacy_nonsession_unknown_at_cap_normalized_to_terminal(self, env):
-        """codex R2 MAJOR-1:升级前遗留的非 session_turn unknown(ac=2,next!=NULL,旧 tick cap 令其
-        逻辑终态)→ startup_scan 收为真终态 next=NULL,新 tick 不再发第 3 次(保旧「≤2 次」语义)。"""
-        env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,state,ts) "
-            "VALUES('e1','om_1',?,'unbound',0)", (CHAT,))
-        mk_job(env, kind="inbound_notice", key="notice:om_1:unbound",
-               ref_message_id="om_1", expected_state="unbound", body="x")
-        env.conn.execute(
-            "UPDATE outbound_jobs SET state='unknown', attempt_count=?, next_attempt_at=? "
-            "WHERE idempotency_key='notice:om_1:unbound'",
-            (constants.MAX_SEND_ATTEMPTS, env.clock.wall_ms()))
-        env.outbound.startup_scan()
-        r = job_state(env, "notice:om_1:unbound")
-        assert r["state"] == "unknown" and r["next_attempt_at"] is None   # 收为真终态
-        assert env.outbound.tick() == 0 and env.runner.calls == []        # 新 tick 不再发
-
-    def test_over_cap_unknown_session_turn_failed_not_rearmed(self, env):
-        """codex R3 MINOR:schema 合法的 over-cap unknown session_turn(ac>=6,next=NULL 或 未来)→
-        startup_scan 转 failed+告警,**不**被重臂发第 7 次、也不永久 HOL。"""
+    def test_legacy_unknown_with_next_only_self_heals_in_tick(self, env):
+        """recovery 旧写法(unknown + next_attempt_at)的 postMessage 行 → tick 自愈为核验,不发送。"""
         bid = env.make_binding(status="active")
-        # next=NULL 形态
-        mk_job(env, binding_id=bid, key="turn:a:0", turn_group="a", chunk_index=0)
-        env.conn.execute(
-            "UPDATE outbound_jobs SET state='unknown', attempt_count=?, next_attempt_at=NULL "
-            "WHERE idempotency_key='turn:a:0'", (constants.TURN_RETRYABLE_MAX_ATTEMPTS,))
-        # next=遥远未来形态(旧 tick cap 曾令其逻辑终态,新 tick 无 cap → 会 HOL / 越限)
-        mk_job(env, binding_id=bid, key="turn:b:0", turn_group="b", chunk_index=0)
-        env.conn.execute(
-            "UPDATE outbound_jobs SET state='unknown', attempt_count=?, next_attempt_at=? "
-            "WHERE idempotency_key='turn:b:0'",
-            (constants.TURN_RETRYABLE_MAX_ATTEMPTS + 1, env.clock.wall_ms() + 10 ** 9))
-        env.outbound.startup_scan()
-        assert job_state(env, "turn:a:0")["state"] == "failed"
-        assert job_state(env, "turn:b:0")["state"] == "failed"
-        assert _alert_count(env) == 2                     # 两条都发告警
-        arm_send_ok(env)
-        env.outbound.tick()                               # 不会再发这两条(已 failed)
-        assert job_state(env, "turn:a:0")["attempt_count"] == constants.TURN_RETRYABLE_MAX_ATTEMPTS
-        assert job_state(env, "turn:b:0")["attempt_count"] == constants.TURN_RETRYABLE_MAX_ATTEMPTS + 1
+        mk_turn(env, bid)
+        freeze_turn(env, "turn:g:0")
+        set_cols(env, "turn:g:0", state="unknown", attempt_count=1, next_attempt_at=env.clock.wall_ms())
+        env.client.on(HIST, lambda m, q: history([]))
+        env.outbound.tick()
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["had_unknown"] == 1 and r["next_attempt_at"] is None
+        assert r["verify_absent_count"] == 1 and env.client.calls_for(PM) == []
 
-    def test_negative_attempt_count_session_turn_failed_not_sent(self, env):
-        """codex R4 M1:schema 合法但代码不可达的负 attempt_count(需外部篡改)→ startup_scan
-        fail-closed 转 failed(不发第 7 次、不 HOL),守「六次硬上限对所有 schema 合法态成立」。"""
+
+# ======================================================================
+# 告警 / 心跳
+# ======================================================================
+class TestAlertsAndHeartbeat:
+    def test_alert_turn_failure_does_not_cascade(self, env):
         bid = env.make_binding(status="active")
-        mk_job(env, binding_id=bid, key="turn:neg:0", turn_group="neg", chunk_index=0)
-        env.conn.execute(
-            "UPDATE outbound_jobs SET state='unknown', attempt_count=-1, next_attempt_at=NULL "
-            "WHERE idempotency_key='turn:neg:0'")
-        env.outbound.startup_scan()
-        assert job_state(env, "turn:neg:0")["state"] == "failed"
-        arm_send_ok(env)
+        arm_post(env, err("channel_not_found"))
+        mk_turn(env, bid)
         env.outbound.tick()
-        assert job_state(env, "turn:neg:0")["attempt_count"] == -1   # 从未发送(未经 _prepare +1)
+        assert len(alerts(env)) == 1
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()   # 告警本身永久失败
+        a = alerts(env)
+        assert len(a) == 1 and a[0]["state"] == "failed"
 
-    def test_prepare_hard_cap_gate_blocks_corrupt_pending(self, env):
-        """codex R5:pending(startup_scan 不收口)携异常 attempt_count(篡改/损坏)→ _prepare 硬门
-        在发送前 fail-closed,绝不发第 7 次。ac>=6 与 ac<0 都拦,attempt_count 不 +1(证明未发送)。"""
+    def test_unconfirmed_alert_turn_does_not_cascade(self, env):
         bid = env.make_binding(status="active")
-        arm_send_ok(env)
-        mk_job(env, binding_id=bid, key="turn:p6:0", turn_group="p6", chunk_index=0)
-        mk_job(env, binding_id=bid, key="turn:pn:0", turn_group="pn", chunk_index=0)
-        env.conn.execute("UPDATE outbound_jobs SET attempt_count=? WHERE idempotency_key='turn:p6:0'",
-                         (constants.TURN_RETRYABLE_MAX_ATTEMPTS,))
-        env.conn.execute("UPDATE outbound_jobs SET attempt_count=-1 WHERE idempotency_key='turn:pn:0'")
+        arm_post(env, timeout())
+        env.client.on(HIST, lambda m, q: err("missing_scope"))
+        mk_turn(env, bid)
         env.outbound.tick()
-        p6, pn = job_state(env, "turn:p6:0"), job_state(env, "turn:pn:0")
-        assert p6["state"] == "failed" and p6["attempt_count"] == constants.TURN_RETRYABLE_MAX_ATTEMPTS
-        assert pn["state"] == "failed" and pn["attempt_count"] == -1   # 未经 _prepare +1 → 从未发送
-
-    def test_prepare_hard_cap_gate_allows_normal_final_attempt(self, env):
-        """对照:正常 unknown ac=5 未触发硬门(prepare 入口 ac<6)→ 照常发第 6 次,再由 finalize 耗尽。"""
-        bid = env.make_binding(status="active")
-        env.runner.on_prefix(["im", "+messages-send"], lambda a, c: network_err_envelope(503))
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0)
-        env.conn.execute("UPDATE outbound_jobs SET state='unknown', attempt_count=5, next_attempt_at=? "
-                         "WHERE idempotency_key='turn:g:0'", (env.clock.wall_ms(),))
-        env.outbound.tick()                          # 第 6 次发送(ac 5→6),finalize 耗尽
-        row = job_state(env, "turn:g:0")
-        assert row["state"] == "failed" and row["attempt_count"] == 6
-        assert len(env.runner.calls_matching("im", "+messages-send")) == 1   # 硬门未拦第 6 次
-
-    def test_timeout_with_ok_without_id_is_retryable(self, env):
-        """codex R2 MINOR-1:超时且信封 ok 但缺 message_id → 超时信号占先,应 retryable 持久重试
-        (曾在 timeout 判断前 return 硬编码非 retryable)。"""
-        self._turn(env)
-        calls = {"n": 0}
-
-        def fn(a, c):
-            calls["n"] += 1
-            return FakeRunResult(rc=0, stdout='{"ok":true,"data":{}}', timed_out=True)
-
-        env.runner.on_prefix(["im", "+messages-send"], fn)
-        env.outbound.tick()
-        env.clock.tick(_RETRY_DELAYS[0] + 1)
-        env.outbound.tick()
-        env.clock.tick(_RETRY_DELAYS[1] + 1)
-        env.outbound.tick()                          # 第 3 次 → 证明持久(非超时误判为 2 次即停)
-        assert calls["n"] == 3 and job_state(env, "turn:g:0")["attempt_count"] == 3
+        verify_tick(env)
+        assert len(alerts(env)) == 1
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()   # 告警也超时 → unknown → 核验永久错 → unconfirmed,但不再生告警
+        verify_tick(env)
+        a = alerts(env)
+        assert len(a) == 1 and a[0]["state"] == "unconfirmed"
 
     def test_alert_suppressed_when_binding_closed(self, env):
-        """告警走 session_turn 的 _binding_active 守卫:群已关 → 告警 cancelled(不外发)。"""
         bid = env.make_binding(status="active")
-        env.runner.on_prefix(["im", "+messages-send"], lambda a, c: network_err_envelope(503))
-        mk_job(env, binding_id=bid, key="turn:g:0", turn_group="g", chunk_index=0, body="orig")
-        for d in _RETRY_DELAYS:
-            env.outbound.tick()
-            env.clock.tick(d + 1)
-        env.outbound.tick()                          # 耗尽→failed+告警入队
-        assert _alert_row(env) is not None
-        env.conn.execute("UPDATE bindings SET status='closed', close_reason='user_unbind' "
-                         "WHERE binding_id=?", (bid,))
+        arm_post(env, err("channel_not_found"))
+        mk_turn(env, bid)
         env.outbound.tick()
-        assert _alert_row(env)["state"] == "cancelled"   # 守卫拦下,零外发告警
+        env.conn.execute("UPDATE bindings SET status='closed', close_reason='user_unbind' WHERE binding_id=?", (bid,))
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()
+        assert alerts(env)[0]["state"] == "cancelled" and len(env.client.calls_for(PM)) == 1
+
+    def test_alert_dedup_by_idempotency_key(self, env):
+        bid = env.make_binding(status="active")
+        mk_turn(env, bid)
+        j = row(env, "turn:g:0")
+        with dbmod.tx(env.conn):
+            env.outbound._enqueue_alert(j, texts.send_failure_alert_body(), j["job_id"], 0)
+            env.outbound._enqueue_alert(j, texts.send_failure_alert_body(), j["job_id"], 0)
+        assert len(alerts(env)) == 1
+
+    def test_heartbeat_per_network_roundtrip(self, env):
+        beats = []
+        env.outbound.heartbeat = lambda: beats.append(1)
+        bid = env.make_binding(status="active")
+        arm_post(env, timeout(), post_ok)
+        env.client.on(HIST, lambda m, q: history([hit_msg(row(env, "turn:ga:0")["job_id"])]))
+        mk_turn(env, bid, group="ga")
+        mk_turn(env, bid, group="gb")
+        env.outbound.tick()          # ga 发送(1)
+        verify_tick(env)             # ga 核验命中(2)
+        env.clock.tick(C.POST_MIN_INTERVAL_MS)
+        env.outbound.tick()          # gb 发送(3)
+        assert len(beats) == 3
+
+    def test_log_never_contains_body(self, env):
+        lines = []
+        env.outbound.log = lines.append
+        bid = env.make_binding(status="active")
+        arm_post(env, err("channel_not_found"))
+        mk_turn(env, bid, body="SECRET-BODY")
+        env.outbound.tick()
+        assert lines and all("SECRET-BODY" not in ln for ln in lines)
