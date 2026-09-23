@@ -120,6 +120,14 @@ def test_notifyctl_module_loads():
     assert hasattr(notifyctl, "run_notify") and hasattr(notifyctl, "main")
 
 
+def test_notify_skill_uses_per_call_tmp_path_and_cleans_up():
+    """R1-m5:固定 /tmp/slack-notify.md 会让多个 session 串正文;skill 必须要求每次调用唯一路径并发后删除。"""
+    text = (pathlib.Path(__file__).resolve().parents[1] / "skills" / "notify" / "SKILL.md").read_text(encoding="utf-8")
+    assert "/tmp/slack-notify.md" not in text.replace("`/tmp/slack-notify.md`", "")   # 只允许作为反例出现在反引号里
+    assert "slack-notify-<随机串>" in text and "mktemp" in text
+    assert "rm -f" in text and "独有" in text
+
+
 def test_plugin_marketplace_version_consistency():
     root = pathlib.Path(__file__).resolve().parents[1]
     pj = json.loads((root / ".claude-plugin" / "plugin.json").read_text())

@@ -13,11 +13,15 @@ description: 遇到"需要 owner 决策或授权才能继续"的 blocker 时,主
 
 分两步,**别把消息正文直接写进 shell 命令**(避免 `$()`、反引号、引号被 shell 展开或截断):
 
-1. 用 **Write 工具**把通知正文逐字写入一个临时文件,例如 `/tmp/slack-notify.md`。正文写你要让用户看到的原话(可中文、可多行)。**正文按标准 markdown 渲染**(Block Kit `markdown` 块):标题/粗体/列表/代码块像平时那样写即可。**不要**写 Slack 的 mrkdwn 特殊标记(`<!channel>` 之类会被拒;`<@U…>` 用户 mention 可以但通常不需要 —— @owner 是系统加的)。正文 ≤ 12000 字符。
-2. 运行(每条 Bash 命令内联完整路径;`< 文件` 把正文喂给 stdin):
+1. 用 **Write 工具**把通知正文逐字写入一个**本次调用独有**的临时文件:文件名自己生成,形如
+   `/tmp/slack-notify-<随机串>.md`(随机串取 `CLAUDE_CODE_SESSION_ID` 前 8 位 + 当前时间戳,或任意随机字符)。
+   **绝不用固定文件名**(如 `/tmp/slack-notify.md`):多个 session 会互相覆盖正文,把别人 session 的通知发出去。
+   正文写你要让用户看到的原话(可中文、可多行)。**正文按标准 markdown 渲染**(Block Kit `markdown` 块):标题/粗体/列表/代码块像平时那样写即可。**不要**写 Slack 的 mrkdwn 特殊标记(`<!channel>` 之类会被拒;`<@U…>` 用户 mention 可以但通常不需要 —— @owner 是系统加的)。正文 ≤ 12000 字符。
+2. 运行并**在同一条命令里删掉临时文件**(每条 Bash 命令内联完整路径;`< 文件` 把正文喂给 stdin;发完就删,不留正文在 /tmp):
    ```bash
-   python3 "${CLAUDE_SKILL_DIR}/../../bin/notifyctl.py" < /tmp/slack-notify.md
+   python3 "${CLAUDE_SKILL_DIR}/../../bin/notifyctl.py" < "/tmp/slack-notify-<随机串>.md"; rm -f "/tmp/slack-notify-<随机串>.md"
    ```
+   纯 shell 场景(不经 Write 工具)也可以 `f=$(mktemp -t slack-notify)` 拿唯一路径,写入后同样 `< "$f"; rm -f "$f"`。
 
 系统会以 bot 身份发出一条消息:第一块是 `@owner`(独立 section),第二块是你的正文(markdown 块);通知栏回退文本也带 owner mention。**你不需要、也不该自己写 `<@…>` / `<!…>`** —— 前缀是系统加的;正文里若出现字面 `<!` 会被整条拒绝(防误触发 @channel/@here)。
 
