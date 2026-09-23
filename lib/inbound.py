@@ -1,123 +1,195 @@
-"""入站管线(plan 4.2):去重 → 详情快照(钉死 binding)→ 结构化@判定 → 门禁 → deliveries。
-写事务内零网络/零子进程;快照与物化在事务外,决策与入队单事务内复验绑定 active(I3)。"""
+"""入站管线(contracts §1 / §5.1 / §5.2 / §4.3)。
+
+- `ingest_in_tx(conn, row)`:drain 持有事务(**本函数绝不** BEGIN/COMMIT/ROLLBACK);零网络。
+  drop 序 → INSERT inbox(received)→ IntegrityError 分支(同一行 / 双投升级 / dup_message)。
+- `Inbound.drive_pending_rows(budget)`:先零网络本地分流(received→resolving→决策;
+  waiting_binding 激活/终止;不限量),再按预算做需要网络的物化(materializing;
+  每 tick ≤ budget[0] 条带下载、≤ budget[1] 条纯文本),每条之后 heartbeat。
+- 附件预算(§5.2)四条路径(owner / allowlist / approved / waiting 激活后)统一在
+  `materializing` 的四列上,持久化在库、重启不重置。
+决策与入队单事务内复验绑定 active(I3);投递判定零模型参与(I1)。"""
 import json
 import sqlite3
 
-from . import (constants, db, jobs, lifecycle, media, runner as runner_mod,
-               senderallow, texts, util)
+from . import config as configmod
+from . import constants, db, jobs, lifecycle, media, senderallow, slackwire, texts, util
+
+DROP_REASONS = ("foreign_team", "foreign_app", "event_type", "self", "subtype",
+                "chat_not_allowed", "not_mentioned_unbound", "cap", "dup_message", "invalid")
+
+# drain 只传 (conn, row);cfg/clock 由最近构造的 Inbound 登记(daemon 内唯一实例)。
+_DEFAULTS = {"cfg": None, "clock": None}
 
 
-def normalize_receive(obj):
-    if not isinstance(obj, dict):
-        return None
-    cands = [obj] + [obj.get(k) for k in ("event", "payload", "data")
-                     if isinstance(obj.get(k), dict)]
-    for c in cands:
-        if c.get("message_id") and c.get("event_id") and c.get("chat_id"):
-            return c
-    return None
+def register_defaults(cfg, clock):
+    _DEFAULTS["cfg"] = cfg
+    _DEFAULTS["clock"] = clock
 
 
-def is_bot_mentioned(snap, app_id):
-    for m in snap.get("mentions") or []:
-        mid = m.get("id")
-        if mid == app_id:
-            return True
-        if isinstance(mid, dict) and app_id in mid.values():
-            return True
-    return False
+def _resolve(cfg, clock):
+    if cfg is None:
+        cfg = _DEFAULTS["cfg"]
+        if cfg is None:
+            cfg = configmod.ConfigSnapshot.load()
+    if clock is None:
+        clock = _DEFAULTS["clock"]
+        if clock is None:
+            from .clock import SystemClock
+            clock = SystemClock()
+    return cfg, clock
 
 
-def extract_text(snap, app_id=None):
-    """正文提取(E3 真机实锤):真实 `+messages-mget` 的正文在**顶层 `content`**
-    (lark-cli 已渲染的纯文本,mention 以 "@{name}" 内联;file/image 亦为渲染文本,
-    形如 "(文件) 名字" / "[图片]")→ 优先直接采用。
-    兼容 fallback:旧 raw-API `body.content` JSON 形状(双形状容忍,与 list_chats
-    的 items|chats 同风格)。
-    app_id 给定时:剥掉指向**本 bot** 的 mention 渲染片段("@{name}"),
-    其他人的 mention 保留原样;首尾空白规整。"""
-    top = snap.get("content")
-    if isinstance(top, str) and top:
-        t = top
-    else:
-        # fallback:raw body.content JSON 形状
-        mtype = snap.get("msg_type")
-        try:
-            content = json.loads((snap.get("body") or {}).get("content") or "{}")
-        except ValueError:
-            content = {}
-        if mtype == "text":
-            t = content.get("text") or ""
-        elif mtype == "post":
-            parts = []
-            if content.get("title"):
-                parts.append(str(content["title"]))
-            for para in content.get("content") or []:
-                runs = [r.get("text") for r in (para or [])
-                        if isinstance(r, dict) and r.get("text")]
-                if runs:
-                    parts.append("".join(runs))
-            t = "\n".join(parts)
-        elif mtype == "image":
-            t = "[图片]"
-        elif mtype == "file":
-            t = f"(文件) {content.get('file_name', '')}".strip()
-        else:
-            t = ""
-        for m in snap.get("mentions") or []:
-            key, name = m.get("key"), m.get("name")
-            if key:
-                t = t.replace(key, f"@{name}" if name else "@?")
-    if app_id:
-        for m in snap.get("mentions") or []:
-            mid = m.get("id")
-            is_bot = mid == app_id or (isinstance(mid, dict) and app_id in mid.values())
-            if is_bot and m.get("name"):
-                t = t.replace(f"@{m['name']}", "")
-        t = t.strip()
-    return t
+# ---------------------------------------------------------------- 快照辅助(纯函数)
+def sender_of(snap):
+    """→ (sender_user_id, sender_type)。sender_type = 'bot'(带 bot_id)| 'user'。"""
+    snap = snap if isinstance(snap, dict) else {}
+    uid = snap.get("user")
+    uid = uid.strip() if isinstance(uid, str) and uid.strip() else None
+    return uid, ("bot" if snap.get("bot_id") else "user")
 
 
-def _media_keys(text):
-    """从已渲染正文提取附件句柄 → [{key,type}],**保序去重**。
-    key 前缀定 type(`img_*`→image、`file_*`→file),与飞书资源 API 契约一致。"""
-    out, seen = [], set()
-    for m in constants.MEDIA_KEY_RE.finditer(text or ""):
-        k = m.group(0)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append({"key": k, "type": "image" if k.startswith("img_") else "file"})
-    return out
+def render_text(snap, bot_user_id):
+    return slackwire.render_text(snap, bot_user_id)
+
+
+def files_of(snap):
+    snap = snap if isinstance(snap, dict) else {}
+    return [f for f in (snap.get("files") or []) if isinstance(f, dict)] \
+        if isinstance(snap.get("files"), list) else []
+
+
+def _blocks_or_attachments(snap):
+    b = snap.get("blocks")
+    a = snap.get("attachments")
+    return bool(isinstance(b, list) and b) or bool(isinstance(a, list) and a)
 
 
 def trim_snapshot(snap):
-    return util.jdumps({"msg_type": snap.get("msg_type"), "trimmed": True,
-                        "sender": snap.get("sender"),
-                        "mention_count": len(snap.get("mentions") or [])})
+    """ignored_not_mentioned 的即时裁剪(不保留未@我们的正文)。"""
+    return util.jdumps({"type": snap.get("type"), "trimmed": True, "user": snap.get("user"),
+                        "ts": snap.get("ts")})
 
 
-def sender_of(snap):
-    s = snap.get("sender") or {}
-    return s.get("id"), s.get("sender_type") or "user"
+def _row_get(row, key, default=None):
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
 
 
+def card_preview(snap, bot_user_id):
+    """审批卡预览 = 正文(去 bot mention)+ 附件文件名(不可信文本,卡片 plain_text 转义)。"""
+    text = render_text(snap, bot_user_id)
+    names = [str(f.get("name") or f.get("title") or f.get("id") or "?") for f in files_of(snap)]
+    if names:
+        text = (text + "\n" if text else "") + "📎 " + ", ".join(names)
+    return text
+
+
+# ---------------------------------------------------------------- ingest(drain 事务内)
+def _drop(conn, reason):
+    db.bump_counter(conn, "event_dropped_%s" % reason)
+    return ("dropped", reason)
+
+
+def ingest_in_tx(conn, row, cfg=None, clock=None):
+    """contracts §1 / §5.1。假定调用方已 BEGIN;零网络。row = slack_events 行(sqlite3.Row 或 mapping)。
+    → ("handed", inbox_row) | ("dropped", reason ∈ DROP_REASONS)。"""
+    cfg, clock = _resolve(cfg, clock)
+    now = clock.wall_ms()
+    try:
+        payload = json.loads(_row_get(row, "payload_json") or "")
+    except (ValueError, TypeError):
+        return _drop(conn, "invalid")
+    f = slackwire.events_fields(payload)
+    if f is None:
+        return _drop(conn, "invalid")
+    if f["team_id"] is None or f["team_id"] != cfg.get("team_id"):
+        return _drop(conn, "foreign_team")
+    if f["api_app_id"] is None or f["api_app_id"] != cfg.get("app_id"):
+        return _drop(conn, "foreign_app")
+    if f["type"] not in constants.EVENT_TYPES_ACCEPTED:
+        return _drop(conn, "event_type")
+    ev = f["event"]
+    if slackwire.is_self_event(ev, cfg):
+        return _drop(conn, "self")
+    if f["subtype"] not in constants.ACCEPT_SUBTYPES:
+        return _drop(conn, "subtype")
+    channel, ts = f["channel"], f["ts"]
+    event_id = f["event_id"]
+    if event_id is None:
+        key = _row_get(row, "event_key") or ""
+        event_id = key[3:] if key.startswith("ev:") else None
+    if not channel or not ts or not event_id:
+        return _drop(conn, "invalid")
+    allow = cfg.get("chat_allowlist")
+    if allow and channel not in allow:
+        return _drop(conn, "chat_not_allowed")
+    binding_id = _row_get(row, "binding_id")
+    mentioned = slackwire.is_bot_mentioned(ev, cfg.get("bot_user_id"))
+    dm = slackwire.is_dm(ev)
+    if binding_id is None and not mentioned and not dm:
+        return _drop(conn, "not_mentioned_unbound")
+    sender, sender_type = sender_of(ev)
+    if sender != cfg.get("owner_user_id"):
+        qs = ",".join("?" for _ in constants.INBOX_NONTERMINAL_STATES)
+        n = conn.execute("SELECT COUNT(*) FROM inbox WHERE state IN (%s)" % qs,
+                         constants.INBOX_NONTERMINAL_STATES).fetchone()[0]
+        if n >= constants.INBOX_NONTERMINAL_CAP:
+            return _drop(conn, "cap")
+    mid = util.message_id_of(channel, ts)
+    thread_ts = f["thread_ts"]
+    reply_thread_ts = thread_ts or ts
+    try:
+        conn.execute(
+            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,sender_user_id,sender_type,"
+            "message_type,thread_ts,reply_thread_ts,snapshot_json,state,ts) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,'received',?)",
+            (event_id, mid, channel, binding_id, sender, sender_type, f["type"], thread_ts,
+             reply_thread_ts, util.jdumps(ev), now))
+    except sqlite3.IntegrityError:
+        by_e = conn.execute("SELECT * FROM inbox WHERE event_id=?", (event_id,)).fetchone()
+        if by_e is not None:
+            return ("handed", by_e)                       # 同一事件重投:已存在,继续驱动
+        by_m = conn.execute("SELECT * FROM inbox WHERE message_id=?", (mid,)).fetchone()
+        if by_m is None:
+            raise                                          # 非两键冲突(如 FK):交给 drain 退避/隔离
+        # 双投(app_mention + message 同一 ts):升级规则(contracts §1)
+        if (by_m["message_type"] == "app_mention" and by_m["state"] in ("received", "resolving")
+                and f["type"] == "message" and (f["files"] or f["blocks"])):
+            if db.cas(conn,
+                      "UPDATE inbox SET snapshot_json=?, sender_user_id=?, sender_type=?, "
+                      "message_type='message', thread_ts=?, reply_thread_ts=?, ts=? "
+                      "WHERE message_id=? AND state IN ('received','resolving')",
+                      (util.jdumps(ev), sender, sender_type, thread_ts, reply_thread_ts, now, mid)):
+                db.bump_counter(conn, "inbox_snapshot_upgraded")
+                return ("handed", conn.execute("SELECT * FROM inbox WHERE message_id=?",
+                                               (mid,)).fetchone())
+        db.bump_counter(conn, "inbox_dup_message")
+        return _drop(conn, "dup_message")
+    return ("handed", conn.execute("SELECT * FROM inbox WHERE message_id=?", (mid,)).fetchone())
+
+
+# ---------------------------------------------------------------- Inbound
 class Inbound:
-    def __init__(self, conn, cfg, runner, clock, media_root, heartbeat=None, log=None):
+    def __init__(self, conn, cfg, client, clock, media_root, heartbeat=None, log=None):
         self.conn = conn
         self.cfg = cfg
-        self.runner = runner
+        self.client = client
         self.clock = clock
         self.media_root = media_root
-        self.heartbeat = heartbeat  # r2-M1②:含网络条目处理完 touch last_loop_at
-        self.log = log              # r3-6:mget/物化失败留原始现场
+        self.heartbeat = heartbeat   # 含网络条目处理完 touch last_loop_at
+        self.log = log
+        self.materializer = None     # 测试注入;None → media.materialize
+        self.worker_path = None      # 测试注入;None → bin/download_worker.py
+        register_defaults(cfg, clock)
 
-    def _log_io_failure(self, what, res):
+    # ---- 基础 ----
+    def _log(self, msg):
         if self.log is None:
             return
         try:
-            self.log(f"{what}: rc={res.rc} timed_out={res.timed_out} "
-                     f"stdout={(res.stdout or '')[:300]!r} stderr={(res.stderr or '')[:300]!r}")
+            self.log(msg)
         except Exception:
             pass
 
@@ -128,223 +200,216 @@ class Inbound:
             except Exception:
                 pass
 
-    # ---------------- 入站事件 ----------------
-    def process_event(self, ev):
-        ev = normalize_receive(ev)
-        if not ev:
-            return
-        if ev.get("chat_type") and ev.get("chat_type") != "group":
-            return  # 只管 group
-        # E2:chat_allowlist 灰度门 —— 任何 inbox/notice 之前,零副作用零回复
-        allow = self.cfg.get("chat_allowlist")
-        if allow and ev.get("chat_id") not in allow:
-            return
-        sender = ev.get("sender_id")
-        if sender in (self.cfg.get("bot_open_id"), self.cfg.get("app_id")):
-            return  # F9:显式过滤 bot 自发
-        chat_id, mid, eid = ev["chat_id"], ev["message_id"], ev["event_id"]
-        live = self.conn.execute(
-            "SELECT 1 FROM bindings WHERE chat_id=? AND status IN ('starting','active')",
-            (chat_id,)).fetchone()
-        if not live and "@" not in (ev.get("content") or ""):
-            return  # 4.2.0 廉价预滤(正确性不依赖)
-        if sender != self.cfg.get("owner_open_id"):
-            qs = ",".join("?" for _ in constants.INBOX_NONTERMINAL_STATES)
-            n = self.conn.execute(
-                f"SELECT COUNT(*) FROM inbox WHERE state IN ({qs})",
-                constants.INBOX_NONTERMINAL_STATES).fetchone()[0]
-            if n >= constants.INBOX_NONTERMINAL_CAP:
-                db.bump_counter(self.conn, "inbox_cap_drops")
-                return
-        row = self._insert_or_resume(chat_id, mid, eid, ev)
-        if row is not None:
-            self.drive_row(row)
-
-    def _insert_or_resume(self, chat_id, mid, eid, ev):
-        now = self.clock.wall_ms()
-        try:
-            with db.tx(self.conn):
-                pinned = self.conn.execute(
-                    "SELECT binding_id FROM bindings WHERE chat_id=? "
-                    "ORDER BY binding_seq DESC LIMIT 1", (chat_id,)).fetchone()
-                self.conn.execute(
-                    "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,"
-                    "sender_open_id,message_type,state,ts) VALUES(?,?,?,?,?,?,'received',?)",
-                    (eid, mid, chat_id, pinned[0] if pinned else None,
-                     ev.get("sender_id"), ev.get("message_type"), now))
-        except sqlite3.IntegrityError:
-            by_e = self.conn.execute(
-                "SELECT * FROM inbox WHERE event_id=?", (eid,)).fetchone()
-            by_m = self.conn.execute(
-                "SELECT * FROM inbox WHERE message_id=?", (mid,)).fetchone()
-            if by_e is not None and by_m is not None and by_e["inbox_seq"] == by_m["inbox_seq"]:
-                return by_e  # 崩溃恢复:同一行,继续驱动
-            db.bump_counter(self.conn, "inbox_conflict_alerts")  # 两键命中不同行:fail-closed
-            return None
-        return self.conn.execute("SELECT * FROM inbox WHERE message_id=?", (mid,)).fetchone()
-
-    # ---------------- 状态机驱动(恢复工人复用同一入口) ----------------
-    def drive_row(self, row):
-        mid = row["message_id"]
-        for _ in range(4):
-            row = self.conn.execute(
-                "SELECT * FROM inbox WHERE message_id=?", (mid,)).fetchone()
-            if row is None:
-                return
-            st = row["state"]
-            if st == "received":
-                db.cas(self.conn,
-                       "UPDATE inbox SET state='resolving', ts=? WHERE message_id=? AND state='received'",
-                       (self.clock.wall_ms(), mid))
-                continue
-            if st == "resolving":
-                self._drive_resolving(row)
-                self._beat()
-                return
-            if st == "waiting_binding":
-                self._drive_waiting(row)
-                self._beat()
-                return
-            if st == "approved_materializing":
-                self._drive_materializing(row)
-                self._beat()
-                return
-            return  # 终态或 awaiting_approval(回调驱动)
-
-    def drive_waiting_rows(self):
-        """激活后 / 每 tick:推进全部 waiting_binding(r7-②:此专用分支先于任何通用收口)。"""
-        rows = self.conn.execute(
-            "SELECT * FROM inbox WHERE state='waiting_binding' ORDER BY inbox_seq").fetchall()
-        n = 0
-        for r in rows:
-            b = self._binding_of(r)
-            if b is not None and b["status"] == "starting":
-                continue  # 继续等
-            self.drive_row(r)
-            n += 1
-        return n
-
-    # ---------------- 内部步骤 ----------------
     def _binding_of(self, row):
         if row["binding_id"] is None:
             return None
         return self.conn.execute(
             "SELECT * FROM bindings WHERE binding_id=?", (row["binding_id"],)).fetchone()
 
-    def _fetch_snapshot(self, message_id):
-        res = self.runner.run(
-            ["im", "+messages-mget", "--as", "bot", "--message-ids", message_id,
-             "--no-reactions"], timeout_s=constants.MGET_TIMEOUT_S)
-        env = runner_mod.parse_envelope(res.stdout)
-        if res.rc != 0 or not runner_mod.envelope_ok(env):
-            self._log_io_failure(f"mget {message_id} failed", res)  # r3-6
-            return None
-        for m in runner_mod.data_of(env).get("messages") or []:
-            if m.get("message_id") == message_id:
-                return m
-        # r4-4:ok:true 但结果里没有目标 message(非静默 None)
-        if self.log is not None:
-            ids = [m.get("message_id") for m in runner_mod.data_of(env).get("messages") or []]
-            try:
-                self.log(f"mget {message_id}: ok but no target message not found in {ids[:5]}")
-            except Exception:
-                pass
-        return None
+    def _row(self, message_id):
+        return self.conn.execute("SELECT * FROM inbox WHERE message_id=?", (message_id,)).fetchone()
 
     def _snapshot_of(self, row):
-        if row["snapshot_json"]:
-            try:
-                snap = json.loads(row["snapshot_json"])
-                if not snap.get("trimmed"):
-                    return snap
-            except ValueError:
-                pass
-        return self._fetch_snapshot(row["message_id"])
+        try:
+            snap = json.loads(row["snapshot_json"] or "")
+        except (ValueError, TypeError):
+            return None
+        return snap if isinstance(snap, dict) and not snap.get("trimmed") else None
+
+    def ingest_in_tx(self, conn, row):
+        return ingest_in_tx(conn, row, self.cfg, self.clock)
+
+    # ---- 驱动入口 ----
+    def drive_pending_rows(self, budget=constants.FOLLOWUP_BUDGET_PER_TICK):
+        """contracts §1.2:本地分流不限量 → 预算内物化。→ 统计 dict。"""
+        routed = self.drive_local_rows()
+        stats = self.drive_materializing_rows(budget)
+        stats["routed"] = routed
+        return stats
+
+    def drive_local_rows(self):
+        """零网络:received/resolving → 决策;waiting_binding → 激活重过门 / 终止映射。"""
+        rows = self.conn.execute(
+            "SELECT * FROM inbox WHERE state IN ('received','resolving','waiting_binding') "
+            "ORDER BY inbox_seq").fetchall()
+        n = 0
+        for r in rows:
+            if self._route_local(r):
+                n += 1
+        return n
+
+    def drive_waiting_rows(self):
+        """兼容入口(旧 daemon_core / recovery):只推进 waiting_binding 行。"""
+        rows = self.conn.execute(
+            "SELECT * FROM inbox WHERE state='waiting_binding' ORDER BY inbox_seq").fetchall()
+        n = 0
+        for r in rows:
+            if self._route_local(r):
+                n += 1
+        return n
+
+    def drive_materializing_rows(self, budget=constants.FOLLOWUP_BUDGET_PER_TICK):
+        """预算内物化:取 materializing ∧ (materialize_next_at IS NULL ∨ ≤ now),
+        带下载 ≤ budget[0] 条、纯文本 ≤ budget[1] 条;每条之后 heartbeat。"""
+        dl_budget, text_budget = int(budget[0]), int(budget[1])
+        stats = {"downloads": 0, "text_only": 0, "skipped_budget": 0}
+        if dl_budget <= 0 and text_budget <= 0:
+            return stats
+        now = self.clock.wall_ms()
+        rows = self.conn.execute(
+            "SELECT * FROM inbox WHERE state='materializing' "
+            "AND (materialize_next_at IS NULL OR materialize_next_at<=?) ORDER BY inbox_seq",
+            (now,)).fetchall()
+        for r in rows:
+            snap = self._snapshot_of(r) or {}
+            heavy = media.needs_download(files_of(snap))
+            if heavy:
+                if dl_budget <= 0:
+                    stats["skipped_budget"] += 1
+                    continue
+                dl_budget -= 1
+                stats["downloads"] += 1
+            else:
+                if text_budget <= 0:
+                    stats["skipped_budget"] += 1
+                    continue
+                text_budget -= 1
+                stats["text_only"] += 1
+            self._drive_materializing(r)
+            self._beat()
+        return stats
+
+    def drive_row(self, row):
+        """单行驱动(测试 / 恢复 / approval.run_followup):本地分流到底;materializing → 一次尝试。"""
+        mid = row["message_id"]
+        did = False
+        for _ in range(4):
+            row = self._row(mid)
+            if row is None:
+                return did
+            st = row["state"]
+            if st in ("received", "resolving", "waiting_binding"):
+                if not self._route_local(row):
+                    return did
+                did = True
+                continue
+            if st == "materializing":
+                did = self._drive_materializing(row) or did
+                self._beat()
+            return did
+        return did
+
+    # ---- 本地分流 ----
+    def _route_local(self, row):
+        """→ 是否推进了状态。"""
+        st = row["state"]
+        if st in ("received", "resolving"):
+            return self._drive_resolving(row)
+        if st == "waiting_binding":
+            return self._drive_waiting(row)
+        return False
 
     def _drive_resolving(self, row):
-        snap = self._snapshot_of(row)  # 网络在事务外
-        if snap is None:
-            return  # 瞬态失败:保持 resolving,恢复工人按 deadline 收口
-        need_media = False
+        mid = row["message_id"]
         with db.tx(self.conn):
-            cur = self.conn.execute(
-                "SELECT state FROM inbox WHERE message_id=?", (row["message_id"],)).fetchone()
-            if cur is None or cur["state"] != "resolving":
-                return
-            need_media = self._decide_in_tx(row, snap)
-        if need_media:
-            self._materialize_then_finalize(row, snap, from_state="resolving")
+            cur = self._row(mid)
+            if cur is None or cur["state"] not in ("received", "resolving"):
+                return False
+            now = self.clock.wall_ms()
+            if cur["state"] == "received":
+                db.cas(self.conn,
+                       "UPDATE inbox SET state='resolving', ts=? WHERE message_id=? AND state='received'",
+                       (now, mid))
+            snap = self._snapshot_of(cur)
+            if snap is None:
+                db.cas(self.conn,
+                       "UPDATE inbox SET state='failed', ts=? WHERE message_id=? AND state='resolving'",
+                       (now, mid))
+                db.bump_counter(self.conn, "inbox_snapshot_invalid")
+                return True
+            self._decide_in_tx(cur, snap, "resolving")
+        return True
 
-    def _decide_in_tx(self, row, snap, from_state="resolving"):
-        """resolving → 终点(单事务)。返回是否 owner 媒体需物化(保持原状态)。"""
+    def _decide_in_tx(self, row, snap, from_state):
+        """本地决策(事务内):未提及 ∧ 非 DM → ignored;绑定 NULL/终态 → inbound_notice;
+        starting → waiting_binding;active → 门禁。"""
         now = self.clock.wall_ms()
         mid = row["message_id"]
-        sender_id, sender_type = sender_of(snap)
-        mtype = snap.get("msg_type")
-        self.conn.execute(
-            "UPDATE inbox SET snapshot_json=?, sender_open_id=?, sender_type=?, message_type=? "
-            "WHERE message_id=?",
-            (util.jdumps(snap), sender_id, sender_type, mtype, mid))
-        if not is_bot_mentioned(snap, self.cfg["app_id"]):
-            self.conn.execute(
-                "UPDATE inbox SET state='ignored_not_mentioned', snapshot_json=?, ts=? "
-                "WHERE message_id=? AND state=?",
-                (trim_snapshot(snap), now, mid, from_state))
-            return False
+        mentioned = (row["message_type"] == "app_mention"
+                     or slackwire.is_bot_mentioned(snap, self.cfg.get("bot_user_id")))
+        dm = slackwire.is_dm(snap)
+        if not mentioned and not dm:
+            db.cas(self.conn,
+                   "UPDATE inbox SET state='ignored_not_mentioned', snapshot_json=?, ts=? "
+                   "WHERE message_id=? AND state=?", (trim_snapshot(snap), now, mid, from_state))
+            return
         binding = self._binding_of(row)
         if binding is None or binding["status"] in ("dead", "closed"):
-            target = lifecycle.map_terminated_to_inbox_state(binding)
-            db.cas(self.conn,
-                   "UPDATE inbox SET state=?, ts=? WHERE message_id=? AND state=?",
-                   (target, now, mid, from_state))
-            jobs.create_inbound_notice(
-                self.conn, chat_id=row["chat_id"], message_id=mid, code=target,
-                binding_id=binding["binding_id"] if binding else None, now=now)
-            return False
+            self._terminated_in_tx(row, snap, binding, from_state, now)
+            return
         if binding["status"] == "starting":
             db.cas(self.conn,
                    "UPDATE inbox SET state='waiting_binding', ts=? WHERE message_id=? AND state=?",
                    (now, mid, from_state))
-            return False
-        # active:正常分流门(4.2.6/4.2.7)
-        return self._gate_active_in_tx(row, snap, binding, from_state, now)
+            return
+        self._gate_active_in_tx(row, snap, binding, from_state, now)
+
+    def _terminated_in_tx(self, row, snap, binding, from_state, now):
+        """绑定 NULL/终态 → 4.2.4 映射终态 + inbound_notice(DM 且非 owner 时压制)。"""
+        mid = row["message_id"]
+        target = lifecycle.map_terminated_to_inbox_state(binding)
+        if not db.cas(self.conn,
+                      "UPDATE inbox SET state=?, ts=? WHERE message_id=? AND state=?",
+                      (target, now, mid, from_state)):
+            return
+        sender, _ = sender_of(snap)
+        if slackwire.is_dm(snap) and sender != self.cfg.get("owner_user_id"):
+            db.bump_counter(self.conn, "dm_notice_suppressed")
+            return
+        jobs.create_inbound_notice(
+            self.conn, chat_id=row["chat_id"], message_id=mid, code=target,
+            binding_id=binding["binding_id"] if binding else None, now=now)
 
     def _gate_active_in_tx(self, row, snap, binding, from_state, now):
+        """active 门禁(contracts §5.1):unsupported / owner / 白名单 / 成员审批。"""
         mid = row["message_id"]
-        mtype = snap.get("msg_type")
-        sender_id, _ = sender_of(snap)
-        if mtype not in constants.SUPPORTED_MSG_TYPES:
+        bot = self.cfg.get("bot_user_id")
+        text = render_text(snap, bot)
+        files = files_of(snap)
+        sender, _ = sender_of(snap)
+        if not text and not files and _blocks_or_attachments(snap):
             db.cas(self.conn,
                    "UPDATE inbox SET state='unsupported', ts=? WHERE message_id=? AND state=?",
                    (now, mid, from_state))
             jobs.create_job(
                 self.conn, kind="unsupported_notice", chat_id=row["chat_id"],
-                binding_id=binding["binding_id"], idempotency_key=jobs.key_un(mid),
-                ref_message_id=mid, expected_state="unsupported",
-                body=texts.UNSUPPORTED_NOTICE, now=now)
-            return False
-        if sender_id == self.cfg["owner_open_id"]:
-            if mtype in constants.MEDIA_MSG_TYPES:
-                return True  # 保持原状态,事务外物化后 finalize
-            self._enqueue_in_tx(row, binding, snap, from_state, now)
-            return False
-        # 白名单成员((chat_id, open_id) 双精确匹配)→ 免审批直投,但**信任级别不变**:
-        # payload 仍 sender_is_owner=false + approved_by="allowlist",agent 侧照旧当
-        # 不可信输入。判定每次读盘 → owner 让 agent 改完文件下一条消息即生效。
-        if senderallow.is_allowed(row["chat_id"], sender_id):
-            if mtype in constants.MEDIA_MSG_TYPES:
-                return True  # 与 owner 同路:事务外物化后 finalize
-            self._enqueue_in_tx(row, binding, snap, from_state, now,
-                                approved_by=constants.APPROVED_BY_ALLOWLIST)
-            return False
+                binding_id=binding["binding_id"], reply_to=row["reply_thread_ts"],
+                idempotency_key=jobs.key_un(mid), ref_message_id=mid,
+                expected_state="unsupported", body=texts.UNSUPPORTED_NOTICE, now=now)
+            return
+        if sender is not None and sender == self.cfg.get("owner_user_id"):
+            if files:
+                self._set_materializing_in_tx(mid, from_state, "owner", now)
+            else:
+                self._enqueue_in_tx(row, binding, snap, from_state, now)
+            return
+        # 白名单成员((chat_id, user_id) 双精确匹配)→ 免审批直投,但**信任级别不变**:
+        # payload 仍 sender_is_owner=false + approved_by="allowlist"。判定每次读盘。
+        if senderallow.is_allowed(row["chat_id"], sender):
+            if files:
+                self._set_materializing_in_tx(mid, from_state, "allowlist", now)
+            else:
+                self._enqueue_in_tx(row, binding, snap, from_state, now,
+                                    approved_by=constants.APPROVED_BY_ALLOWLIST)
+            return
         # member → 审批门(纯机械;绝不直投)
-        reason = self._member_quota_reason(row["chat_id"], sender_id, now)
+        reason = self._member_quota_reason(row["chat_id"], sender, now)
         if reason:
             db.cas(self.conn,
                    "UPDATE inbox SET state='failed', ts=? WHERE message_id=? AND state=?",
                    (now, mid, from_state))
-            db.bump_counter(self.conn, f"ratelimit_{reason}")
-            return False
+            db.bump_counter(self.conn, "ratelimit_%s" % reason)
+            return
         pending_id = util.new_id()
         nonce = util.new_nonce()
         self.conn.execute(
@@ -354,16 +419,20 @@ class Inbound:
         db.cas(self.conn,
                "UPDATE inbox SET state='awaiting_approval', ts=? WHERE message_id=? AND state=?",
                (now, mid, from_state))
-        sender_label = sender_id or "?"
         jobs.create_job(
             self.conn, kind="approval_card", chat_id=row["chat_id"],
-            binding_id=binding["binding_id"], reply_to=mid,
+            binding_id=binding["binding_id"], reply_to=row["reply_thread_ts"],
             idempotency_key=jobs.key_card(pending_id), ref_pending_id=pending_id,
-            expected_state="pending",
-            body=texts.build_approval_card(pending_id, nonce, sender_label,
-                                           extract_text(snap, self.cfg.get("app_id"))),
+            ref_message_id=mid, expected_state="pending",
+            body=texts.build_approval_card(pending_id, nonce, sender or "?",
+                                           card_preview(snap, bot)),
             now=now)
-        return False
+
+    def _set_materializing_in_tx(self, mid, from_state, reason, now):
+        return db.cas(self.conn,
+                      "UPDATE inbox SET state='materializing', materialize_reason=?, "
+                      "materialize_started_at=NULL, materialize_attempts=0, materialize_next_at=NULL, "
+                      "ts=? WHERE message_id=? AND state=?", (reason, now, mid, from_state))
 
     def _member_quota_reason(self, chat_id, sender_id, now):
         undecided = self.conn.execute(
@@ -371,59 +440,42 @@ class Inbound:
             "WHERE i.chat_id=? AND p.state='pending'", (chat_id,)).fetchone()[0]
         if undecided >= constants.MAX_UNDECIDED_PER_CHAT:
             return "chat_pending_quota"
+        if sender_id is None:
+            return None
         last = self.conn.execute(
             "SELECT MAX(p.created_at) FROM pendings p JOIN inbox i ON p.message_id=i.message_id "
-            "WHERE i.sender_open_id=?", (sender_id,)).fetchone()[0]
+            "WHERE i.sender_user_id=?", (sender_id,)).fetchone()[0]
         if last is not None and 0 <= now - last < constants.SENDER_COOLDOWN_MS:
             return "sender_cooldown"
         return None
 
+    def build_payload(self, row, snap, paths=None, approved_by=None):
+        """listener payload(contracts §4.3;`type`/`delivery_seq` 由 listener 加)。"""
+        sender, _ = sender_of(snap)
+        paths = list(paths or [])
+        return {
+            "message_id": row["message_id"],
+            "chat_id": row["chat_id"],
+            "ts": snap.get("ts") if isinstance(snap.get("ts"), str) else None,
+            "thread_ts": snap.get("thread_ts") if isinstance(snap.get("thread_ts"), str) else None,
+            "sender_user_id": sender,
+            "sender_is_owner": sender is not None and sender == self.cfg.get("owner_user_id"),
+            "approved_by": approved_by,
+            "message_type": row["message_type"] or snap.get("type"),
+            "text": render_text(snap, self.cfg.get("bot_user_id")),
+            "media_paths": paths,
+            "files": media.describe_files(files_of(snap), paths),
+        }
+
     def _enqueue_in_tx(self, row, binding, snap, from_state, now,
-                       media_paths=None, approved_by=None, create_receipt=True):
-        """事务内复验绑定 active + deliveries 幂等入队(I3)。"""
+                       paths=None, approved_by=None, create_receipt=True):
+        """事务内复验绑定 active + deliveries 幂等入队(I3)+ receipt_reaction。→ 是否入队。"""
         b = self.conn.execute(
-            "SELECT status FROM bindings WHERE binding_id=?",
-            (binding["binding_id"],)).fetchone()
+            "SELECT status FROM bindings WHERE binding_id=?", (binding["binding_id"],)).fetchone()
         if b is None or b["status"] != "active":
             return False
         mid = row["message_id"]
-        sender_id, sender_type = sender_of(snap)
-        payload = {
-            "message_id": mid,
-            "chat_id": row["chat_id"],
-            "sender_open_id": sender_id,
-            "sender_type": sender_type,
-            "sender_is_owner": sender_id == self.cfg["owner_open_id"],
-            "approved_by": approved_by,
-            "message_type": snap.get("msg_type"),
-            "text": extract_text(snap, self.cfg.get("app_id")),
-            "media_paths": media_paths or [],
-        }
-        # 非纯文本 → 附「附件可自取」句柄。**判定看 msg_type,不看正文有没有 key**:
-        # 「扫到 key 才加」会漏掉 image/file(它们渲染成 `[图片]`/`(文件) 名字`、根本不含 key),
-        # 也会给纯文本里粘了 img_v3_… 的代码误加。keys 独立填(可为空,空则给 mget 兜底)。
-        # 新字段而非拼进 text:text 是用户原话,污染它会混淆「用户说了什么」与「系统提示」;
-        # 新字段对既有消费者 additive,经 listener 的 line.update(payload) 原样到达 agent。
-        # **只扫未剥 mention 的原始顶层 `content`;拿不到就不扫**(codex impl r1 Low1 + r2 实证):
-        # `extract_text` 把指向本 bot 的 `@name` 替换成**空串**,故 `img@TestBot_v12_fake` 会被
-        # 拼成正文里原本不存在的 key `img_v12_fake`(实测,legacy `body.content` 形状同样复现)。
-        # 后果仅是 agent 拿到假 key、下载失败(charset 无 `/`/`.`/shell 元字符,无安全面),但
-        # 没必要留着。**故意不回退扫 `payload["text"]`**(那会让假 key 在 legacy 形状上复活),
-        # 也不去扫序列化后的 `body.content`(JSON 的字段名/转义会带来新误判面)。
-        # **代价**:legacy 形状(顶层 `content` 缺失,lark-cli 正常渲染下不出现)keys 为空 —— 但
-        # hint 仍在 + 给 mget 兜底,agent 照样能看原始结构。不递归解析原始 post 节点(过度设计)。
-        if snap.get("msg_type") != "text":
-            raw = snap.get("content")
-            keys = _media_keys(raw) if isinstance(raw, str) else []
-            payload["media_keys"] = keys
-            payload["fetch_hint"] = texts.media_fetch_hint(mid, keys, self.cfg["profile"])
-        # 回复/引用 → 附「被引用消息可自取」句柄。**闸门与上面的媒体分支相互独立**:
-        # 带引用的消息 msg_type 仍是 `text`,套用 `msg_type != "text"` 会整个漏掉。
-        # 「图 + 引用」两个 hint 都要有,故用两个独立字段、不共用一个键。
-        reply_to = snap.get("reply_to")
-        if isinstance(reply_to, str) and reply_to:
-            payload["reply_to"] = reply_to
-            payload["reply_hint"] = texts.reply_fetch_hint(reply_to, self.cfg["profile"])
+        payload = self.build_payload(row, snap, paths=paths, approved_by=approved_by)
         existing = self.conn.execute(
             "SELECT delivery_seq FROM deliveries WHERE binding_id=? AND message_id=?",
             (binding["binding_id"], mid)).fetchone()
@@ -442,115 +494,188 @@ class Inbound:
             jobs.create_job(
                 self.conn, kind="receipt_reaction", chat_id=row["chat_id"],
                 binding_id=binding["binding_id"], idempotency_key=jobs.key_rc(seq),
-                ref_delivery_seq=seq, ref_message_id=mid, body="GLANCE", now=now)
+                ref_delivery_seq=seq, ref_message_id=mid, body=constants.RECEIPT_REACTION,
+                now=now)
         return True
 
-    def _materialize_then_finalize(self, row, snap, from_state, approved_pending=None):
-        """owner 媒体 / 白名单成员媒体 / 已批准 member 媒体:
-        网络物化(事务外)→ 单事务复验+入队。
-
-        `approved_by` 三种来源必须区分开(否则白名单成员的图会**长得和 owner 本人发的一样**):
-        点按钮 → 该 owner 的 operator_id;白名单 → `"allowlist"`;owner 本人 → None。
-        """
-        mid = row["message_id"]
-        now = self.clock.wall_ms()
-        try:
-            paths = media.materialize(
-                self.runner, self.media_root, row["binding_id"], mid, log=self.log)
-        except media.MediaError:
-            with db.tx(self.conn):
-                db.cas(self.conn,
-                       "UPDATE inbox SET state='failed', ts=? WHERE message_id=? AND state=?",
-                       (now, mid, from_state))
-                if approved_pending is not None:
-                    jobs.create_job(
-                        self.conn, kind="decision_notice", chat_id=row["chat_id"],
-                        binding_id=row["binding_id"],
-                        idempotency_key=jobs.key_dec(approved_pending["pending_id"], "failed"),
-                        ref_pending_id=approved_pending["pending_id"], ref_message_id=mid,
-                        expected_state="failed",
-                        body=texts.decision_notice_body("failed"), now=now)
-                db.bump_counter(self.conn, "media_failed")
-            return
-        if paths is None:
-            return  # 瞬态:保持现状态,deadline 由恢复工人收口
-        with db.tx(self.conn):
-            b = self._binding_of(row)
-            now = self.clock.wall_ms()
-            if b is not None and b["status"] == "active":
-                sender_id, _ = sender_of(snap)
-                if approved_pending is not None:
-                    approved_by = approved_pending["decided_by"]
-                elif sender_id != self.cfg["owner_open_id"]:
-                    # 非 owner 又走到这里 ⟹ 只可能是白名单直投(审批路径必带 pending)
-                    approved_by = constants.APPROVED_BY_ALLOWLIST
-                else:
-                    approved_by = None
-                self._enqueue_in_tx(
-                    row, b, snap, from_state, now, media_paths=paths,
-                    approved_by=approved_by,
-                    create_receipt=approved_pending is None)
-                if approved_pending is not None:
-                    jobs.create_job(
-                        self.conn, kind="decision_notice", chat_id=row["chat_id"],
-                        binding_id=row["binding_id"],
-                        idempotency_key=jobs.key_dec(approved_pending["pending_id"], "approved"),
-                        ref_pending_id=approved_pending["pending_id"],
-                        expected_state="approved",
-                        body=texts.decision_notice_body("approved"), now=now)
-            else:
-                if approved_pending is not None:
-                    # 4.8 通用分支:绑定复验失败 → undeliverable(仅非 waiting 状态)
-                    db.cas(self.conn,
-                           "UPDATE inbox SET state='undeliverable', ts=? "
-                           "WHERE message_id=? AND state=?", (now, mid, from_state))
-                else:
-                    target = lifecycle.map_terminated_to_inbox_state(b)
-                    if db.cas(self.conn,
-                              "UPDATE inbox SET state=?, ts=? WHERE message_id=? AND state=?",
-                              (target, now, mid, from_state)):
-                        jobs.create_inbound_notice(
-                            self.conn, chat_id=row["chat_id"], message_id=mid,
-                            code=target, binding_id=row["binding_id"], now=now)
-
     def _drive_waiting(self, row):
-        """waiting_binding 专用分支(r7-②):激活 → 重过正常分流门;终止 → 4.2.4 映射。"""
+        """waiting_binding:绑定仍 starting → 继续等;active → 重过门;终止 → 4.2.4 映射。"""
         b = self._binding_of(row)
         if b is not None and b["status"] == "starting":
-            return
-        snap = self._snapshot_of(row)
-        if snap is None:
-            return
-        need_media = False
+            return False
+        mid = row["message_id"]
         with db.tx(self.conn):
-            cur = self.conn.execute(
-                "SELECT state FROM inbox WHERE message_id=?", (row["message_id"],)).fetchone()
+            cur = self._row(mid)
             if cur is None or cur["state"] != "waiting_binding":
-                return
+                return False
             now = self.clock.wall_ms()
-            b = self._binding_of(row)  # 事务内重读:激活/终止只取其一(r7-③)
+            b = self._binding_of(cur)          # 事务内重读:激活/终止只取其一
+            if b is not None and b["status"] == "starting":
+                return False
+            snap = self._snapshot_of(cur)
+            if snap is None:
+                db.cas(self.conn,
+                       "UPDATE inbox SET state='failed', ts=? WHERE message_id=? AND state='waiting_binding'",
+                       (now, mid))
+                db.bump_counter(self.conn, "inbox_snapshot_invalid")
+                return True
             if b is not None and b["status"] == "active":
-                need_media = self._gate_active_in_tx(row, snap, b, "waiting_binding", now)
-            elif b is None or b["status"] in ("dead", "closed"):
-                target = lifecycle.map_terminated_to_inbox_state(b)
-                if db.cas(self.conn,
-                          "UPDATE inbox SET state=?, ts=? WHERE message_id=? AND state=?",
-                          (target, now, row["message_id"], "waiting_binding")):
-                    jobs.create_inbound_notice(
-                        self.conn, chat_id=row["chat_id"], message_id=row["message_id"],
-                        code=target, binding_id=row["binding_id"], now=now)
-        if need_media:
-            self._materialize_then_finalize(row, snap, from_state="waiting_binding")
+                self._gate_active_in_tx(cur, snap, b, "waiting_binding", now)
+            else:
+                self._terminated_in_tx(cur, snap, b, "waiting_binding", now)
+        return True
+
+    # ---- 物化(需要网络;事务外下载,单事务收口) ----
+    def _client_tokens(self):
+        """下载用 bot_token:客户端的 tokens 文件(文件是真相)→ 客户端内存 token → 默认 tokens.json。
+        拿不到 → None(视为瞬态:走预算)。token 绝不进日志。"""
+        c = self.client
+        try:
+            path = getattr(c, "tokens_path", None)
+            if path is not None:
+                return configmod.load_tokens(path, allow_env=False)[0]
+            tok = getattr(c, "_token", None)
+            if isinstance(tok, str) and tok:
+                return {"bot_token": tok}
+            return configmod.load_tokens(allow_env=False)[0]
+        except configmod.ConfigError as e:
+            self._log("materialize: tokens unavailable: %s" % e)
+            return None
+
+    def _materialize(self, **kw):
+        fn = self.materializer or media.materialize
+        return fn(**kw)
 
     def _drive_materializing(self, row):
-        """approved_materializing:重驱物化(4.8);绑定复验失败 → undeliverable。"""
-        pending = self.conn.execute(
-            "SELECT * FROM pendings WHERE message_id=? AND state='approved'",
-            (row["message_id"],)).fetchone()
-        if pending is None:
-            return
+        """materializing 行的一次尝试(contracts §5.2)。"""
+        mid = row["message_id"]
+        row = self._row(mid)
+        if row is None or row["state"] != "materializing":
+            return False
+        now = self.clock.wall_ms()
+        reason = row["materialize_reason"] or "owner"
+        pending = None
+        if reason == "approved":
+            pending = self.conn.execute(
+                "SELECT * FROM pendings WHERE message_id=?", (mid,)).fetchone()
         snap = self._snapshot_of(row)
         if snap is None:
-            return
-        self._materialize_then_finalize(
-            row, snap, from_state="approved_materializing", approved_pending=pending)
+            self._materialize_terminal(row, reason, pending, "snapshot_invalid")
+            return True
+        # 绑定非 active:不下载,直接收口(approved → undeliverable;其它 → 4.2.4 映射)
+        b = self._binding_of(row)
+        if b is None or b["status"] != "active":
+            self._finalize_not_active(row, snap, reason, pending)
+            return True
+        started = row["materialize_started_at"]
+        if started is not None and now - started > constants.MEDIA_RETRY_DEADLINE_MS:
+            self._materialize_terminal(row, reason, pending, "budget")
+            return True
+        if started is None:
+            db.cas(self.conn,
+                   "UPDATE inbox SET materialize_started_at=? WHERE message_id=? "
+                   "AND state='materializing' AND materialize_started_at IS NULL", (now, mid))
+        files = files_of(snap)
+        tokens = self._client_tokens() if media.needs_download(files) else {}
+        stats = {}
+        try:
+            # tokens 为 None(拿不到凭据)也原样传入:media.materialize 对需要下载的消息返回 None(瞬态)
+            res = self._materialize(
+                client_tokens=tokens, media_root=self.media_root,
+                binding_id=row["binding_id"], message_id=mid, files=files,
+                deadline_s=constants.DOWNLOAD_DEADLINE_S, worker_path=self.worker_path,
+                log=self.log, clock=self.clock, stats=stats)
+        except media.MediaError as e:
+            self._log("materialize %s MediaError: %s" % (mid, e))
+            self._materialize_terminal(row, reason, pending, "media_error")
+            return True
+        for k, v in stats.items():
+            db.bump_counter(self.conn, k, v)
+        if res is None:
+            self._materialize_transient(row)
+            return True
+        paths, skipped = res
+        self._finalize_success(row, snap, reason, pending, paths)
+        return True
+
+    def _materialize_transient(self, row):
+        now = self.clock.wall_ms()
+        n = int(row["materialize_attempts"] or 0)
+        delay = min(constants.MEDIA_RETRY_BACKOFF_MS * (2 ** n), constants.MEDIA_RETRY_BACKOFF_MAX_MS)
+        db.cas(self.conn,
+               "UPDATE inbox SET materialize_attempts=materialize_attempts+1, materialize_next_at=? "
+               "WHERE message_id=? AND state='materializing'", (now + delay, row["message_id"]))
+
+    def _materialize_terminal(self, row, reason, pending, why):
+        """预算耗尽 / MediaError → 终态:owner/allowlist → failed(静默计数);
+        approved → failed + decision_notice(attachment_failed)。"""
+        mid = row["message_id"]
+        now = self.clock.wall_ms()
+        with db.tx(self.conn):
+            if not db.cas(self.conn,
+                          "UPDATE inbox SET state='failed', ts=? WHERE message_id=? AND state='materializing'",
+                          (now, mid)):
+                return
+            db.bump_counter(self.conn, "media_budget_exhausted" if why == "budget" else "media_failed")
+            if reason == "approved" and pending is not None:
+                lifecycle.create_decision_notice(
+                    self.conn, pending_id=pending["pending_id"], binding_id=row["binding_id"],
+                    chat_id=row["chat_id"], message_id=mid, reply_to=row["reply_thread_ts"],
+                    outcome="attachment_failed", now=now)
+        self._log("materialize %s terminal (%s, reason=%s)" % (mid, why, reason))
+
+    def _finalize_not_active(self, row, snap, reason, pending):
+        mid = row["message_id"]
+        now = self.clock.wall_ms()
+        with db.tx(self.conn):
+            cur = self._row(mid)
+            if cur is None or cur["state"] != "materializing":
+                return
+            b = self._binding_of(cur)
+            if b is not None and b["status"] == "active":
+                return                      # 竞态:又 active 了(不可能,但 fail-safe:留给下轮)
+            if reason == "approved":
+                if db.cas(self.conn,
+                          "UPDATE inbox SET state='undeliverable', ts=? WHERE message_id=? "
+                          "AND state='materializing'", (now, mid)) and pending is not None:
+                    lifecycle.create_decision_notice(
+                        self.conn, pending_id=pending["pending_id"], binding_id=cur["binding_id"],
+                        chat_id=cur["chat_id"], message_id=mid, reply_to=cur["reply_thread_ts"],
+                        outcome="closed_undelivered", now=now)
+            else:
+                self._terminated_in_tx(cur, snap, b, "materializing", now)
+
+    def _finalize_success(self, row, snap, reason, pending, paths):
+        """单事务:复验绑定 active → 入队(approved_by 按 reason);approved 再入队 delivered。"""
+        mid = row["message_id"]
+        with db.tx(self.conn):
+            cur = self._row(mid)
+            if cur is None or cur["state"] != "materializing":
+                return
+            now = self.clock.wall_ms()
+            b = self._binding_of(cur)
+            if b is None or b["status"] != "active":
+                if reason == "approved":
+                    if db.cas(self.conn,
+                              "UPDATE inbox SET state='undeliverable', ts=? WHERE message_id=? "
+                              "AND state='materializing'", (now, mid)) and pending is not None:
+                        lifecycle.create_decision_notice(
+                            self.conn, pending_id=pending["pending_id"], binding_id=cur["binding_id"],
+                            chat_id=cur["chat_id"], message_id=mid, reply_to=cur["reply_thread_ts"],
+                            outcome="closed_undelivered", now=now)
+                else:
+                    self._terminated_in_tx(cur, snap, b, "materializing", now)
+                return
+            if reason == "approved":
+                approved_by = pending["decided_by"] if pending is not None else None
+            elif reason == "allowlist":
+                approved_by = constants.APPROVED_BY_ALLOWLIST
+            else:
+                approved_by = None
+            ok = self._enqueue_in_tx(cur, b, snap, "materializing", now, paths=paths,
+                                     approved_by=approved_by, create_receipt=(reason != "approved"))
+            if ok and reason == "approved" and pending is not None:
+                lifecycle.create_decision_notice(
+                    self.conn, pending_id=pending["pending_id"], binding_id=cur["binding_id"],
+                    chat_id=cur["chat_id"], message_id=mid, reply_to=cur["reply_thread_ts"],
+                    outcome="delivered", now=now)

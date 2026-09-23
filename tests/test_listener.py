@@ -119,7 +119,7 @@ class TestClaim:
         assert len(lines) == 2
         objs = [json.loads(x) for x in lines]
         assert [o["message_id"] for o in objs] == ["om_1", "om_2"]  # 按 delivery_seq 序
-        assert all(o["type"] == "feishu_message" and "delivery_seq" in o for o in objs)
+        assert all(o["type"] == "slack_message" and "delivery_seq" in o for o in objs)
         rows = env.deliveries(bid)
         assert all(r["state"] == "emitted" for r in rows)
         assert all(r["lease_epoch"] == 1 for r in rows)

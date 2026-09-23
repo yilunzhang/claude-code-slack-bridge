@@ -10,8 +10,6 @@ from tests.helpers import app_mention_event, block_action, envelope, message_eve
 # WP1 的 drain_staging 已落地(事务/退避/隔离机制在 tests/test_daemon_plumbing.py 用契约形状的假 ingest 验证);
 # 下面标 WP1 的用例还依赖 WP2 的 lib/inbound.ingest_in_tx(真实 handed/dropped 语义、monkeypatch 目标属性),
 # WP2 合入即转绿(strict → 报错提醒)→ WP5 摘标记。
-WP1 = pytest.mark.xfail(strict=True, reason="WP1 done; needs WP2 inbound.ingest_in_tx")
-WP2 = pytest.mark.xfail(strict=True, reason="WP2 inbound/approval 事务接口未落地")
 
 
 def _staged_row(env, key):
@@ -19,7 +17,6 @@ def _staged_row(env, key):
 
 
 # ---------------------------------------------------------------- 提交
-@WP1
 def test_handed_row_is_consumed_in_same_transaction_as_inbox_insert(env):
     env.make_binding(status="active", chat_id=CHAT)
     ev = message_event(text="hi", channel=CHAT, user=OWNER)
@@ -33,7 +30,6 @@ def test_handed_row_is_consumed_in_same_transaction_as_inbox_insert(env):
     assert not env.conn.in_transaction
 
 
-@WP1
 def test_dropped_row_is_consumed_with_reason(env):
     env.stage("events_api", envelope(message_event(channel=CHAT), event_id="EvF", team_id="T_FOREIGN"))
     env.stage("events_api", envelope(message_event(channel=CHAT, user=OWNER, subtype="message_changed"),
@@ -45,7 +41,6 @@ def test_dropped_row_is_consumed_with_reason(env):
     assert env.conn.execute("SELECT COUNT(*) FROM inbox").fetchone()[0] == 0
 
 
-@WP1
 def test_drain_respects_next_drain_at_batch_and_seq_order(env):
     env.make_binding(status="active", chat_id=CHAT)
     now = env.clock.wall_ms()
@@ -62,7 +57,6 @@ def test_drain_respects_next_drain_at_batch_and_seq_order(env):
 
 
 # ---------------------------------------------------------------- 回滚 / 退避 / 隔离
-@WP1
 def test_business_exception_rolls_back_everything_and_backs_off(env, monkeypatch):
     from lib import inbound
     env.make_binding(status="active", chat_id=CHAT)
@@ -87,7 +81,6 @@ def test_business_exception_rolls_back_everything_and_backs_off(env, monkeypatch
     assert _staged_row(env, "ev:EvX")["drain_attempts"] == 1
 
 
-@WP1
 def test_quarantine_after_max_attempts_keeps_payload_and_error(env, monkeypatch):
     from lib import inbound
     env.stage("events_api", envelope(message_event(channel=CHAT, user=OWNER), event_id="EvQ"))
@@ -104,7 +97,6 @@ def test_quarantine_after_max_attempts_keeps_payload_and_error(env, monkeypatch)
     assert _staged_row(env, "ev:EvQ")["drain_attempts"] == constants.DRAIN_MAX_ATTEMPTS
 
 
-@WP1
 def test_business_must_not_open_nested_transaction(env, monkeypatch):
     """ingest_in_tx 若自己 BEGIN(db.tx 嵌套)→ RuntimeError → 按业务异常处理(staged + 退避),不崩 drain。"""
     from lib import inbound
@@ -120,12 +112,11 @@ def test_business_must_not_open_nested_transaction(env, monkeypatch):
 
 
 # ---------------------------------------------------------------- 交接与 followup 分离 / 崩溃恢复
-@WP2
 def test_consumed_then_crash_before_followup_still_delivers(env, conn, cfg, clock, client, prober, data_dir):
     """drain 把行交接(inbox received)后 daemon 崩溃;10 分钟后新进程只靠 drive_pending_rows 仍投递。"""
     from tests.conftest import Env
     env.make_binding(status="active", chat_id=CHAT)
-    ev = message_event(text="hi", channel=CHAT, user=OWNER)
+    ev = message_event(text="<@U0BOT> hi", channel=CHAT, user=OWNER)   # 频道需 @bot
     env.stage("events_api", envelope(ev, event_id="EvC"))
     env.drain()
     mid = "%s:%s" % (CHAT, ev["ts"])
@@ -139,7 +130,6 @@ def test_consumed_then_crash_before_followup_still_delivers(env, conn, cfg, cloc
     assert len(d) == 1 and d[0]["message_id"] == mid
 
 
-@WP2
 def test_binding_pinned_at_receive_not_at_drain(env):
     """事件到达时无绑定 → binding_id NULL;之后 bind 再 drain,仍按 unbound 处理(不查 latest)。"""
     ev = message_event(text="<@U0BOT> hi", channel=CHAT, user=OWNER)
@@ -153,7 +143,6 @@ def test_binding_pinned_at_receive_not_at_drain(env):
     assert env.jobs("inbound_notice")
 
 
-@WP2
 def test_duplicate_delivery_message_then_app_mention_both_orders(env):
     env.make_binding(status="active", chat_id=CHAT)
     for order in ("message_first", "mention_first"):
@@ -162,8 +151,9 @@ def test_duplicate_delivery_message_then_app_mention_both_orders(env):
                           files=[slack_file(id="F" + ts[-3:])])
         a = app_mention_event(text="<@U0BOT> look", channel=CHAT, user=OWNER, ts=ts)
         first, second = (m, a) if order == "message_first" else (a, m)
-        env.stage("events_api", envelope(first, event_id="Ev1" + ts[-3:]))
-        env.stage("events_api", envelope(second, event_id="Ev2" + ts[-3:]))
+        sfx = ts.split(".")[0][-3:]                                  # "001" / "002":每轮独立的 event_id
+        env.stage("events_api", envelope(first, event_id="Ev1" + sfx))
+        env.stage("events_api", envelope(second, event_id="Ev2" + sfx))
         env.drain()
         row = env.inbox_row("%s:%s" % (CHAT, ts))
         assert row is not None
@@ -173,7 +163,6 @@ def test_duplicate_delivery_message_then_app_mention_both_orders(env):
     assert int(dbmod.get_state(env.conn, "inbox_snapshot_upgraded", "0")) == 1
 
 
-@WP2
 def test_interactive_drain_dropped_reasons(env):
     env.make_binding(status="active", chat_id=CHAT)
     env.click(pending_id="nope", nonce="n", card_ts="1.1", action_ts="2.2")          # invalid(pending 不存在)
@@ -184,7 +173,6 @@ def test_interactive_drain_dropped_reasons(env):
     assert env.conn.execute("SELECT COUNT(*) FROM callback_events").fetchone()[0] == 2  # 裸去重也落库
 
 
-@WP2
 def test_approve_click_is_single_transaction_with_decision_and_delivery(env):
     from lib import util
     bid = env.make_binding(status="active", chat_id=CHAT)

@@ -1,282 +1,306 @@
-"""审批回调(plan 4.3):单事务(去重+机械校验+CAS+入队/物化+通知);崩溃缝注入重放。"""
+"""审批回调(contracts §5.4 / §5.5):process_in_tx 在测试自开的 db.tx 内(不依赖 WP1 drain);
+block_actions 矩阵:approve / reject / dup action_ts / non-owner / nonce 不符 / 回填后 card_ts 不符 /
+late / card_ts 非法不回填 / 回填把 card job 置 sent(confirmed-by-click)/ team 不符 skipped /
+approve 带 files → materializing(approved) + approved_pending_files → 物化后 delivered。"""
 import json
 
 import pytest
 
-from tests.conftest import APP_ID, CHAT, MEMBER, OWNER
-from tests.helpers import bot_mention, mget_snapshot
-from lib import lifecycle
+from lib import approval, db as dbmod, jobs, lifecycle, texts, util
+from lib.approval import Approval
+from tests.conftest import CHAT, MEMBER, OWNER, TEAM
+from tests.helpers import block_action, envelope, message_event, slack_file
+from tests.test_inbound import ingest, mention, mid_of, ok_materializer, none_materializer, raising_materializer
+
+CARD_TS = "1700000100.000001"
 
 
-class Crash(Exception):
-    pass
+def member_pending(env, text="run task", files=None, thread_ts=None, chat=CHAT, user=MEMBER):
+    if not env.conn.execute("SELECT 1 FROM bindings WHERE status='active' AND chat_id=?", (chat,)).fetchone():
+        env.make_binding(status="active", chat_id=chat)
+    ev = message_event(text=mention(text), channel=chat, user=user, files=files, thread_ts=thread_ts)
+    assert ingest(env, envelope(ev))[0] == "handed"
+    env.inbound.drive_pending_rows()
+    p = env.pendings()[-1]
+    assert p["state"] == "pending" and p["message_id"] == mid_of(ev)
+    return p, ev
 
 
-def member_pending(env, mid="om_1", msg_type="text"):
-    env.make_binding(status="active")
-    env.arm_mget([mget_snapshot(mid, CHAT, MEMBER, msg_type=msg_type, text="run task",
-                                mentions=[bot_mention(APP_ID)])])
-    env.recv_event(message_id=mid, sender_id=MEMBER, message_type=msg_type)
-    p = env.pendings()[0]
-    assert p["state"] == "pending"
-    return p
-
-
-def cb(p, act="approve", operator=OWNER, event_id="cb_1", nonce=None,
-       message_id="om_card_x", chat_id=CHAT):
-    return {"type": "card.action.trigger", "event_id": event_id,
-            "operator_id": operator,
-            "action_value": json.dumps({"pending_id": p["pending_id"],
-                                        "nonce": nonce or p["nonce"], "act": act}),
-            "message_id": message_id, "chat_id": chat_id, "host": "im_message"}
+def click(env, p, act="approve", user=OWNER, card_ts=CARD_TS, action_ts=None, channel=CHAT,
+          nonce=None, team=TEAM, **kw):
+    payload = block_action(p["pending_id"], nonce or p["nonce"], act=act, user=user, channel=channel,
+                           card_ts=card_ts, action_ts=action_ts, team=team, **kw)
+    with dbmod.tx(env.conn):
+        res = approval.process_in_tx(env.conn, payload)
+    assert not env.conn.in_transaction
+    return res, payload
 
 
 def pending_row(env, pid):
     return env.conn.execute("SELECT * FROM pendings WHERE pending_id=?", (pid,)).fetchone()
 
 
+def cb_count(env):
+    return env.conn.execute("SELECT COUNT(*) FROM callback_events").fetchone()[0]
+
+
+def dec_keys(env):
+    return [j["idempotency_key"] for j in env.jobs("decision_notice")]
+
+
 class TestApproveReject:
     def test_approve_text_single_tx_effects(self, env):
-        p = member_pending(env)
-        r = env.approval.process_event(cb(p))
-        assert r == "applied"
+        p, ev = member_pending(env)
+        res, payload = click(env, p)
+        assert res == ("handed", None)
         pr = pending_row(env, p["pending_id"])
         assert pr["state"] == "approved" and pr["decided_by"] == OWNER
-        assert pr["decided_event_id"] == "cb_1"
-        assert env.inbox_row("om_1")["state"] == "enqueued"
+        assert pr["decided_event_id"] == "act:%s:%s:%s:%s:sb_approve:%s" % (
+            TEAM, CHAT, CARD_TS, OWNER, payload["actions"][0]["action_ts"])
+        assert pr["card_message_id"] == util.message_id_of(CHAT, CARD_TS)   # 点击回填卡片身份
+        assert env.inbox_row(mid_of(ev))["state"] == "enqueued"
         d = env.deliveries()
         assert len(d) == 1
-        payload = json.loads(d[0]["payload_json"])
-        assert payload["sender_is_owner"] is False and payload["approved_by"] == OWNER
+        pl = json.loads(d[0]["payload_json"])
+        assert pl["sender_is_owner"] is False and pl["approved_by"] == OWNER
+        assert pl["sender_user_id"] == MEMBER and pl["text"] == "run task"
         dec = env.jobs("decision_notice")
         assert len(dec) == 1
-        assert dec[0]["idempotency_key"] == f"dec:{p['pending_id']}:approved"
-        assert env.jobs("receipt_reaction") == []  # 审批路径无 👀
-        assert env.conn.execute(
-            "SELECT COUNT(*) FROM callback_events WHERE event_id='cb_1'").fetchone()[0] == 1
+        assert dec[0]["idempotency_key"] == "dec:%s:delivered" % p["pending_id"]
+        assert dec[0]["expected_state"] == "delivered" and dec[0]["ref_pending_id"] == p["pending_id"]
+        assert dec[0]["reply_to"] == ev["ts"] and dec[0]["ref_message_id"] == mid_of(ev)
+        assert dec[0]["body"] == texts.decision_notice_body("delivered")
+        assert env.jobs("receipt_reaction") == []                            # 审批路径无 👀
+        assert cb_count(env) == 1
 
     def test_reject(self, env):
-        p = member_pending(env)
-        r = env.approval.process_event(cb(p, act="reject"))
-        assert r == "applied"
+        p, ev = member_pending(env)
+        assert click(env, p, act="reject")[0] == ("handed", None)
         assert pending_row(env, p["pending_id"])["state"] == "rejected"
-        assert env.inbox_row("om_1")["state"] == "rejected"
-        assert env.deliveries() == []
-        dec = env.jobs("decision_notice")
-        assert dec[0]["idempotency_key"] == f"dec:{p['pending_id']}:rejected"
+        assert env.inbox_row(mid_of(ev))["state"] == "rejected"
+        assert env.deliveries() == [] and dec_keys(env) == ["dec:%s:rejected" % p["pending_id"]]
+
+    def test_threaded_message_decision_reply_to_thread(self, env):
+        p, ev = member_pending(env, thread_ts="1699999990.000001")
+        click(env, p)
+        assert env.jobs("decision_notice")[0]["reply_to"] == "1699999990.000001"
 
 
-class TestMechanicalValidation:
+class TestMatrix:
+    def test_dup_same_action_ts(self, env):
+        p, ev = member_pending(env)
+        assert click(env, p, action_ts="1700000200.000001")[0] == ("handed", None)
+        assert click(env, p, action_ts="1700000200.000001")[0] == ("dropped", "dup")
+        assert len(env.deliveries()) == 1 and len(env.jobs("decision_notice")) == 1 and cb_count(env) == 1
+
+    def test_second_click_different_action_ts_is_late(self, env):
+        p, ev = member_pending(env)
+        assert click(env, p, act="reject")[0] == ("handed", None)
+        assert click(env, p, act="approve")[0] == ("dropped", "late")
+        assert pending_row(env, p["pending_id"])["state"] == "rejected" and env.deliveries() == []
+        assert cb_count(env) == 2
+
     @pytest.mark.parametrize("mutate,desc", [
-        (dict(operator=MEMBER), "member 自批"),
-        (dict(nonce="deadbeef" * 4), "nonce 错"),
-        (dict(act="detonate"), "act 非枚举"),
-        (dict(chat_id="oc_other"), "chat 不符"),
+        (dict(user=MEMBER), "非 owner 自批"),
+        (dict(nonce="deadbeef" * 4), "nonce 不符"),
+        (dict(channel="C_OTHER"), "channel 与 inbox.chat_id 不符"),
+        (dict(card_ts="not-a-ts"), "card_ts 非法"),
+        (dict(card_ts="1.2.3"), "card_ts 非法(多点)"),
     ])
-    def test_invalid_no_state_change(self, env, mutate, desc):
-        p = member_pending(env)
-        r = env.approval.process_event(cb(p, event_id="cb_bad", **mutate))
-        assert r == "invalid", desc
-        assert pending_row(env, p["pending_id"])["state"] == "pending"
+    def test_invalid_no_state_change_no_backfill(self, env, mutate, desc):
+        p, ev = member_pending(env)
+        res, _ = click(env, p, **mutate)
+        assert res == ("dropped", "invalid"), desc
+        pr = pending_row(env, p["pending_id"])
+        assert pr["state"] == "pending" and pr["card_message_id"] is None
         assert env.deliveries() == [] and env.jobs("decision_notice") == []
-        # 无效回调裸去重记录
-        assert env.conn.execute(
-            "SELECT COUNT(*) FROM callback_events WHERE event_id='cb_bad'").fetchone()[0] == 1
+        assert env.jobs("approval_card")[0]["state"] == "pending"          # card job 未被动
+        assert cb_count(env) == 1                                          # 裸去重记录
+        assert env.inbox_row(mid_of(ev))["state"] == "awaiting_approval"
 
     def test_non_ascii_nonce_invalid_not_crash(self, env):
-        p = member_pending(env)
-        r = env.approval.process_event(cb(p, event_id="cb_u", nonce="坏心思 nonce"))
-        assert r == "invalid"
-        assert pending_row(env, p["pending_id"])["state"] == "pending"
+        p, ev = member_pending(env)
+        assert click(env, p, nonce="坏心思 nonce")[0] == ("dropped", "invalid")
 
     def test_unknown_pending_invalid(self, env):
-        p = member_pending(env)
-        fake = dict(p)
-        fake["pending_id"] = "no-such"
-        assert env.approval.process_event(cb(fake, event_id="cb_z")) == "invalid"
+        env.make_binding(status="active")
+        fake = {"pending_id": "no-such", "nonce": "n"}
+        assert click(env, fake)[0] == ("dropped", "invalid") and cb_count(env) == 1
 
-    def test_card_message_id_checked_only_when_backfilled(self, env):
-        p = member_pending(env)
-        env.conn.execute("UPDATE pendings SET card_message_id='om_card_real' WHERE pending_id=?",
-                         (p["pending_id"],))
-        assert env.approval.process_event(cb(p, message_id="om_forged")) == "invalid"
-        assert env.approval.process_event(
-            cb(p, event_id="cb_2", message_id="om_card_real")) == "applied"
+    def test_card_ts_mismatch_after_backfill(self, env):
+        p, ev = member_pending(env)
+        env.conn.execute("UPDATE pendings SET card_message_id=? WHERE pending_id=?",
+                         (util.message_id_of(CHAT, "1700000100.000009"), p["pending_id"]))
+        assert click(env, p, card_ts="1700000100.000001")[0] == ("dropped", "invalid")
+        assert pending_row(env, p["pending_id"])["state"] == "pending"
+        assert click(env, p, card_ts="1700000100.000009")[0] == ("handed", None)
 
-    def test_duplicate_event_noop(self, env):
-        p = member_pending(env)
-        assert env.approval.process_event(cb(p)) == "applied"
-        assert env.approval.process_event(cb(p)) == "dup"
-        assert len(env.deliveries()) == 1
-        assert len(env.jobs("decision_notice")) == 1
+    def test_team_mismatch_skipped_with_bare_record(self, env):
+        p, ev = member_pending(env)
+        assert click(env, p, team="T_OTHER")[0] == ("dropped", "skipped")
+        assert pending_row(env, p["pending_id"])["state"] == "pending" and cb_count(env) == 1
 
-    def test_late_click_on_decided_pending(self, env):
-        p = member_pending(env)
-        assert env.approval.process_event(cb(p, act="reject", event_id="cb_1")) == "applied"
-        r = env.approval.process_event(cb(p, act="approve", event_id="cb_2"))
-        assert r == "late"
-        assert pending_row(env, p["pending_id"])["state"] == "rejected"
-        assert env.deliveries() == []
+    def test_malformed_value_skipped_with_bare_record(self, env):
+        p, ev = member_pending(env)
+        assert click(env, p, value="garbage")[0] == ("dropped", "skipped")
+        assert cb_count(env) == 1
+        with dbmod.tx(env.conn):
+            assert approval.process_in_tx(env.conn, {"type": "block_actions"}) == ("dropped", "skipped")
+        assert cb_count(env) == 1                                          # 无 key 可记
+
+    def test_allowlist_gate(self, env):
+        p, ev = member_pending(env)
+        env.cfg["chat_allowlist"] = ["C_OTHER"]
+        assert click(env, p)[0] == ("dropped", "invalid")
+        assert pending_row(env, p["pending_id"])["state"] == "pending" and env.deliveries() == []
+        env.cfg["chat_allowlist"] = [CHAT]
+        assert click(env, p)[0] == ("handed", None)
 
     def test_binding_terminated_then_click_is_late(self, env):
-        p = member_pending(env)
-        bid = env.conn.execute("SELECT binding_id FROM pendings WHERE pending_id=?",
-                               (p["pending_id"],)).fetchone()[0]
-        lifecycle.terminate_binding(env.conn, bid, "user_unbind", env.clock)
-        r = env.approval.process_event(cb(p))
-        assert r == "late"  # 终止级联已 expire pending → CAS 拒绝
+        p, ev = member_pending(env)
+        lifecycle.terminate_binding(env.conn, p["binding_id"], "user_unbind", env.clock)
+        assert click(env, p)[0] == ("dropped", "late")
         assert env.deliveries() == []
 
+    def test_binding_closed_without_cascade_approve_is_undeliverable(self, env):
+        """崩溃缝:绑定已 closed 但 pending 仍 pending → approve 通过 CAS,但不可投递 → closed_undelivered。"""
+        p, ev = member_pending(env)
+        env.conn.execute("UPDATE bindings SET status='closed', close_reason='cc_gone' WHERE binding_id=?",
+                         (p["binding_id"],))
+        assert click(env, p)[0] == ("handed", None)
+        assert pending_row(env, p["pending_id"])["state"] == "approved"
+        assert env.inbox_row(mid_of(ev))["state"] == "undeliverable" and env.deliveries() == []
+        assert dec_keys(env) == ["dec:%s:closed_undelivered" % p["pending_id"]]
 
-class TestCrashSeams:
-    def test_crash_after_cas_rolls_back_then_replay_succeeds(self, env):
-        p = member_pending(env)
 
-        def seam(name):
-            if name == "after_cas":
-                raise Crash()
+class TestBackfillCardJob:
+    @pytest.mark.parametrize("state", ["unknown", "pending", "sending"])
+    def test_click_confirms_card_job(self, env, state):
+        p, ev = member_pending(env)
+        key = jobs.key_card(p["pending_id"])
+        env.conn.execute("UPDATE outbound_jobs SET state=?, attempt_count=1 WHERE idempotency_key=?", (state, key))
+        assert click(env, p)[0] == ("handed", None)
+        j = env.conn.execute("SELECT * FROM outbound_jobs WHERE idempotency_key=?", (key,)).fetchone()
+        assert j["state"] == "sent" and j["error"] == "confirmed-by-click"
+        assert j["sent_message_id"] == util.message_id_of(CHAT, CARD_TS)
+        assert pending_row(env, p["pending_id"])["card_message_id"] == util.message_id_of(CHAT, CARD_TS)
 
-        with pytest.raises(Crash):
-            env.approval.process_event(cb(p), seam=seam)
-        # 整体回滚:pending 仍 pending,callback 未记,零副作用
-        assert pending_row(env, p["pending_id"])["state"] == "pending"
-        assert env.conn.execute("SELECT COUNT(*) FROM callback_events").fetchone()[0] == 0
+    def test_already_sent_card_job_untouched(self, env):
+        p, ev = member_pending(env)
+        key = jobs.key_card(p["pending_id"])
+        env.conn.execute("UPDATE outbound_jobs SET state='sent', sent_message_id='C0CHAT:9.9' "
+                         "WHERE idempotency_key=?", (key,))
+        env.conn.execute("UPDATE pendings SET card_message_id='C0CHAT:9.9' WHERE pending_id=?", (p["pending_id"],))
+        assert click(env, p, card_ts="9.9")[0] == ("handed", None)
+        j = env.conn.execute("SELECT * FROM outbound_jobs WHERE idempotency_key=?", (key,)).fetchone()
+        assert j["state"] == "sent" and j["error"] is None and j["sent_message_id"] == "C0CHAT:9.9"
+
+    def test_invalid_card_ts_leaves_job_and_pending_alone(self, env):
+        p, ev = member_pending(env)
+        key = jobs.key_card(p["pending_id"])
+        env.conn.execute("UPDATE outbound_jobs SET state='unknown' WHERE idempotency_key=?", (key,))
+        assert click(env, p, card_ts="bogus")[0] == ("dropped", "invalid")
+        j = env.conn.execute("SELECT state FROM outbound_jobs WHERE idempotency_key=?", (key,)).fetchone()
+        assert j["state"] == "unknown" and pending_row(env, p["pending_id"])["card_message_id"] is None
+
+    def test_late_click_still_backfills_card_identity(self, env):
+        """迟到点击:CAS 失败 → late,但卡片身份已由点击证实(回填先于 CAS)。"""
+        p, ev = member_pending(env)
+        env.conn.execute("UPDATE pendings SET state='expired' WHERE pending_id=?", (p["pending_id"],))
+        assert click(env, p)[0] == ("dropped", "late")
+        assert pending_row(env, p["pending_id"])["card_message_id"] == util.message_id_of(CHAT, CARD_TS)
+
+
+class TestApproveWithFiles:
+    def _approve_files(self, env):
+        p, ev = member_pending(env, files=[slack_file(id="F1", name="a.pdf", size=3)])
+        res, _ = click(env, p)
+        assert res[0] == "handed" and res[1] is not None
+        row = env.inbox_row(mid_of(ev))
+        assert row["state"] == "materializing" and row["materialize_reason"] == "approved"
+        assert row["materialize_started_at"] is None and row["materialize_attempts"] == 0
+        assert res[1]["message_id"] == row["message_id"] and res[1]["state"] == "materializing"
+        assert dec_keys(env) == ["dec:%s:approved_pending_files" % p["pending_id"]]
+        assert env.jobs("decision_notice")[0]["expected_state"] == "approved_pending_files"
         assert env.deliveries() == []
-        # 重放同一 event → 完整生效一次
-        assert env.approval.process_event(cb(p)) == "applied"
-        assert len(env.deliveries()) == 1
+        return p, ev, res[1]
 
-    def test_crash_before_commit_rolls_back(self, env):
-        p = member_pending(env)
-
-        def seam(name):
-            if name == "before_commit":
-                raise Crash()
-
-        with pytest.raises(Crash):
-            env.approval.process_event(cb(p), seam=seam)
-        assert pending_row(env, p["pending_id"])["state"] == "pending"
-        assert env.approval.process_event(cb(p)) == "applied"
-
-    def test_replay_after_commit_is_dup(self, env):
-        p = member_pending(env)
-        assert env.approval.process_event(cb(p)) == "applied"
-        # "崩溃在 commit 后、下游动作前" 的重放等价于 dup
-        assert env.approval.process_event(cb(p)) == "dup"
-        assert len(env.deliveries()) == 1
-
-
-class TestMediaApprove:
-    def test_media_approve_materializes_then_delivers(self, env):
-        p = member_pending(env, mid="om_img", msg_type="image")
-        snap = mget_snapshot("om_img", CHAT, MEMBER, msg_type="image",
-                             mentions=[bot_mention(APP_ID)])
-
-        def dl(args, cwd):
-            import pathlib
-            d = pathlib.Path(cwd) / "lark-im-resources"
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "img.png").write_bytes(b"IMG")
-            from tests.helpers import ok_envelope
-            return ok_envelope({"messages": [snap]})
-
-        env.runner.on(lambda a: "--download-resources" in a, dl)
-        r = env.approval.process_event(cb(p))
-        assert r == "applied"
-        row = env.inbox_row("om_img")
-        assert row["state"] == "enqueued"
+    def test_materialize_then_delivered(self, env):
+        p, ev, row = self._approve_files(env)
+        env.inbound.materializer = ok_materializer()
+        assert env.approval.run_followup(row) is True
+        assert env.inbox_row(mid_of(ev))["state"] == "enqueued"
         d = env.deliveries()
         assert len(d) == 1
-        payload = json.loads(d[0]["payload_json"])
-        assert payload["media_paths"] and payload["approved_by"] == OWNER
-        # v1.4.2:**成员**(非 owner)的非文本消息经批准后同样带 hint 字段 —— 若把新字段
-        # 包进 `sender_is_owner` 判断,成员发的带说明图片会静默丢掉句柄,而全套仍绿。
-        assert "fetch_hint" in payload and "media_keys" in payload
-        dec = env.jobs("decision_notice")
-        assert [j["idempotency_key"] for j in dec] == [f"dec:{p['pending_id']}:approved"]
+        pl = json.loads(d[0]["payload_json"])
+        assert pl["approved_by"] == OWNER and pl["media_paths"] and pl["files"][0]["local_path"]
+        assert dec_keys(env) == ["dec:%s:approved_pending_files" % p["pending_id"],
+                                 "dec:%s:delivered" % p["pending_id"]]
+        assert env.jobs("receipt_reaction") == []
 
-    def test_media_approve_download_definitive_failure(self, env):
-        p = member_pending(env, mid="om_img", msg_type="image")
-        snap = mget_snapshot("om_img", CHAT, MEMBER, msg_type="image",
-                             mentions=[bot_mention(APP_ID)])
+    def test_budget_driver_picks_it_up(self, env):
+        p, ev, row = self._approve_files(env)
+        env.inbound.materializer = ok_materializer()
+        env.inbound.drive_pending_rows()
+        assert env.inbox_row(mid_of(ev))["state"] == "enqueued"
 
-        def dl(args, cwd):
-            import pathlib
-            d = pathlib.Path(cwd) / "lark-im-resources"
-            d.mkdir(parents=True, exist_ok=True)
-            import os
-            os.symlink("/etc/hosts", d / "evil")  # 确定性失败
-            from tests.helpers import ok_envelope
-            return ok_envelope({"messages": [snap]})
+    def test_media_error_attachment_failed(self, env):
+        p, ev, row = self._approve_files(env)
+        env.inbound.materializer = raising_materializer
+        env.approval.run_followup(row)
+        assert env.inbox_row(mid_of(ev))["state"] == "failed" and env.deliveries() == []
+        assert dec_keys(env)[-1] == "dec:%s:attachment_failed" % p["pending_id"]
 
-        env.runner.on(lambda a: "--download-resources" in a, dl)
-        assert env.approval.process_event(cb(p)) == "applied"
-        assert env.inbox_row("om_img")["state"] == "failed"
-        dec = env.jobs("decision_notice")
-        assert [j["idempotency_key"] for j in dec] == [f"dec:{p['pending_id']}:failed"]
-        assert env.deliveries() == []
+    def test_transient_then_budget_exhausted_attachment_failed(self, env):
+        p, ev, row = self._approve_files(env)
+        calls = []
+        env.inbound.materializer = none_materializer(calls)
+        env.approval.run_followup(row)
+        assert env.inbox_row(mid_of(ev))["state"] == "materializing"
+        while env.inbox_row(mid_of(ev))["state"] == "materializing":
+            env.clock.tick(env.inbox_row(mid_of(ev))["materialize_next_at"] - env.clock.wall_ms())
+            env.inbound.drive_pending_rows()
+        assert env.inbox_row(mid_of(ev))["state"] == "failed"
+        assert dec_keys(env)[-1] == "dec:%s:attachment_failed" % p["pending_id"]
 
-    def test_media_approve_transient_failure_stays_materializing(self, env):
-        p = member_pending(env, mid="om_img", msg_type="image")
-        from tests.helpers import err_envelope
-        env.runner.on(lambda a: "--download-resources" in a, lambda a, c: err_envelope(500))
-        assert env.approval.process_event(cb(p)) == "applied"
-        assert env.inbox_row("om_img")["state"] == "approved_materializing"
-        assert env.deliveries() == []
+    def test_unbind_while_materializing_closed_undelivered(self, env):
+        p, ev, row = self._approve_files(env)
+        env.inbound.materializer = none_materializer([])
+        env.approval.run_followup(row)
+        lifecycle.terminate_binding(env.conn, p["binding_id"], "user_unbind", env.clock)
+        assert env.inbox_row(mid_of(ev))["state"] == "undeliverable"
+        assert dec_keys(env)[-1] == "dec:%s:closed_undelivered" % p["pending_id"]
+        st = {j["idempotency_key"]: j["state"] for j in env.jobs("decision_notice")}
+        assert st["dec:%s:approved_pending_files" % p["pending_id"]] == "cancelled"
+        env.inbound.drive_pending_rows()                                   # 不再物化、不再改状态
+        assert env.inbox_row(mid_of(ev))["state"] == "undeliverable"
 
-
-class TestFailClosedValidation:
-    """修复项6:机械校验在 BEGIN IMMEDIATE 事务内;缺字段一律 REJECT。"""
-
-    def test_missing_chat_id_invalid(self, env):
-        p = member_pending(env)
-        ev = cb(p, event_id="cb_nochat")
-        del ev["chat_id"]
-        assert env.approval.process_event(ev) == "invalid"
-        assert pending_row(env, p["pending_id"])["state"] == "pending"
-
-    def test_backfilled_card_missing_message_id_invalid(self, env):
-        p = member_pending(env)
-        env.conn.execute("UPDATE pendings SET card_message_id='om_card_real' "
-                         "WHERE pending_id=?", (p["pending_id"],))
-        ev = cb(p, event_id="cb_nomid")
-        del ev["message_id"]
-        assert env.approval.process_event(ev) == "invalid"
-        assert pending_row(env, p["pending_id"])["state"] == "pending"
-
-    def test_validation_reads_in_tx_state(self, env):
-        """事务内校验:seam 在事务内回填 card_message_id → 携带旧 message_id 的回调必须被拒。"""
-        p = member_pending(env)
-
-        def seam(name):
-            if name == "in_tx_before_validate":
-                env.conn.execute(
-                    "UPDATE pendings SET card_message_id='om_card_fresh' "
-                    "WHERE pending_id=?", (p["pending_id"],))
-
-        r = env.approval.process_event(cb(p, message_id="om_stale"), seam=seam)
-        assert r == "invalid"
-        assert pending_row(env, p["pending_id"])["state"] == "pending"
-        # 携带事务内可见的正确 card id → 通过
-        assert env.approval.process_event(
-            cb(p, event_id="cb_2", message_id="om_card_fresh"), seam=seam) == "applied"
+    def test_binding_closed_before_download_closed_undelivered(self, env):
+        p, ev, row = self._approve_files(env)
+        env.conn.execute("UPDATE bindings SET status='closed', close_reason='cc_gone' WHERE binding_id=?",
+                         (p["binding_id"],))
+        calls = []
+        env.inbound.materializer = ok_materializer(calls)
+        env.inbound.drive_pending_rows()
+        assert env.inbox_row(mid_of(ev))["state"] == "undeliverable" and calls == []
+        assert dec_keys(env)[-1] == "dec:%s:closed_undelivered" % p["pending_id"]
 
 
-class TestAllowlistGate:
-    """r3-1①:遗留 pending 来自列外群 → 回调按 invalid(裸去重,零 CAS 零 delivery)。"""
+class TestClassShape:
+    def test_module_function_without_registered_inbound_fails_closed(self, env, monkeypatch):
+        p, ev = member_pending(env)
+        monkeypatch.setitem(approval._DEFAULTS, "inbound", None)
+        payload = block_action(p["pending_id"], p["nonce"], user=OWNER, channel=CHAT, card_ts=CARD_TS)
+        with pytest.raises(RuntimeError, match="no Inbound registered"):
+            with dbmod.tx(env.conn):
+                approval.process_in_tx(env.conn, payload)
+        assert pending_row(env, p["pending_id"])["state"] == "pending"      # 随事务回滚,零副作用
+        assert cb_count(env) == 0
 
-    def test_out_of_list_pending_callback_invalid(self, env):
-        p = member_pending(env)  # 建于无 allowlist 时
-        env.cfg["chat_allowlist"] = ["oc_other"]  # 之后收紧 allowlist
-        r = env.approval.process_event(cb(p, event_id="cb_al"))
-        assert r == "invalid"
-        assert pending_row(env, p["pending_id"])["state"] == "pending"  # 零 CAS
-        assert env.deliveries() == []  # 零 delivery
-        assert env.conn.execute(
-            "SELECT COUNT(*) FROM callback_events WHERE event_id='cb_al'").fetchone()[0] == 1
-
-    def test_in_list_pending_callback_applies(self, env):
-        p = member_pending(env)
-        from tests.conftest import CHAT as _CHAT
-        env.cfg["chat_allowlist"] = [_CHAT]
-        assert env.approval.process_event(cb(p, event_id="cb_al2")) == "applied"
+    def test_frozen_constructor_and_delegation(self, env):
+        a = Approval(env.conn, env.cfg, env.clock, env.inbound)
+        p, ev = member_pending(env)
+        payload = block_action(p["pending_id"], p["nonce"], user=OWNER, channel=CHAT, card_ts=CARD_TS)
+        with dbmod.tx(env.conn):
+            assert a.process_in_tx(env.conn, payload) == ("handed", None)
+        assert a.run_followup(None) is False

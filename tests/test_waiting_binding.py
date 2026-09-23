@@ -1,9 +1,10 @@
-"""starting 期语义(plan 4.2.5 定案)+ 激活重过分流门(r6-B)+ r7-③ 单一路径竞态断言。"""
+"""starting 期语义 + 激活重过分流门 + 单一路径竞态断言(Slack 事件形状;ingest 走真实 db.tx)。"""
 import json
 
-from tests.conftest import APP_ID, CHAT, MEMBER, OWNER
-from tests.helpers import bot_mention, mget_snapshot
 from lib import lifecycle
+from tests.conftest import CHAT, MEMBER, OWNER
+from tests.helpers import envelope, message_event, slack_file
+from tests.test_inbound import ingest, mention, mid_of, ok_materializer
 
 
 def make_starting(env, **kw):
@@ -15,131 +16,105 @@ def activate(env, bid):
     assert lifecycle.activate_if_ready(env.conn, bid, env.clock) == "activated"
 
 
+def recv(env, ev):
+    assert ingest(env, envelope(ev))[0] == "handed"
+    env.inbound.drive_pending_rows()
+    return mid_of(ev)
+
+
 class TestStartingSemantics:
     def test_messages_wait_no_jobs_no_deliveries(self, env):
         make_starting(env)
-        env.arm_mget([mget_snapshot("om_1", CHAT, OWNER, mentions=[bot_mention(APP_ID)])])
-        env.recv_event()
-        assert env.inbox_row("om_1")["state"] == "waiting_binding"
-        assert env.deliveries() == []
-        # 不建任何外发 job(receipt/card/notice 都不建)
-        assert env.jobs() == []
+        mid = recv(env, message_event(text=mention("hi"), user=OWNER))
+        assert env.inbox_row(mid)["state"] == "waiting_binding"
+        assert env.deliveries() == [] and env.jobs() == []
+        env.inbound.drive_pending_rows()                        # 仍 starting → 继续等
+        assert env.inbox_row(mid)["state"] == "waiting_binding"
 
 
 class TestActivationRegate:
     def test_owner_text_delivered_after_activation(self, env):
         bid = make_starting(env)
-        env.arm_mget([mget_snapshot("om_1", CHAT, OWNER, text="早排队的指令",
-                                    mentions=[bot_mention(APP_ID)])])
-        env.recv_event()
+        mid = recv(env, message_event(text=mention("早排队的指令"), user=OWNER))
         activate(env, bid)
-        n = env.inbound.drive_waiting_rows()
-        assert n == 1
-        row = env.inbox_row("om_1")
-        assert row["state"] == "enqueued"
+        assert env.inbound.drive_waiting_rows() == 1
+        assert env.inbox_row(mid)["state"] == "enqueued"
         d = env.deliveries(bid)
-        assert len(d) == 1
-        assert json.loads(d[0]["payload_json"])["text"] == "早排队的指令"
+        assert len(d) == 1 and json.loads(d[0]["payload_json"])["text"] == "早排队的指令"
 
     def test_member_must_go_through_approval(self, env):
-        """r6-B:激活重过分流门,member 绝不绕审批。"""
         bid = make_starting(env)
-        env.arm_mget([mget_snapshot("om_1", CHAT, MEMBER, text="member 消息",
-                                    mentions=[bot_mention(APP_ID)])])
-        env.recv_event(sender_id=MEMBER)
+        mid = recv(env, message_event(text=mention("member 消息"), user=MEMBER))
         activate(env, bid)
-        env.inbound.drive_waiting_rows()
-        row = env.inbox_row("om_1")
-        assert row["state"] == "awaiting_approval"
-        assert len(env.jobs("approval_card")) == 1
-        assert env.deliveries(bid) == []  # 未批准不投
+        env.inbound.drive_pending_rows()
+        assert env.inbox_row(mid)["state"] == "awaiting_approval"
+        assert len(env.jobs("approval_card")) == 1 and env.deliveries(bid) == []
 
-    def test_owner_media_materializes_on_activation(self, env, tmp_path):
+    def test_owner_files_materialize_on_activation(self, env):
         bid = make_starting(env)
-        snap = mget_snapshot("om_1", CHAT, OWNER, msg_type="image",
-                             mentions=[bot_mention(APP_ID)])
-        env.arm_mget([snap])
-
-        def dl(args, cwd):
-            import pathlib
-            d = pathlib.Path(cwd) / "lark-im-resources"
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "pic.png").write_bytes(b"PNGDATA")
-            from tests.helpers import ok_envelope
-            return ok_envelope({"messages": [snap]})
-
-        env.runner.on(lambda a: a[:2] == ["im", "+messages-mget"] and "--download-resources" in a, dl)
-        env.recv_event(message_type="image")
+        calls = []
+        env.inbound.materializer = ok_materializer(calls)
+        mid = recv(env, message_event(text=mention("pic"), user=OWNER, files=[slack_file(name="pic.png")]))
+        assert calls == []                                       # starting 期不下载
         activate(env, bid)
-        env.inbound.drive_waiting_rows()
-        d = env.deliveries(bid)
-        assert len(d) == 1
-        payload = json.loads(d[0]["payload_json"])
-        paths = payload["media_paths"]
-        assert len(paths) == 1 and paths[0].endswith("pic.png")
-        import os
-        assert os.path.isabs(paths[0]) and os.path.exists(paths[0])
-        # v1.4.2:非文本一律带 hint 字段(**真投递路径**上钉住"所有非文本",
-        # 否则把闸门改成 `msg_type == "post"` 全套仍绿)。image 已下好 → keys 空、
-        # 但 hint 在,且措辞必须先指向 media_paths(不能谎称桥不下载)。
-        assert payload["media_keys"] == []
-        assert "media_paths" in payload["fetch_hint"]
+        env.inbound.drive_pending_rows()
+        row = env.inbox_row(mid)
+        assert row["state"] == "enqueued" and calls == [mid]
+        p = json.loads(env.deliveries(bid)[0]["payload_json"])
+        assert len(p["media_paths"]) == 1 and p["media_paths"][0].endswith("pic.png")
+        assert p["files"][0]["local_path"] == p["media_paths"][0]
+
+    def test_unlisted_member_files_still_gated_after_activation(self, env):
+        bid = make_starting(env)
+        calls = []
+        env.inbound.materializer = ok_materializer(calls)
+        mid = recv(env, message_event(text=mention("pic"), user=MEMBER, files=[slack_file()]))
+        activate(env, bid)
+        env.inbound.drive_pending_rows()
+        assert env.inbox_row(mid)["state"] == "awaiting_approval" and calls == []
+        assert env.deliveries() == [] and len(env.pendings()) == 1
 
 
 class TestExactlyOnePath:
-    """r7-③:激活与终止对同一消息只产生一条路径,绝不并存。"""
-
-    def _waiting_msg(self, env, bid):
-        env.arm_mget([mget_snapshot("om_1", CHAT, OWNER, mentions=[bot_mention(APP_ID)])])
-        env.recv_event()
-        assert env.inbox_row("om_1")["state"] == "waiting_binding"
+    def _waiting_msg(self, env):
+        mid = recv(env, message_event(text=mention("w"), user=OWNER))
+        assert env.inbox_row(mid)["state"] == "waiting_binding"
+        return mid
 
     def test_activate_then_drive_delivery_only(self, env):
         bid = make_starting(env)
-        self._waiting_msg(env, bid)
+        self._waiting_msg(env)
         activate(env, bid)
-        env.inbound.drive_waiting_rows()
-        env.inbound.drive_waiting_rows()  # 幂等重驱
-        assert len(env.deliveries(bid)) == 1
-        assert env.jobs("inbound_notice") == []
+        env.inbound.drive_pending_rows()
+        env.inbound.drive_pending_rows()
+        assert len(env.deliveries(bid)) == 1 and env.jobs("inbound_notice") == []
 
     def test_terminate_then_drive_notice_only(self, env):
         bid = make_starting(env)
-        self._waiting_msg(env, bid)
+        mid = self._waiting_msg(env)
         lifecycle.terminate_binding(env.conn, bid, "session_end", env.clock)
-        env.inbound.drive_waiting_rows()  # 终止事务已映射;重驱=幂等
-        row = env.inbox_row("om_1")
-        assert row["state"] == "session_closed"
-        assert env.deliveries(bid) == []
-        keys = [j["idempotency_key"] for j in env.jobs("inbound_notice")]
-        assert keys == ["notice:om_1:session_closed"]
+        env.inbound.drive_pending_rows()
+        assert env.inbox_row(mid)["state"] == "session_closed" and env.deliveries(bid) == []
+        assert [j["idempotency_key"] for j in env.jobs("inbound_notice")] == ["notice:%s:session_closed" % mid]
 
     def test_activate_then_terminate_before_drive_notice_only(self, env):
-        """激活后、驱动前终止:重驱看到的是终态绑定 → 只出 notice,不出 delivery。"""
         bid = make_starting(env)
-        self._waiting_msg(env, bid)
+        mid = self._waiting_msg(env)
         activate(env, bid)
         lifecycle.terminate_binding(env.conn, bid, "user_unbind", env.clock)
-        env.inbound.drive_waiting_rows()
-        assert env.deliveries(bid) == []
-        assert env.inbox_row("om_1")["state"] == "unbound"
-        keys = [j["idempotency_key"] for j in env.jobs("inbound_notice")]
-        assert keys == ["notice:om_1:unbound"]
+        env.inbound.drive_pending_rows()
+        assert env.deliveries(bid) == [] and env.inbox_row(mid)["state"] == "unbound"
+        assert [j["idempotency_key"] for j in env.jobs("inbound_notice")] == ["notice:%s:unbound" % mid]
 
     def test_recovery_generic_branch_never_intercepts_waiting(self, env):
-        """r7-②:waiting 专用分支先于通用 undeliverable/dropped 分支。
-        构造"终止级联漏掉的 waiting 行"(崩溃缝模拟),由恢复工人收口。"""
+        """终止级联漏掉的 waiting 行(崩溃缝)→ 恢复工人按 4.2.4 映射,不是 undeliverable。"""
         bid = env.make_binding(status="closed", close_reason="cc_gone")
-        import json as _json
-        from tests.helpers import mget_snapshot as _snap, bot_mention as _bm
+        ev = message_event(text=mention("w"), user=OWNER)
         env.conn.execute(
-            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts,snapshot_json) "
-            "VALUES('ev_1','om_1',?,?,'waiting_binding',?,?)",
-            (CHAT, bid, env.clock.wall_ms(),
-             _json.dumps(_snap("om_1", CHAT, OWNER, mentions=[_bm(APP_ID)]))))
+            "INSERT INTO inbox(event_id,message_id,chat_id,binding_id,state,ts,snapshot_json,sender_user_id) "
+            "VALUES('ev_1',?,?,?,'waiting_binding',?,?,?)",
+            (mid_of(ev), CHAT, bid, env.clock.wall_ms(), json.dumps(ev), OWNER))
         env.recovery.slow_tick()
-        row = env.inbox_row("om_1")
-        assert row["state"] == "session_closed"  # 专用分支按 4.2.4 映射,不是 undeliverable
-        keys = [j["idempotency_key"] for j in env.jobs("inbound_notice")]
-        assert keys == ["notice:om_1:session_closed"]
+        assert env.inbox_row(mid_of(ev))["state"] == "session_closed"
+        assert [j["idempotency_key"] for j in env.jobs("inbound_notice")] == ["notice:%s:session_closed" % mid_of(ev)]
         assert env.deliveries(bid) == []

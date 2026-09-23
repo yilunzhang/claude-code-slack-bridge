@@ -17,11 +17,6 @@ from tests.helpers import (FakeSlackClient, app_mention_event, block_action, env
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# WP1 的 drain_staging / ConsumerManager 已落地;下面两条的断言还要 WP2 的 lib/inbound.ingest_in_tx
-# (真实 handed/dropped 语义 + monkeypatch 目标属性),WP2 合入即转绿 → WP5 摘标记。
-WP1 = pytest.mark.xfail(strict=True, reason="WP1 done; needs WP2 inbound.ingest_in_tx")
-WP2 = pytest.mark.xfail(strict=True, reason="WP2 入站/审批/媒体/恢复/生命周期 未落地")
-WP3 = pytest.mark.xfail(strict=True, reason="WP3 出站状态机 未落地")
 
 
 # ======================================================================
@@ -318,7 +313,6 @@ def test_env_click_stages_interactive(env):
 # ======================================================================
 # WP1:daemon_core.drain_staging / ConsumerManager
 # ======================================================================
-@WP1
 def test_drain_staging_exists_and_marks_consumed_only_on_handed_or_dropped(env):
     from lib import daemon_core
     assert callable(getattr(daemon_core.DaemonCore, "drain_staging"))
@@ -332,7 +326,6 @@ def test_drain_staging_exists_and_marks_consumed_only_on_handed_or_dropped(env):
     assert res["handed"] == 1 and res["dropped"] == 1
 
 
-@WP1
 def test_drain_exception_rolls_back_keeps_staged_and_backs_off(env, monkeypatch):
     from lib import inbound
     env.make_binding(status="active", chat_id=CHAT)
@@ -373,7 +366,6 @@ def test_consumer_script_exists():
 # ======================================================================
 # WP2:inbound / approval / media / lifecycle / recovery
 # ======================================================================
-@WP2
 def test_ingest_in_tx_exists_never_opens_transaction_and_returns_mapping(env):
     from lib import inbound
     env.make_binding(status="active", chat_id=CHAT)
@@ -389,7 +381,6 @@ def test_ingest_in_tx_exists_never_opens_transaction_and_returns_mapping(env):
     assert res[0] == "dropped" and isinstance(res[1], str)
 
 
-@WP2
 def test_process_in_tx_return_mapping(env):
     from lib import approval
     with dbmod.tx(env.conn):
@@ -404,7 +395,6 @@ def test_process_in_tx_return_mapping(env):
     assert res == ("dropped", "dup")
 
 
-@WP2
 def test_media_materialize_signature_returns_paths_and_skipped(env):
     from lib import media
     sig = inspect.signature(media.materialize)
@@ -413,7 +403,6 @@ def test_media_materialize_signature_returns_paths_and_skipped(env):
     assert out == ([], [])
 
 
-@WP2
 def test_terminate_in_tx_closed_undelivered(env):
     from lib import lifecycle
     bid = env.make_binding(status="active", chat_id=CHAT)
@@ -431,7 +420,6 @@ def test_terminate_in_tx_closed_undelivered(env):
     assert "dec:p1:closed_undelivered" in keys
 
 
-@WP2
 def test_expire_pendings_single_scope(env):
     bid = env.make_binding(status="active", chat_id=CHAT)
     now = env.clock.wall_ms()
@@ -455,13 +443,11 @@ def test_expire_pendings_single_scope(env):
     assert any(j["idempotency_key"] == "dec:p0:expired" for j in env.jobs("decision_notice"))
 
 
-@WP2
 def test_recovery_never_revives_terminal_jobs():
     from lib.recovery import Recovery
     assert not hasattr(Recovery, "_rearm_failed_cards")
 
 
-@WP2
 def test_download_worker_exists():
     assert (ROOT / "bin" / "download_worker.py").exists()
 
