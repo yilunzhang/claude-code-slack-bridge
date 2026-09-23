@@ -1,5 +1,6 @@
 """Stop hook(plan 4.7):fail-closed 总则、bind-turn 双 Stop 抑制链闩矩阵、
-tombstone/prefix 纵深、正常入队(chunk 单事务)、异常降级。"""
+tombstone/prefix 纵深、正常入队(chunk 单事务)、异常降级。握手/闩/tombstone 逻辑自 feishu-bridge
+原样移植,只换 marker 前缀(constants.MARKER_PREFIX = [slack-bridge-bind:)与数据目录 env 名。"""
 import pytest
 
 from tests.conftest import CHAT, CC_PID, CC_START
@@ -140,7 +141,7 @@ class TestTombstoneAndPrefix:
     def test_prefix_depth_defense(self, hook_env):
         env = hook_env
         env.make_binding(status="active", session_id="sess-1")
-        r = stop(env, msg="member 诱导:[feishu-bridge-bind:ffffffffffffffffffffffffffffffff]")
+        r = stop(env, msg="member 诱导:[slack-bridge-bind:ffffffffffffffffffffffffffffffff]")
         assert r["suppressed"] and r["reason"] == "marker-prefix"
         assert turn_jobs(env) == []
 
@@ -235,10 +236,10 @@ class TestEntryFailClosed:
             conn=BoomConn(), prober=env.prober, clock=env.clock, start_pid=HOOK_PID)
         assert r["suppressed"]
         err = capsys.readouterr().err
-        assert "feishu-bridge" in err and "fail-closed" in err
+        assert "slack-bridge" in err and "fail-closed" in err
 
     def test_no_db_file_noop(self, hook_env, monkeypatch, tmp_path):
-        monkeypatch.setenv("FEISHU_BRIDGE_DATA_DIR", str(tmp_path / "empty-nowhere"))
+        monkeypatch.setenv("SLACK_BRIDGE_DATA_DIR", str(tmp_path / "empty-nowhere"))
         r = hooklib.stop_hook_entry(
             {"session_id": "s", "last_assistant_message": "x"},
             prober=hook_env.prober, clock=hook_env.clock, start_pid=HOOK_PID)
