@@ -312,6 +312,31 @@ def test_header_valueerror_on_connect_never_leaks_token(conn, tokens, tmp_path):
     assert_no_secret(run)
 
 
+def test_sdk_logger_output_is_redacted_at_source(conn, tokens, tmp_path):
+    """R2-M5:slack_sdk **自身** logger 不经 consumer 的 status();没有 handler 时 logging.lastResort 把
+    WARNING+ 裸打到 stderr —— 真 sdk 的 ping/connect 失败日志会把 `Bearer <xapp token>` 带出来。
+    consumer 必须给 `slack_sdk` logger 挂遮蔽 handler:输出经 status()(显式 token + 形态兜底)单行
+    `[sdk] <LEVEL> <logger>: <msg>`,不再 propagate;DEBUG 不输出。"""
+    run = ConsumerRun(tmp_path, [
+        HELLO,
+        {"__control": "sdk_log", "level": "warning",
+         "text": "Failed to send a ping: Invalid header value b'Bearer {app_token}\\n'"},
+        {"__control": "sdk_log", "level": "error", "logger": "slack_sdk.web.base_client",
+         "text": "retry gave up: xoxb-1-other-shaped-token-zz"},
+        {"__control": "sdk_log", "level": "debug", "text": "noisy debug {app_token}"},
+        DONE])
+    assert run.wait_marker()
+    run.close_stdin()
+    assert run.finish() == constants.CONSUMER_RC_OK
+    sdk_lines = [l for l in run.stderr_lines() if l.startswith("[sdk] ")]
+    assert [l.split()[1:3] for l in sdk_lines] == [["WARNING", "slack_sdk.socket_mode.builtin.client:"],
+                                                    ["ERROR", "slack_sdk.web.base_client:"]]
+    assert "Invalid header value" in sdk_lines[0] and "***" in sdk_lines[0]
+    assert sdk_lines[1].endswith("retry gave up: ***")
+    assert "noisy" not in run.err                        # DEBUG 低于门槛
+    assert_no_secret(run)
+
+
 def test_rc_tokens_with_embedded_newline_rejected_at_load(conn, data_dir, tmp_path):
     """含内部换行的 xapp token 在装载处就拒(rc 2),stderr 不含 token。"""
     from lib import paths

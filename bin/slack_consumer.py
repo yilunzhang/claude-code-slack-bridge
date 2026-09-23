@@ -15,12 +15,16 @@
   staged_dup,**仍 ack**)→ 提交 → ack;锁超时 / 任何异常 → **不 ack**(Slack 会重投)。
   其它信封类型(slash_commands 等)→ ack 后丢弃、不落库。
 - stderr 状态行:`[socket] ready num_connections=N`(= CONSUMER_READY_SENTINEL 前缀)/
-  `[socket] disconnect reason=…` / `[socket] warn …` / `[socket] fatal <code>` / `[socket] exit reason=…`。
+  `[socket] disconnect reason=…` / `[socket] warn …` / `[socket] fatal <code>` / `[socket] exit reason=…`;
+  sdk **自身** logger(`slack_sdk.*`)经 `install_sdk_log_redaction` 挂的 handler 走同一 `status()`
+  (`[sdk] <LEVEL> <logger>: <msg>`,WARNING+,不 propagate;exc_info 只留异常类型名)——
+  否则无 handler 时 logging.lastResort 会把含 `Bearer <token>` 的 sdk 日志裸打到 stderr(R2-M5)。
 - 退出码(constants.CONSUMER_RC_*):0 stdin EOF / SIGTERM / 看门狗断连超 CONSUMER_DISCONNECT_EXIT_S
   (均先 `client.close()`);2 tokens;3 致命鉴权(invalid_auth / link_disabled 等,或 hello 迟迟不来);
   4 缺 slack_sdk;5 其它(db 缺失/schema 不符/网络连接失败/未知异常)。
 """
 import json
+import logging
 import os
 import pathlib
 import signal
@@ -60,6 +64,45 @@ def status(line):
             sys.stderr.flush()
         except (OSError, ValueError):
             pass
+
+
+SDK_LOGGER_NAME = "slack_sdk"          # 真 sdk 全部 logger 都在这棵树下(logging.getLogger(__name__))
+SDK_LOG_LEVEL = logging.WARNING
+SDK_LOG_MAX_LEN = 300
+
+
+class _SdkLogHandler(logging.Handler):
+    """`slack_sdk` logger 树的唯一出口(R2-M5):记录经 status() 遮蔽后单行输出。
+    - 只用 record.getMessage()(不走 Formatter 的 traceback 拼接):exc_info 只留异常类型名,
+      真 sdk 常用 logger.exception(...) 把含 `Bearer <token>` 的 header ValueError 整段打出来;
+    - 任何格式化异常都吞掉(handler 绝不能炸 sdk 线程)。"""
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001
+            msg = "<unformattable>"
+        try:
+            if record.exc_info and record.exc_info[1] is not None:
+                msg = "%s %s" % (msg, type(record.exc_info[1]).__name__)
+            status("[sdk] %s %s: %s" % (record.levelname, record.name,
+                                        msg.replace("\n", " ")[:SDK_LOG_MAX_LEN]))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def install_sdk_log_redaction(level=SDK_LOG_LEVEL):
+    """给 `slack_sdk` logger 挂 `_SdkLogHandler`(幂等,返回 handler),并关闭 propagate:
+    sdk 日志不再落到 root / lastResort 裸打 stderr。在 _load_sdk 之前调用亦可(按名字取 logger)。"""
+    logger = logging.getLogger(SDK_LOGGER_NAME)
+    for h in logger.handlers:
+        if isinstance(h, _SdkLogHandler):
+            return h
+    h = _SdkLogHandler(level=level)
+    logger.addHandler(h)
+    logger.setLevel(level)
+    logger.propagate = False
+    return h
 
 
 def _env_float(name, default):
@@ -338,6 +381,7 @@ def _load_sdk():
 
 
 def main(argv=None):
+    install_sdk_log_redaction()   # 先于导入 sdk:sdk 自身 logger 的输出全部经 status() 遮蔽(R2-M5)
     try:
         sdk = _load_sdk()
     except ImportError:

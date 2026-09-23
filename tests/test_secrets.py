@@ -261,3 +261,71 @@ class TestNoLeakPaths:
             assert err == "[socket] warn something *** and ***\n"
         finally:
             cons._SECRETS[:] = []
+
+    def test_consumer_stderr_token_never_reaches_status_report(self, env):
+        """R2-M5:consumer 的**全部** stderr 进 ConsumerManager._feed;make_status_writer 入库的
+        consumer_socket_last_status / _ready / _last_exit_rc 必须**先遮蔽再截断**(daemon 已知 secret +
+        Slack token 形态兜底),bridgectl status 的 JSON 与 log 回调里绝不出现 token。"""
+        from lib.daemon_core import SOCKET_KEY, ConsumerManager, make_status_writer
+        tok = "xapp-1-A0000000000-B0000000000-synthetic0123456789"
+        plain = "plain-secret-without-token-shape"
+        logs = []
+        writer = make_status_writer(env.conn, log=logs.append, secrets_provider=lambda: [tok, plain])
+        mgr = ConsumerManager(env.clock, on_line=lambda k, l: None, on_status=writer,
+                              argv_builder=lambda key: ["true"])
+        c = mgr.consumers[SOCKET_KEY]
+        mgr._feed(c, "stderr", ("WARNING slack_sdk: Invalid header b'Bearer %s\\n' %s\n" % (tok, plain)).encode())
+        assert dbmod.get_state(env.conn, "consumer_socket_last_status") == \
+            "stderr WARNING slack_sdk: Invalid header b'Bearer ***\\n' ***"
+        mgr._feed(c, "stderr", ("%s num_connections=1 %s\n" % (constants.CONSUMER_READY_SENTINEL, tok)).encode())
+        assert dbmod.get_state(env.conn, "consumer_socket_ready") == "ready num_connections=1 ***"
+        writer(SOCKET_KEY, "exited", "rc=3 restarts=1 %s %s" % (tok, plain))
+        assert dbmod.get_state(env.conn, "consumer_socket_last_exit_rc") == "3"
+        # 先遮蔽再截断:token 跨过 200 字符截断点时不能以残片(`xapp-1-A0…`)形式漏出
+        writer(SOCKET_KEY, "stderr", "x" * 185 + " " + tok)
+        rep = json.dumps(ctl.status_report(env.conn, env.cfg, env.clock), ensure_ascii=False)
+        blob = rep + "\n".join(logs)
+        assert tok not in blob and plain not in blob and "xapp-" not in blob
+        assert dbmod.get_state(env.conn, "consumer_socket_last_status").endswith(" ***")
+
+    def test_consumer_manager_scrubs_stderr_before_callbacks(self):
+        """R2-M5:ConsumerManager._feed 自身对 stderr 行遮蔽(形态兜底 + secrets_provider 的显式 secret),
+        任何 on_status 消费者(状态入库 / daemon.log)都拿不到原文。"""
+        from lib.daemon_core import SOCKET_KEY, ConsumerManager
+        from tests.helpers import FakeClock
+        statuses = []
+        mgr = ConsumerManager(FakeClock(), on_line=lambda k, l: None,
+                              on_status=lambda k, s, d: statuses.append((s, d)),
+                              argv_builder=lambda key: ["true"], secrets_provider=lambda: ["plain-mgr-secret-1"])
+        c = mgr.consumers[SOCKET_KEY]
+        mgr._feed(c, "stderr", b"Bearer xapp-1-mgr-token-abcdef plain-mgr-secret-1 tail\n")
+        assert statuses == [("stderr", "Bearer *** *** tail")]
+
+    def test_consumer_sdk_log_handler_redacts_in_process(self, capsys):
+        """R2-M5:consumer 给 `slack_sdk` logger 挂的 handler:WARNING+ 经 status() 遮蔽后单行输出,
+        不 propagate(不再落到 lastResort 裸打);exc_info 只留异常类型名(不打 traceback);DEBUG 不输出。"""
+        import logging
+        cons = _load(ROOT / "bin" / "slack_consumer.py", "consumer_sdklog_mod")
+        cons._SECRETS[:] = ["plain-sdk-secret-77"]
+        logger = logging.getLogger("slack_sdk")
+        h = cons.install_sdk_log_redaction()
+        try:
+            assert cons.install_sdk_log_redaction() is h            # 幂等
+            assert logger.propagate is False
+            child = logging.getLogger("slack_sdk.socket_mode.builtin.client")
+            child.warning("failed: Bearer xapp-1-sdk-token-abcdef plain-sdk-secret-77")
+            try:
+                raise ValueError("Invalid header value b'Bearer xoxb-1-exc-token-zz'")
+            except ValueError:
+                child.exception("send failed")
+            child.debug("dbg xapp-1-debug-token-qq")
+            err = capsys.readouterr().err
+        finally:
+            logger.removeHandler(h)
+            logger.propagate = True
+            logger.setLevel(logging.NOTSET)
+            cons._SECRETS[:] = []
+        lines = err.splitlines()
+        assert lines[0] == "[sdk] WARNING slack_sdk.socket_mode.builtin.client: failed: Bearer *** ***"
+        assert lines[1] == "[sdk] ERROR slack_sdk.socket_mode.builtin.client: send failed ValueError"
+        assert len(lines) == 2 and "token" not in err and "Traceback" not in err

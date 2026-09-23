@@ -12,6 +12,8 @@ enqueue → process → 监听器,和真 sdk 同路径)或**控制项** `{"__con
   {"__control":"close","code":1006,"reason":"x","reconnect":false,"reconnect_after":0.0}
       关闭底层连接(is_connected → False,触发 on_close_listeners);reconnect=true 时稍后重连并补发 hello
   {"__control":"done"}   等队列与线程池排空后写 {"__event":"script_done"}(测试据此关 stdin)
+  {"__control":"sdk_log","level":"warning","logger":"slack_sdk.socket_mode.builtin.client","text":"… {app_token} …"}
+      模拟 sdk 自身 logger 打日志({app_token} 替换为真实 app token;R2-M5 遮蔽 handler 的靶子)
 日志:env `FAKE_SLACK_ACK_LOG` 追加 JSON 行:每次 `send_message` 的原文(ack = {"envelope_id": …})
 以及生命周期事件 {"__event": ctor|connect|reconnect|close|script_done, …}。**绝不记录 token 本身**。"""
 from .errors import SlackApiError, SlackClientError, SlackRequestError  # noqa: F401

@@ -51,13 +51,29 @@ class _Consumer:
         self.stdout_lines = 0
 
 
-class ConsumerManager:
-    """`ConsumerManager(clock, on_line, on_status, argv_builder, keys=(SOCKET_KEY,))`(contracts §8)。
-    on_line(key, line_str):consumer stdout 行(只计数);on_status(key, status, detail):
-    spawned / ready / stderr / exited / rapid-exit-alert / spawn-failed / restart。"""
+def _secrets_of(provider):
+    """`secrets_provider()` → 已知 secret 串元组(bot/app token);None / 异常 → ()。
+    形态兜底(util.SLACK_TOKEN_RE)不依赖此表,显式 secret 只是多一层。"""
+    if provider is None:
+        return ()
+    try:
+        return tuple(s for s in (provider() or ()) if isinstance(s, str) and s)
+    except Exception:  # noqa: BLE001
+        return ()
 
-    def __init__(self, clock, on_line, on_status, argv_builder, keys=(SOCKET_KEY,)):
+
+class ConsumerManager:
+    """`ConsumerManager(clock, on_line, on_status, argv_builder, keys=(SOCKET_KEY,))`(contracts §8;
+    尾随可选 kwarg `secrets_provider=None`,R2-M5)。
+    on_line(key, line_str):consumer stdout 行(只计数);on_status(key, status, detail):
+    spawned / ready / stderr / exited / rapid-exit-alert / spawn-failed / restart。
+    consumer 的**全部** stderr 都经 `_feed`:每一行在交给 on_status 之前先 `util.redact_secrets`
+    (secrets_provider 给出的显式 token + Slack token 形态兜底)—— sdk 自身 logger 绕过 consumer
+    的 status() 裸打到 stderr 的文本也不会以原文进入状态入库 / daemon.log。"""
+
+    def __init__(self, clock, on_line, on_status, argv_builder, keys=(SOCKET_KEY,), secrets_provider=None):
         self.clock = clock
+        self._secrets_provider = secrets_provider
         self.on_line = on_line
         self.on_status = on_status
         self.argv_builder = argv_builder
@@ -173,6 +189,7 @@ class ConsumerManager:
                 text = line.decode("utf-8", "replace").strip()
                 if not text:
                     continue
+                text = util.redact_secrets(text, _secrets_of(self._secrets_provider))  # 先于任何回调(R2-M5)
                 if text.startswith(constants.CONSUMER_READY_SENTINEL):
                     c.ready = True
                     detail = text[len(constants.CONSUMER_READY_SENTINEL):].strip()
@@ -272,10 +289,14 @@ def _parse_rc(detail):
     return None
 
 
-def make_status_writer(conn, log):
+def make_status_writer(conn, log, secrets_provider=None):
     """consumer 状态 → daemon_state(contracts §4.5:consumer_<key>_ready / _last_status /
-    _restarts / _last_exit_rc)。spawn=starting,ready 置位,退出=down。"""
+    _restarts / _last_exit_rc)。spawn=starting,ready 置位,退出=down。
+    **唯一**的状态入库入口:detail 在此**先遮蔽再截断**(R2-M5)—— `secrets_provider()` 给出的显式
+    token + Slack token 形态兜底;截断在遮蔽之后,token 跨过 200 字符截断点也不会以残片漏出。
+    这些键会被 `bridgectl status` 原样输出(进模型输出)。"""
     def on_status(key, status, detail):
+        detail = util.redact_secrets(detail, _secrets_of(secrets_provider))
         log("consumer[%s] %s: %s" % (key, status, detail))
         if status == "spawned":
             db.set_state(conn, "consumer_%s_ready" % key, "starting")  # 跨代不误报 ready

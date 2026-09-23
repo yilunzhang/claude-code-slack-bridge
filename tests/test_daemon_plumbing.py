@@ -653,3 +653,22 @@ class TestDaemonAssembly:
         for _ in range(3):                                                     # 一次性信号:不再重拉
             assert loop_once() is False
         assert mgr.restarts == [(SOCKET_KEY, "app_token_changed")]
+
+    def test_secrets_table_follows_token_rotation(self, env, tokens):
+        """R2-M5:daemon 的遮蔽表(status writer / ConsumerManager 的 secrets_provider)随 gate 看到的
+        tokens 版本变化而刷新;旧 token 保留(轮换后旧值仍可能出现在异常文本里);读失败保留旧表。"""
+        from lib.fingerprint import FingerprintGate
+        mod = _load_daemon_module()
+        env.client.on("auth.test", lambda m, p: ok(AUTH_OK))
+        gate = FingerprintGate(env.conn, env.cfg, env.client, env.clock, notifier=lambda *a: None)
+        assert gate.startup() == "ok"
+        secrets = ["xoxb-test-bot-token", "xapp-test-app-token"]
+        seen = {"version": gate.tokens_version}
+        logs = []
+        assert mod.refresh_secrets_if_rotated(gate, seen, secrets, log=logs.append) is False
+        _rewrite_tokens(tokens, bot="xoxb-rotated-bot", app="xapp-rotated-app")
+        gate.tick()
+        assert mod.refresh_secrets_if_rotated(gate, seen, secrets, log=logs.append) is True
+        assert secrets == ["xoxb-test-bot-token", "xapp-test-app-token", "xoxb-rotated-bot", "xapp-rotated-app"]
+        assert seen["version"] == gate.tokens_version and len(logs) == 1 and "xapp" not in logs[0]
+        assert mod.refresh_secrets_if_rotated(gate, seen, secrets) is False      # 版本没再变

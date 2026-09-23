@@ -182,6 +182,14 @@ class SocketModeClient:
                 elif ctl == "done":
                     self._drain_inflight()
                     _script.log({"__event": "script_done"})
+                elif ctl == "sdk_log":
+                    # 模拟真 sdk **自身** logger(slack_sdk.socket_mode.builtin.client 等)把含
+                    # `Bearer <token>` 的异常文本打进日志:{app_token} 占位符替换为真实 app token。
+                    # 真 sdk 里 logger 无 handler 时由 logging.lastResort 裸打 stderr(R2-M5)。
+                    import logging
+                    text = str(item.get("text", "")).replace("{app_token}", str(self.app_token))
+                    logging.getLogger(item.get("logger") or "slack_sdk.socket_mode.builtin.client").log(
+                        logging.getLevelName(str(item.get("level", "WARNING")).upper()), text)
                 else:
                     _script.log({"__event": "unknown_control", "control": ctl})
                 continue

@@ -56,6 +56,25 @@ def restart_consumer_if_app_token_changed(gate, mgr, log=None):
     return True
 
 
+def refresh_secrets_if_rotated(gate, seen, secrets=None, log=None):
+    """主循环每轮一次:gate 看到的 tokens 版本变了 → 重读 tokens.json 刷新遮蔽表(secrets 列表**原地**更新,
+    status writer / ConsumerManager / log_line 的 secrets_provider 都持同一引用)。读失败 → 保留旧表
+    (形态兜底不依赖此表)。`seen` = {"version": …} 可变记录。→ 是否刷新。"""
+    ver = getattr(gate, "tokens_version", None)
+    if ver is None or ver == seen.get("version"):
+        return False
+    seen["version"] = ver
+    target = _SECRETS if secrets is None else secrets
+    try:
+        tokens, _v = configmod.load_tokens(paths.tokens_path(), allow_env=False)
+    except configmod.ConfigError:
+        return False
+    fresh = [v for v in tokens.values() if isinstance(v, str) and v]
+    target[:] = list(dict.fromkeys(target + fresh))   # 旧 token 也留着:轮换后旧值仍可能出现在异常文本里
+    (log or log_line)("secrets table refreshed for tokens_version=%s" % ver)
+    return True
+
+
 def build_consumer_argv(cfg, root):
     return [cfg.get("consumer_python") or sys.executable, str(root / "bin" / "slack_consumer.py")]
 
@@ -122,9 +141,12 @@ def main():
                       log=log_line, gate=gate)  # gate.tick 在 loop 内先于出站
 
     root = paths.pkg_root()
-    on_status = make_status_writer(conn, log_line)  # ready 置位/清除同步 daemon_state
+    secrets_provider = lambda: _SECRETS  # noqa: E731 —— 状态入库 / stderr 行遮蔽的显式 token 表(R2-M5)
+    on_status = make_status_writer(conn, log_line, secrets_provider=secrets_provider)  # ready 置位/清除同步 daemon_state
     mgr = ConsumerManager(clock, on_line=core.on_consumer_line, on_status=on_status,
-                          argv_builder=lambda key: build_consumer_argv(cfg, root))
+                          argv_builder=lambda key: build_consumer_argv(cfg, root),
+                          secrets_provider=secrets_provider)
+    secrets_seen = {"version": gate.tokens_version}
 
     stop = {"flag": False}
 
@@ -149,6 +171,7 @@ def main():
             cfg.refresh()  # 配置原地更新(所有组件持同一引用)
             core.loop_iteration()  # 内含刷心跳 + drain + followup + gate.tick(先于出站)
             restart_consumer_if_app_token_changed(gate, mgr)  # gate.tick 之后读一次性信号
+            refresh_secrets_if_rotated(gate, secrets_seen)     # 凭据轮换 → 遮蔽表跟着换
             mgr.tick()
     finally:
         # 安全点标记 stopping(finally 首步,mgr.shutdown 前)—— supervisor 由此可观测到"正在退出"
