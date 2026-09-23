@@ -21,6 +21,14 @@ def connect(db_file, busy_timeout_ms=constants.BUSY_TIMEOUT_DAEMON_MS):
     return conn
 
 
+def connect_short(db_file, busy_ms=constants.CONSUMER_DB_BUSY_MS):
+    """consumer 线程用的**短超时**连接(contracts §1 / §9):与 `connect` 同一套 PRAGMA
+    (WAL / synchronous=NORMAL / foreign_keys=ON / Row),只是 busy_timeout 换成 `busy_ms`
+    (缺省 CONSUMER_DB_BUSY_MS=1500)。锁等待超过 busy_ms → sqlite3.OperationalError,consumer 据此**不 ack**
+    (Slack 重投),不拖住 sdk 线程池。"""
+    return connect(db_file, busy_timeout_ms=int(busy_ms))
+
+
 def check_schema(conn):
     """只读校验 schema_version —— **绝不建库、绝不写**(供 notify 直发等只读入口用)。
     缺 daemon_state 表 / 缺 schema_version 行 / 值不符 → SchemaMismatch(fail-closed)。

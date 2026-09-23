@@ -8,7 +8,7 @@
   `SLACK_BRIDGE_DATA_DIR`);token 只在内存,**绝不进 stderr / stdout / 异常文本**。
 - 客户端(R2-N3,关键字参数):`WebClient(token=app_token, retry_handlers=[])`;
   `SocketModeClient(app_token=…, web_client=…, auto_reconnect_enabled=True, ping_interval=10)`。
-- `on_request(client, req)`(sdk 线程池线程,每线程独立短超时连接 CONSUMER_DB_BUSY_MS):
+- `on_request(client, req)`(sdk 线程池线程,每线程独立 `db.connect_short(CONSUMER_DB_BUSY_MS)`):
   `key = slackwire.event_key(req.type, req.payload)`(None → ack + 计数 staged_invalid);
   同事务 SELECT 钉 binding_id → `INSERT … ON CONFLICT(event_key) DO NOTHING`(rowcount 0 → 计数
   staged_dup,**仍 ack**)→ 提交 → ack;锁超时 / 任何异常 → **不 ack**(Slack 会重投)。
@@ -89,15 +89,6 @@ def _slack_error_code(e):
     return code or "unknown_error"
 
 
-def connect_short(db_file, busy_ms=constants.CONSUMER_DB_BUSY_MS):
-    """consumer 线程用的短超时连接(contracts §1 的 `db.connect_short`)。
-    lib/db.py 尚未提供同名函数时退回 `db.connect(busy_timeout_ms=…)`(语义等价:同 PRAGMA、有界 busy)。"""
-    fn = getattr(db, "connect_short", None)
-    if fn is not None:
-        return fn(db_file, busy_ms)
-    return db.connect(db_file, busy_timeout_ms=busy_ms)
-
-
 class Consumer:
     def __init__(self, sdk, app_token, db_file):
         self.sdk = sdk
@@ -125,7 +116,7 @@ class Consumer:
     def _conn(self):
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = connect_short(self.db_file, constants.CONSUMER_DB_BUSY_MS)
+            conn = db.connect_short(self.db_file, constants.CONSUMER_DB_BUSY_MS)
             self._local.conn = conn
         return conn
 
@@ -359,7 +350,7 @@ def main(argv=None):
         status("[socket] fatal db_missing")
         return constants.CONSUMER_RC_OTHER
     try:
-        probe = connect_short(db_file, constants.CONSUMER_DB_BUSY_MS)
+        probe = db.connect_short(db_file, constants.CONSUMER_DB_BUSY_MS)
         try:
             db.check_schema(probe)
         finally:

@@ -1,5 +1,6 @@
-"""schema.sql 原样建库 + 全部约束真跑(外键/CHECK/部分唯一索引)+ Slack 版新增表/列。"""
+"""schema.sql 原样建库 + 全部约束真跑(外键/CHECK/部分唯一索引)+ Slack 版新增表/列 + db.connect_short。"""
 import sqlite3
+import time
 
 import pytest
 
@@ -273,3 +274,40 @@ def test_pendings_unique_message_and_decided_event(conn):
 def test_wal_and_fk_pragmas_applied(conn):
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_connect_short_same_pragmas_custom_busy_timeout(conn, data_dir):
+    """contracts §1:`db.connect_short(db_file, busy_ms)` = consumer 线程用的短超时连接。
+    与 connect 同 PRAGMA(WAL / synchronous=NORMAL / foreign_keys / Row / autocommit),busy_timeout=busy_ms;
+    锁被别的连接持有时**真等 busy_ms 后**抛 OperationalError(consumer 据此不 ack),而不是等 daemon 的 5s。"""
+    from lib import constants, db as dbmod, paths
+    short = dbmod.connect_short(paths.db_path(), 200)
+    try:
+        assert short.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert short.execute("PRAGMA synchronous").fetchone()[0] == 1          # NORMAL
+        assert short.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert short.execute("PRAGMA busy_timeout").fetchone()[0] == 200
+        assert short.row_factory is sqlite3.Row and short.isolation_level is None
+        assert short.execute("SELECT value FROM daemon_state WHERE key='schema_version'").fetchone()["value"] == "1"
+        # 缺省 busy_ms = CONSUMER_DB_BUSY_MS
+        dflt = dbmod.connect_short(paths.db_path())
+        try:
+            assert dflt.execute("PRAGMA busy_timeout").fetchone()[0] == constants.CONSUMER_DB_BUSY_MS
+        finally:
+            dflt.close()
+        # 另一连接持写锁 → 短连接的写事务等 ~200ms 后失败(不是 daemon 的 5s)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            t0 = time.monotonic()
+            with pytest.raises(sqlite3.OperationalError):
+                short.execute("BEGIN IMMEDIATE")
+            elapsed = time.monotonic() - t0
+            assert 0.15 <= elapsed < 2.0, elapsed
+        finally:
+            conn.execute("ROLLBACK")
+        # 锁释放后同一短连接正常可写
+        with dbmod.tx(short):
+            dbmod.set_state(short, "probe", "1")
+        assert dbmod.get_state(conn, "probe") == "1"
+    finally:
+        short.close()
