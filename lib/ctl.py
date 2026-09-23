@@ -255,7 +255,10 @@ def list_chats(client, cfg, page_cap=LIST_PAGE_CAP):
 
 def open_owner_dm(client, cfg):
     """`conversations.open(users=owner_user_id)` → 钉 `owner_dm_id`(`cfg.set_persist`)。
-    → {"ok": True, "owner_dm_id": D…} | {"ok": False, "error": …}。只有 owner DM 可绑(拒他人 DM)。"""
+    → {"ok": True, "owner_dm_id": D…, "chat_id": D…, "already_pinned": bool} | {"ok": False, "error": …}。
+    **幂等**(R1-m4):Slack 对同一 owner 总返回同一个 DM;已钉住同一 id 时不重写 config,只报 already_pinned;
+    钉的是别的 id(陈旧)→ 覆盖为最新。只有 owner DM 可绑(拒他人 DM);`chats` 只列出、**不**钉住,
+    列表里 `is_pinned_owner_dm=false` 的 owner DM 要先跑本命令再 bind,否则 bind 得 `foreign_dm`。"""
     owner = cfg.get("owner_user_id")
     if not owner:
         return {"ok": False, "error": "config 缺 owner_user_id"}
@@ -266,11 +269,13 @@ def open_owner_dm(client, cfg):
     dm = ch.get("id") if isinstance(ch, dict) else None
     if not isinstance(dm, str) or not dm.startswith("D"):
         return {"ok": False, "error": "conversations.open 未返回 D… 会话 id"}
-    if hasattr(cfg, "set_persist"):
-        cfg.set_persist("owner_dm_id", dm)
-    else:
-        cfg["owner_dm_id"] = dm
-    return {"ok": True, "owner_dm_id": dm, "chat_id": dm}
+    already = cfg.get("owner_dm_id") == dm
+    if not already:
+        if hasattr(cfg, "set_persist"):
+            cfg.set_persist("owner_dm_id", dm)
+        else:
+            cfg["owner_dm_id"] = dm
+    return {"ok": True, "owner_dm_id": dm, "chat_id": dm, "already_pinned": already}
 
 
 # ---------------------------------------------------------------- bind / unbind

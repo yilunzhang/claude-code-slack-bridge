@@ -205,8 +205,8 @@ def cmd_chats(args):
         out({"ok": False,
              "error": "会话列表未能完整取回(conversations.list 失败 / 分页未取完 / cursor 循环)"}, 2)
     out({"ok": True, "chats": chats, "owner_dm_id": cfg.get("owner_dm_id"),
-         "note": "频道只列 bot 已是成员的(先 /invite @bot);DM 只列 owner 自己的;"
-                 "owner DM 未出现时跑 open-dm"})
+         "note": "频道只列 bot 已是成员的(先 /invite @bot);DM 只列 owner 自己的;本命令只列出、不钉住:"
+                 "owner DM 未出现或其 is_pinned_owner_dm=false 时先跑 open-dm(幂等)再 bind"})
 
 
 def cmd_open_dm(args):

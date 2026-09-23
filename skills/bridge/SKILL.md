@@ -39,13 +39,15 @@ hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**�
    ```bash
    python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" chats
    ```
-   `chats[]` 每项 `{chat_id, name, type∈public_channel|private_channel|owner_dm, is_member}`。把列表给用户选(此时可用 AskUserQuestion —— 尚未绑定)。
+   `chats[]` 每项 `{chat_id, name, type∈public_channel|private_channel|owner_dm, is_member}`(owner_dm 那条另带 `is_pinned_owner_dm`)。把列表给用户选(此时可用 AskUserQuestion —— 尚未绑定)。
    - **频道只列 bot 已是成员的**。"不在列表里"≠"频道不存在":让用户在 Slack 里 `/invite @slack-bridge` 到那个频道后重跑 `chats`。**不要自己建频道**(v1 不支持,也别用别的工具建)。
-   - 想绑 DM:用 **owner DM**。列表里 `type=owner_dm` 的那条即可;没有就先
+   - 想绑 DM:用 **owner DM**(列表里 `type=owner_dm` 的那条)。**`chats` 只是列出来,不会钉住 `owner_dm_id`**——
+     看那条的 `is_pinned_owner_dm`:`false`(或列表里根本没有 owner DM)→ **先跑**
      ```bash
      python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" open-dm
      ```
-     它返回并钉住 `owner_dm_id`(D…)。**其它 D… 一律不能绑**。
+     它返回并钉住 `owner_dm_id`(D…;**幂等**,重复跑无副作用,输出 `already_pinned` 说明是否早已钉住)。
+     不先 `open-dm` 就 bind 会得到 `foreign_dm`。`true` 才能直接 bind。**其它 D… 一律不能绑**。
    - `ok=false`(列表取不全)→ 如实告诉用户,不要凭残缺列表下结论。
 
 3. **建绑定**:

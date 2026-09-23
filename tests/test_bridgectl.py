@@ -360,11 +360,57 @@ class TestOpenDm:
         c.on("conversations.open", lambda m, p: ok({"channel": {"id": "D0NEWDM"}}))
         cfg.pop("owner_dm_id", None)
         res = ctl.open_owner_dm(c, cfg)
-        assert res == {"ok": True, "owner_dm_id": "D0NEWDM", "chat_id": "D0NEWDM"}
+        assert res == {"ok": True, "owner_dm_id": "D0NEWDM", "chat_id": "D0NEWDM", "already_pinned": False}
         assert c.calls_for("conversations.open") == [{"users": OWNER}]
         assert cfg["owner_dm_id"] == "D0NEWDM"
         assert configmod.load_config()["owner_dm_id"] == "D0NEWDM"           # set_persist 落盘
         assert configmod.ConfigSnapshot.load()["owner_user_id"] == OWNER        # 其它键不动
+
+    def test_open_dm_is_idempotent_and_reports_already_pinned(self, cfg):
+        """R1-m4:重复跑 open-dm 无副作用;已钉同一 id 时不重写 config,只报 already_pinned=true。"""
+        c = FakeSlackClient()
+        c.on("conversations.open", lambda m, p: ok({"channel": {"id": "D0NEWDM"}}))
+        cfg.pop("owner_dm_id", None)
+        r1 = ctl.open_owner_dm(c, cfg)
+        assert r1["ok"] and r1["already_pinned"] is False and configmod.load_config()["owner_dm_id"] == "D0NEWDM"
+        raw_after_first = paths.config_path().read_bytes()
+        persist_calls = []
+        real_persist = cfg.set_persist
+        cfg.set_persist = lambda k, v: persist_calls.append((k, v)) or real_persist(k, v)
+        r2 = ctl.open_owner_dm(c, cfg)
+        assert r2 == {"ok": True, "owner_dm_id": "D0NEWDM", "chat_id": "D0NEWDM", "already_pinned": True}
+        assert persist_calls == [] and paths.config_path().read_bytes() == raw_after_first   # 不重写
+        assert len(c.calls_for("conversations.open")) == 2
+        # 钉的是陈旧 id → 覆盖为最新
+        cfg.set_persist = real_persist
+        cfg.set_persist("owner_dm_id", "D0STALE")
+        r3 = ctl.open_owner_dm(c, cfg)
+        assert r3["already_pinned"] is False and configmod.load_config()["owner_dm_id"] == "D0NEWDM"
+
+    def test_chats_marks_pin_state_and_bind_needs_open_dm_first(self, env, ctl_prober):
+        """chats 只列出、不钉住:is_pinned_owner_dm=false 的 owner DM 直接 bind → foreign_dm;open-dm 后可绑。"""
+        c = FakeSlackClient()
+        c.on("conversations.list", lambda m, p: ok({"channels": [
+            {"id": "D0NEWDM", "is_im": True, "user": OWNER}], "response_metadata": {"next_cursor": ""}}))
+        c.on("conversations.open", lambda m, p: ok({"channel": {"id": "D0NEWDM"}}))
+        env.cfg.pop("owner_dm_id", None)
+        chats = ctl.list_chats(c, env.cfg)
+        assert chats == [{"chat_id": "D0NEWDM", "name": "owner DM", "type": "owner_dm", "is_member": True,
+                          "is_pinned_owner_dm": False}]
+        assert env.cfg.get("owner_dm_id") is None                       # chats 没有钉住
+        with pytest.raises(lifecycle.BindConflict) as ei:
+            ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober, "D0NEWDM", "dm", "/tmp", ZSH_PID)
+        assert ei.value.code == "foreign_dm"
+        assert ctl.open_owner_dm(c, env.cfg)["ok"]
+        assert ctl.list_chats(c, env.cfg)[0]["is_pinned_owner_dm"] is True
+        res = ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober, "D0NEWDM", "dm", "/tmp", ZSH_PID)
+        assert res["is_owner_dm"] is True
+
+    def test_bridge_skill_tells_agent_to_open_dm_when_not_pinned(self):
+        text = (ROOT / "skills" / "bridge" / "SKILL.md").read_text(encoding="utf-8")
+        assert "is_pinned_owner_dm" in text and "幂等" in text
+        step = text[text.index("想绑 DM"):text.index("想绑 DM") + 600]
+        assert "open-dm" in step and "foreign_dm" in step and "不会钉住" in step
 
     def test_failure_or_non_dm_id(self, cfg):
         c = FakeSlackClient()
