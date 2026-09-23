@@ -39,7 +39,7 @@ def chunk_text_with_footer(body, footer, limit=constants.CHUNK_LIMIT):
     - 页脚为空 → 等价 chunk_text。
     - 先按 limit 平切;末块 + 页脚仍 ≤ limit → 直接拼。
     - 否则把末块再切一刀:前段 `limit-len(footer)` 字符留在原位,余下的尾部 + 页脚成为新末块
-      (恰好 = limit)。**正文一个字符都不丢**;页脚整体不可分。
+      (≤ limit)。**正文一个字符都不丢**;页脚整体不可分。
     - 页脚本身 > limit(不可能装下)→ 丢页脚,正文照常平切;绝不丢正文。
     """
     if not body:
@@ -58,7 +58,7 @@ def chunk_text_with_footer(body, footer, limit=constants.CHUNK_LIMIT):
     if keep <= 0:
         chunks.append(footer)  # 页脚恰好占满一块
         return chunks
-    head, tail = last[:len(last) - keep], last[len(last) - keep:]
+    head, tail = last[:keep], last[keep:]  # 前段留原位(≤limit),尾部 + 页脚成新末块(≤limit)
     chunks[-1] = head
     chunks.append(tail + footer)
     return chunks
