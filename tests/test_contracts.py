@@ -82,13 +82,6 @@ def test_constants_exist_and_values():
     assert c.ACTION_IDS == ("sb_approve", "sb_reject")
 
 
-def test_legacy_constants_marked_for_wp5():
-    src = (ROOT / "lib" / "constants.py").read_text(encoding="utf-8")
-    for name in ("MGET_TIMEOUT_S", "PERMANENT_SEND_CODES", "SELFCHECK_CHAT_ID", "MEDIA_KEY_RE",
-                 "TURN_RETRYABLE_MAX_ATTEMPTS", "CARD_REARM_MAX_ATTEMPTS"):
-        line = [l for l in src.splitlines() if l.startswith(name + " ")][0]
-        assert "LEGACY-FEISHU: remove in WP5" in line, name
-
 
 # ======================================================================
 # WP0:util / slackwire / texts / listener / hooklib marker

@@ -154,7 +154,10 @@ def test_alert_bodies_are_fixed_and_honest():
     assert "取消" in texts.group_cancelled_alert_body()
 
 
-def test_legacy_helpers_still_importable():
-    assert texts.DECISION_NOTICE["approved"] == texts.DECISION_TEXT["delivered"]
-    assert texts.DECISION_NOTICE["failed"] == texts.DECISION_TEXT["attachment_failed"]
-    assert callable(texts.media_fetch_hint) and callable(texts.reply_fetch_hint)
+def test_legacy_feishu_helpers_removed():
+    """WP5:飞书时代的取件提示与 approved/failed 旧键已删;decision_notice_body 只认六种 outcome。"""
+    for name in ("DECISION_NOTICE", "media_fetch_hint", "reply_fetch_hint"):
+        assert not hasattr(texts, name), name
+    for legacy in ("approved", "failed"):
+        with pytest.raises(KeyError):
+            texts.decision_notice_body(legacy)

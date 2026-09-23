@@ -2,9 +2,7 @@
 
 命名纪律:
 - 本文件是 WP1–WP4 并行实现共享的**名字预声明**(plan「并行前提」),值可在各 WP 微调,名字不改。
-- 标注 `# LEGACY-FEISHU: remove in WP5` 的名字只为让旧模块 / 旧测试仍可导入,WP5 一并删除。
 """
-import re
 
 # ======================================================================
 # 出站 chunk / 页脚
@@ -222,27 +220,3 @@ BUSY_TIMEOUT_OBS_MS = 300
 BUSY_TIMEOUT_LISTENER_MS = 3_000
 
 SCHEMA_VERSION = "1"
-
-# ======================================================================
-# LEGACY-FEISHU(旧模块/旧测试仍引用;WP5 连同 runner.py/selfcheck.py/旧测试一并删除)
-# ======================================================================
-MGET_TIMEOUT_S = 30                                  # LEGACY-FEISHU: remove in WP5
-DOWNLOAD_TIMEOUT_S = 120                             # LEGACY-FEISHU: remove in WP5
-UNKNOWN_RETRY_DELAY_MS = 15_000                      # LEGACY-FEISHU: remove in WP5
-MAX_SEND_ATTEMPTS = 2                                # LEGACY-FEISHU: remove in WP5
-OUTBOUND_BATCH = 20                                  # LEGACY-FEISHU: remove in WP5
-TURN_RETRYABLE_MAX_ATTEMPTS = 6                      # LEGACY-FEISHU: remove in WP5
-TURN_RETRY_BACKOFF_MS = 8_000                        # LEGACY-FEISHU: remove in WP5
-TURN_RETRY_BACKOFF_MAX_MS = 45_000                   # LEGACY-FEISHU: remove in WP5
-RESOLVE_DEADLINE_MS = 10 * 60 * 1000                 # LEGACY-FEISHU: remove in WP5
-MATERIALIZE_DEADLINE_MS = 10 * 60 * 1000             # LEGACY-FEISHU: remove in WP5
-PERMANENT_SEND_CODES = frozenset({230002, 230013, 99991672, 230099, 99992402})  # LEGACY-FEISHU: remove in WP5
-TRANSIENT_SEND_CODES = frozenset({230020, 99991661, 99991663})                  # LEGACY-FEISHU: remove in WP5
-RETRYABLE_FALLBACK_CODES = frozenset({230020})       # LEGACY-FEISHU: remove in WP5
-CARD_REARM_MAX_ATTEMPTS = 5                          # LEGACY-FEISHU: remove in WP5
-CARD_REARM_BACKOFF_MS = 30_000                       # LEGACY-FEISHU: remove in WP5
-CARD_REARM_BACKOFF_MAX_MS = 10 * 60 * 1000           # LEGACY-FEISHU: remove in WP5
-SELFCHECK_CHAT_ID = "oc_ef148370df62f0a61e113731c6c50eb3"  # LEGACY-FEISHU: remove in WP5
-SUPPORTED_MSG_TYPES = ("text", "image", "file", "post")   # LEGACY-FEISHU: remove in WP5
-MEDIA_MSG_TYPES = ("image", "file")                  # LEGACY-FEISHU: remove in WP5
-MEDIA_KEY_RE = re.compile(r"(?:img|file)_[A-Za-z0-9_-]+")  # LEGACY-FEISHU: remove in WP5

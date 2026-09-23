@@ -1,5 +1,5 @@
 """pytest 装配:数据目录重定向(SLACK_BRIDGE_*)、config.json/tokens.json、真实 SQLite、
-FakeSlackClient、Env(一站式接线)。旧 Feishu fixture(runner / recv_event / arm_mget)标 LEGACY,WP5 删。"""
+FakeSlackClient、Env(一站式接线)。"""
 import pathlib
 import sys
 import types
@@ -11,18 +11,14 @@ sys.path.insert(0, str(SKILL_ROOT))
 
 from tests.helpers import (  # noqa: E402
     APP_ID, BOT_ID, BOT_USER, CHAT, DM, MEMBER, OWNER, TEAM,
-    FakeClock, FakeProber, FakeRunner, FakeSlackClient, block_action, next_ts,
+    FakeClock, FakeProber, FakeSlackClient, block_action, next_ts,
 )
-
-# LEGACY-FEISHU: remove in WP5(旧测试 `from tests.conftest import BOT_OPEN_ID, PROFILE`)
-BOT_OPEN_ID = BOT_USER  # LEGACY-FEISHU: remove in WP5
-PROFILE = "main"        # LEGACY-FEISHU: remove in WP5
 
 CC_PID = 4242
 CC_START = "Tue Jul 14 09:00:00 2026"
 
 __all__ = ["TEAM", "BOT_USER", "BOT_ID", "APP_ID", "OWNER", "MEMBER", "CHAT", "DM",
-           "BOT_OPEN_ID", "PROFILE", "CC_PID", "CC_START", "Env"]
+           "CC_PID", "CC_START", "Env"]
 
 
 @pytest.fixture
@@ -95,11 +91,6 @@ def client(conn, clock):
 
 
 @pytest.fixture
-def runner():  # LEGACY-FEISHU: remove in WP5
-    return FakeRunner(profile=PROFILE)
-
-
-@pytest.fixture
 def prober():
     p = FakeProber()
     p.set(CC_PID, 1, CC_START, "claude")
@@ -110,10 +101,9 @@ class Env:
     """一站式已接线组件(全部 fake 注入,零网络)。构造签名冻结于 docs/contracts.md §8:
     Inbound(conn, cfg, client, clock, media_root) / Outbound(conn, cfg, client, clock) /
     Approval(conn, cfg, clock, inbound) / Recovery(conn, cfg, client, clock, inbound, prober) /
-    DaemonCore(conn, cfg, clock, inbound, approval, outbound, recovery)。
-    WP2/WP3 前旧模块只是把 client 存进 `self.runner` 字段,不影响构造。"""
+    DaemonCore(conn, cfg, clock, inbound, approval, outbound, recovery)。"""
 
-    def __init__(self, conn, cfg, clock, client, prober, data_dir, runner=None):
+    def __init__(self, conn, cfg, clock, client, prober, data_dir):
         from lib import paths
         from lib.approval import Approval
         from lib.daemon_core import DaemonCore
@@ -127,7 +117,6 @@ class Env:
         self.client = client
         self.prober = prober
         self.data_dir = data_dir
-        self.runner = runner  # LEGACY-FEISHU: remove in WP5
         self.media_root = paths.media_root()
         self.inbound = Inbound(conn, cfg, client, clock, self.media_root)
         self.outbound = Outbound(conn, cfg, client, clock)
@@ -250,30 +239,7 @@ class Env:
     def pendings(self):
         return self.conn.execute("SELECT * FROM pendings ORDER BY created_at, pending_id").fetchall()
 
-    # ---- LEGACY-FEISHU: remove in WP5 ----
-    def recv_event(self, message_id="om_1", event_id=None, chat_id=CHAT,
-                   sender_id=OWNER, content="@TestBot hi", message_type="text",
-                   chat_type="group"):  # LEGACY-FEISHU: remove in WP5
-        ev = {
-            "type": "im.message.receive_v1",
-            "event_id": event_id or ("ev_" + message_id),
-            "message_id": message_id, "chat_id": chat_id, "chat_type": chat_type,
-            "sender_id": sender_id, "message_type": message_type, "content": content,
-        }
-        self.inbound.process_event(ev)
-        return ev
-
-    def arm_mget(self, snapshot_rows):  # LEGACY-FEISHU: remove in WP5
-        from tests.helpers import ok_envelope
-
-        def fn(args, cwd):
-            return ok_envelope({"messages": snapshot_rows})
-
-        assert self.runner is not None
-        self.runner.on(
-            lambda a: a[:2] == ["im", "+messages-mget"] and "--download-resources" not in a, fn)
-
 
 @pytest.fixture
-def env(conn, cfg, clock, client, prober, data_dir, runner):
-    return Env(conn, cfg, clock, client, prober, data_dir, runner=runner)
+def env(conn, cfg, clock, client, prober, data_dir):
+    return Env(conn, cfg, clock, client, prober, data_dir)

@@ -490,7 +490,7 @@ class Outbound:
         return False
 
     def _decision_guard(self, job):
-        """§5.5 六种 outcome 的守卫(+ LEGACY-FEISHU approved/failed 两键,WP5 删)。"""
+        """§5.5 六种 outcome 的守卫(expected_state ∉ DECISION_OUTCOMES → False,fail-closed)。"""
         exp = job["expected_state"]
         p = self._pending(job["ref_pending_id"])
         mid = p["message_id"] if p is not None else job["ref_message_id"]
@@ -505,10 +505,6 @@ class Outbound:
             return r is not None and r["state"] == "failed"
         if exp == "closed_undelivered":
             return r is not None and r["state"] == "undeliverable"
-        if exp == "approved":  # LEGACY-FEISHU: remove in WP5
-            return p is not None and p["state"] == "approved"
-        if exp == "failed":    # LEGACY-FEISHU: remove in WP5
-            return r is not None and r["state"] == "failed"
         return False
 
     def _binding_active(self, binding_id):

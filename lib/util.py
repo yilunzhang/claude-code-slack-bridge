@@ -1,5 +1,4 @@
 """小工具:id/nonce/marker/chunk/原子写/日志轮转 + Slack 文本/消息标识辅助。"""
-import hashlib
 import json
 import os
 import secrets
@@ -18,11 +17,6 @@ def new_nonce():
 
 def marker_for(nonce):
     return f"{constants.MARKER_PREFIX}{nonce}]"
-
-
-def short_key(logical_key):
-    """LEGACY-FEISHU: remove in WP5(飞书 --idempotency-key ≤50 字符的短键;Slack 无幂等键)。"""
-    return "fb:" + hashlib.sha1(str(logical_key).encode("utf-8")).hexdigest()[:32]
 
 
 def chunk_text(s, limit=constants.CHUNK_LIMIT):

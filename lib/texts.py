@@ -1,6 +1,5 @@
 """全部对外固定文案 + 审批卡片(Block Kit)构造。控制行/通知文案不携带用户可控文本(I1);
-卡片预览 = plain_text + 转义 + 截断 + 控制字符剥离。
-LEGACY-FEISHU 段(media_fetch_hint / reply_fetch_hint / 旧 DECISION_NOTICE 键)WP5 删。"""
+卡片预览 = plain_text + 转义 + 截断 + 控制字符剥离。"""
 import json
 import re
 
@@ -25,11 +24,6 @@ DECISION_TEXT = {
     "closed_undelivered": "🔌 绑定已结束,附件未投递。",
 }
 assert tuple(DECISION_TEXT) == constants.DECISION_OUTCOMES
-
-# LEGACY-FEISHU: remove in WP5(旧 approval/inbound/recovery 仍用 approved/failed 两个键)
-DECISION_NOTICE = dict(DECISION_TEXT)
-DECISION_NOTICE["approved"] = DECISION_TEXT["delivered"]   # LEGACY-FEISHU: remove in WP5
-DECISION_NOTICE["failed"] = DECISION_TEXT["attachment_failed"]  # LEGACY-FEISHU: remove in WP5
 
 # ---- lifecycle_notice ----
 LC_BOUND = ("✅ 已绑定本机 CC session。@我 的消息会投递给 session(DM 无需 @);"
@@ -57,9 +51,8 @@ def inbound_notice_body(code):
 
 
 def decision_notice_body(outcome):
-    """decision_notice 的纯文本形态(卡片身份未知 → chat.postMessage/text 时用)。六种 outcome;
-    旧键 approved/failed 仅 LEGACY 兼容。"""
-    return DECISION_NOTICE[outcome]
+    """decision_notice 的纯文本形态(卡片身份未知 → chat.postMessage/text 时用)。六种 outcome。"""
+    return DECISION_TEXT[outcome]
 
 
 def send_failure_alert_body():
@@ -191,19 +184,3 @@ def decision_update_blocks(outcome, decided_by, preview=None):
 def decision_update_text(outcome):
     """chat.update 的 text 回退(通知栏)。"""
     return DECISION_TEXT[outcome]
-
-
-# ======================================================================
-# LEGACY-FEISHU: remove in WP5(旧 inbound.py 仍引用;Slack 版无 lark-cli 取件提示)
-# ======================================================================
-def media_fetch_hint(message_id, keys, profile):  # LEGACY-FEISHU: remove in WP5
-    lines = ["📎 本条是非文本消息,上面的正文可能不完整。"]
-    for k in keys or []:
-        lines.append("  lark-cli im +messages-resources-download --message-id %s --file-key %s --type %s"
-                     " --output ./feishu-media-%s --as bot --profile %s"
-                     % (message_id, k["key"], k["type"], k["key"], profile))
-    return "\n".join(lines)
-
-
-def reply_fetch_hint(reply_to, profile):  # LEGACY-FEISHU: remove in WP5
-    return "💬 本条回复/引用了另一条消息 %s(lark-cli --profile %s)。" % (reply_to, profile)

@@ -3,7 +3,7 @@
 from . import constants, texts, util
 
 
-# E4b 键模板最坏长度审计(逻辑键存 DB;wire 一律 util.short_key ≤40):
+# 键模板长度参考(逻辑键存 DB,仅本地唯一;Slack 侧无幂等键,job_id 进 metadata):
 #   turn:<32hex>:<idx>            = 38+len(idx)  → 大 idx 可超 50
 #   card:<32hex>                  = 37
 #   dec:<32hex>:<outcome≤8>       ≤ 46
