@@ -20,7 +20,6 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 WP1 = pytest.mark.xfail(strict=True, reason="WP1 传输/daemon_core 未落地")
 WP2 = pytest.mark.xfail(strict=True, reason="WP2 入站/审批/媒体/恢复/生命周期 未落地")
 WP3 = pytest.mark.xfail(strict=True, reason="WP3 出站状态机 未落地")
-WP4 = pytest.mark.xfail(strict=True, reason="WP4 控制面/hooklib/notify/fingerprint 未落地")
 
 
 # ======================================================================
@@ -515,22 +514,19 @@ def test_prepare_freezes_op_columns(env):
 
 
 # ======================================================================
-# WP4:hooklib / notify / fingerprint
+# WP4:hooklib / notify / fingerprint(已落地,守卫直接绿)
 # ======================================================================
-@WP4
 def test_hooklib_uses_chunk_text_with_footer():
     src = inspect.getsource(hooklib)
     assert "chunk_text_with_footer" in src
 
 
-@WP4
 def test_notify_has_credentials_unverified_path():
     from lib import notify
     src = inspect.getsource(notify)
     assert "credentials-unverified" in src and "outbound_gate_tokens_version" in src
 
 
-@WP4
 def test_fingerprint_writes_gate_tokens_version():
     from lib import fingerprint
     src = inspect.getsource(fingerprint)
