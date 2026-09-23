@@ -672,3 +672,27 @@ class TestDaemonAssembly:
         assert secrets == ["xoxb-test-bot-token", "xapp-test-app-token", "xoxb-rotated-bot", "xapp-rotated-app"]
         assert seen["version"] == gate.tokens_version and len(logs) == 1 and "xapp" not in logs[0]
         assert mod.refresh_secrets_if_rotated(gate, seen, secrets) is False      # 版本没再变
+
+    def test_secrets_refresh_retries_after_read_failure(self, env, tokens):
+        """R3-m2:版本变了但 tokens.json 暂时读不了(chmod 644)→ 不提交 seen,下一轮仍重试;恢复后刷新成功。"""
+        import os
+        from lib.fingerprint import FingerprintGate
+        mod = _load_daemon_module()
+        env.client.on("auth.test", lambda m, p: ok(AUTH_OK))
+        gate = FingerprintGate(env.conn, env.cfg, env.client, env.clock, notifier=lambda *a: None)
+        assert gate.startup() == "ok"
+        secrets = ["xoxb-test-bot-token", "xapp-test-app-token"]
+        seen = {"version": gate.tokens_version}
+        _rewrite_tokens(tokens, bot="xoxb-rotated-bot", app="xapp-rotated-app")
+        gate.tick()
+        new_ver = gate.tokens_version
+        assert new_ver != seen["version"]
+        os.chmod(str(tokens.path), 0o644)                                       # 读失败(权限)
+        try:
+            assert mod.refresh_secrets_if_rotated(gate, seen, secrets) is False
+            assert seen["version"] != new_ver and "xapp-rotated-app" not in secrets
+            assert mod.refresh_secrets_if_rotated(gate, seen, secrets) is False   # 仍在重试,仍失败
+        finally:
+            os.chmod(str(tokens.path), 0o600)
+        assert mod.refresh_secrets_if_rotated(gate, seen, secrets) is True        # 恢复后刷新
+        assert seen["version"] == new_ver and "xapp-rotated-app" in secrets

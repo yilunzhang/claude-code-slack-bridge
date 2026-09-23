@@ -85,6 +85,9 @@ class _SdkLogHandler(logging.Handler):
         try:
             if record.exc_info and record.exc_info[1] is not None:
                 msg = "%s %s" % (msg, type(record.exc_info[1]).__name__)
+            # R3-M5:先对完整消息遮蔽,再单行化、截断 —— 先截断会留下 token 残片(完整替换匹配不上,
+            # 残片又不足以触发形态正则);status() 会再遮蔽一次,无害。
+            msg = util.redact_secrets(msg, _SECRETS)
             status("[sdk] %s %s: %s" % (record.levelname, record.name,
                                         msg.replace("\n", " ")[:SDK_LOG_MAX_LEN]))
         except Exception:  # noqa: BLE001

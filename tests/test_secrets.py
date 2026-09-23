@@ -329,3 +329,29 @@ class TestNoLeakPaths:
         assert lines[0] == "[sdk] WARNING slack_sdk.socket_mode.builtin.client: failed: Bearer *** ***"
         assert lines[1] == "[sdk] ERROR slack_sdk.socket_mode.builtin.client: send failed ValueError"
         assert len(lines) == 2 and "token" not in err and "Traceback" not in err
+
+
+class TestSdkHandlerBoundary:
+    def test_sdk_log_handler_redacts_before_truncation(self, capsys):
+        """R3-M5:先截断后遮蔽会留下跨 300 字符边界的 token 残片(`xapp-1-ABC`);必须先遮蔽再截断。"""
+        import logging
+        from lib import util
+        cons = _load(ROOT / "bin" / "slack_consumer.py", "consumer_sdklog_boundary_mod")
+        token = "xapp-1-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        plain = "plain-secret-without-token-shape-xyz"
+        cons._SECRETS[:] = [token, plain]
+        logger = logging.getLogger("slack_sdk")
+        h = cons.install_sdk_log_redaction()
+        try:
+            child = logging.getLogger("slack_sdk.socket_mode.builtin.client")
+            child.warning("a" * (cons.SDK_LOG_MAX_LEN - 11) + " " + token)     # token 跨在截断边界上
+            child.warning("b" * (cons.SDK_LOG_MAX_LEN - 11) + " " + plain)
+            err = capsys.readouterr().err
+        finally:
+            logger.removeHandler(h)
+            logger.propagate = True
+            logger.setLevel(logging.NOTSET)
+            cons._SECRETS[:] = []
+        assert "xapp-" not in err and "plain-secret" not in err
+        assert token[:8] not in err and plain[:8] not in err
+        assert "***" in err

@@ -63,12 +63,12 @@ def refresh_secrets_if_rotated(gate, seen, secrets=None, log=None):
     ver = getattr(gate, "tokens_version", None)
     if ver is None or ver == seen.get("version"):
         return False
-    seen["version"] = ver
     target = _SECRETS if secrets is None else secrets
     try:
         tokens, _v = configmod.load_tokens(paths.tokens_path(), allow_env=False)
     except configmod.ConfigError:
-        return False
+        return False          # R3-m2:读失败不提交 seen,下一轮继续重试
+    seen["version"] = ver
     fresh = [v for v in tokens.values() if isinstance(v, str) and v]
     target[:] = list(dict.fromkeys(target + fresh))   # 旧 token 也留着:轮换后旧值仍可能出现在异常文本里
     (log or log_line)("secrets table refreshed for tokens_version=%s" % ver)

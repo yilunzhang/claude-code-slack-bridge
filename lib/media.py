@@ -158,17 +158,25 @@ def skipped_of(plan):
             for e in plan if e["skip"] is not None]
 
 
+_NEW_STYLE_RE = re.compile(r"^f\d{2}-")
+
+
 def _lookup_published(entry, by_name, claimed):
-    """按 dest_name 反查已发布路径;新名缺席时回落旧命名(R2-m1,R1-M7 之前发布的目录):
-    净化后的原名、再是旧去重形态 `<n>-原名`(n ≥ 2)。每个路径只认领一次(同名文件不会都指向同一路径)。"""
+    """按 dest_name 反查已发布路径。旧命名回落(R2-m1 → R3-m1 收紧):**只在目录里完全没有新式名
+    (`fNN-…`)时**才回落,且只认净化后的原名精确匹配;不猜 `<n>-原名` 之类的旧去重形态(旧实现的序号
+    规则与本函数无法可靠对齐,猜错会把别的附件内容错配给当前条目)。有歧义 → None(payload 记 no_url,
+    media_paths 仍保留真实路径)。每个路径只认领一次。"""
+    p = by_name.get(entry["dest_name"])
+    if p is not None and p not in claimed:
+        claimed.add(p)
+        return p
+    if any(_NEW_STYLE_RE.match(n) for n in by_name):
+        return None                      # 混合目录:新式名缺席就是缺席,绝不回落到别人的旧名
     legacy = _safe_name(entry["name"], entry["index"])
-    cands = [entry["dest_name"], legacy]
-    cands.extend("%d-%s" % (n, legacy) for n in range(2, len(by_name) + 2))
-    for c in cands:
-        p = by_name.get(c)
-        if p is not None and p not in claimed:
-            claimed.add(p)
-            return p
+    p = by_name.get(legacy)
+    if p is not None and p not in claimed:
+        claimed.add(p)
+        return p
     return None
 
 

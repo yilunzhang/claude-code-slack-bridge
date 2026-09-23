@@ -120,18 +120,18 @@ class TestFilePlan:
         assert media.describe_files(files, [])[0]["skipped_reason"] == "no_url"
 
     def test_describe_files_falls_back_to_legacy_published_names(self, env):
-        """R2-m1:R1-M7 之前发布的目录用「净化原名 / 同名加 `<n>-`」落盘;升级后 dest_name 是
-        `f<idx>-<id>-<name>`,只按新名反查会把旧目录里的文件错标 no_url(media_paths 却仍带旧路径)。
-        新名缺席时回落到净化后的原名(及旧去重形态 `<n>-原名`)匹配,每个路径只认领一次。"""
+        """R2-m1 → R3-m1 收紧:只在**纯旧式目录**里按净化原名精确回落;不猜 `<n>-` 旧去重序号;
+        目录里一旦有新式名(`fNN-…`)就不回落,避免把别的附件的旧文件错配给当前条目。"""
         files = [slack_file(id="A", name="a.pdf", size=10), slack_file(id="B", name="a.pdf", size=11),
                  slack_file(id="C", name="c.txt", size=12), slack_file(id="D", name="z.bin", size=13)]
         legacy = ["/x/y/a.pdf", "/x/y/2-a.pdf", "/x/y/c.txt", "/x/y/z.bin"]
         out = media.describe_files(files, legacy)
-        assert [d.get("local_path") for d in out] == legacy
-        assert all("skipped_reason" not in d for d in out)
-        # 新旧混合(部分按新名发布)各归其位:新名优先;同名文件不会都指向同一路径
-        mixed = ["/x/y/f01-A-a.pdf", "/x/y/2-a.pdf", "/x/y/c.txt", "/x/y/z.bin"]
-        assert [d["local_path"] for d in media.describe_files(files, mixed)] == mixed
+        assert [d.get("local_path") for d in out] == ["/x/y/a.pdf", None, "/x/y/c.txt", "/x/y/z.bin"]
+        assert out[1]["skipped_reason"] == "no_url"            # 不猜 2-a.pdf / 1-a.pdf 属于谁
+        # 混合目录(有新式名)→ 新名优先;新名缺席的条目不回落到旧名(R3-m1 误配案例)
+        mixed = ["/x/y/a.pdf", "/x/y/f01-A-a.pdf"]
+        out = media.describe_files(files[:2], mixed)
+        assert out[0]["local_path"] == "/x/y/f01-A-a.pdf" and out[1]["skipped_reason"] == "no_url"
         # 旧目录只有一份 a.pdf:第二个同名文件不能抢它,仍保守 no_url
         out = media.describe_files(files[:2], ["/x/y/a.pdf"])
         assert out[0]["local_path"] == "/x/y/a.pdf" and out[1]["skipped_reason"] == "no_url"
