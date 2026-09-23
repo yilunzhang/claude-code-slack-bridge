@@ -816,16 +816,24 @@ class Outbound:
             res = self.client.call(method, params, timeout_s=constants.SEND_TIMEOUT_S)
             cls = classify_send_error(res)
             if cls == "sent":
-                hit_ts = self._find_hit(job_id, res.get("messages"))
+                msgs = res.get("messages")
+                if not isinstance(msgs, list):
+                    outcome = "error"       # 响应没有 messages 列表 = 不完整查询,绝不算 absent
+                    break
+                hit_ts = self._find_hit(job_id, msgs)
                 if hit_ts:
                     outcome = "hit"
                     break
                 meta = res.get("response_metadata")
                 cursor = meta.get("next_cursor") if isinstance(meta, dict) else None
-                if res.get("has_more") and cursor:
+                cursor = cursor if isinstance(cursor, str) and cursor else None
+                if res.get("has_more") or cursor:
+                    if not cursor:
+                        outcome = "error"   # 声称还有更多却给不出 cursor → 无法翻页 → 不算 absent
+                        break
                     params = dict(params, cursor=cursor)
-                    continue  # 翻页;页数用尽仍 has_more → error(翻页未完)
-                outcome = "absent"
+                    continue  # 翻页;页数用尽仍 has_more → 循环结束 outcome None → error
+                outcome = "absent"          # 只有完整翻完且未命中才是 absent
                 break
             if cls == "wait":
                 outcome = "wait"

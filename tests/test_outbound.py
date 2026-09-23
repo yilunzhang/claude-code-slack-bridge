@@ -974,6 +974,32 @@ class TestVerify:
         assert r["state"] == "unknown" and r["verify_error_count"] == 1 and r["verify_absent_count"] == 0
         assert len(env.client.calls_for(HIST)) == C.VERIFY_MAX_PAGES
 
+    def test_has_more_without_cursor_is_error_not_absent(self, env):
+        """Codex 实现 review R1:声称 has_more 却无 cursor = 不完整查询,不能算 absent。"""
+        bid = env.make_binding(status="active")
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: history([], has_more=True, cursor=None))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_error_count"] == 1 and r["verify_absent_count"] == 0
+
+    def test_cursor_without_has_more_still_paginates(self, env):
+        bid = env.make_binding(status="active")
+        r = send_unknown(env, bid)
+        ts = next_ts()
+        env.client.on(HIST, seq(history([], has_more=False, cursor="c9"), history([hit_msg(r["job_id"], ts)])))
+        verify_tick(env)
+        assert row(env, "turn:g:0")["state"] == "sent"
+        assert env.client.calls_for(HIST)[1]["cursor"] == "c9"
+
+    def test_response_without_messages_list_is_error(self, env):
+        bid = env.make_binding(status="active")
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: ok({"ok": True}))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_error_count"] == 1 and r["verify_absent_count"] == 0
+
     def test_hit_requires_bot_id_event_type_and_job_id(self, env):
         bid = env.make_binding(status="active")
         r = send_unknown(env, bid)

@@ -169,8 +169,10 @@ def _is_not_sent_reason(reason):
         return True, "dns"
     if isinstance(reason, ConnectionRefusedError):
         return True, "connection_refused"
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return True, "tls_cert"          # 证书校验失败发生在握手阶段,请求肯定未写出
     if isinstance(reason, ssl.SSLError):
-        return True, "tls"
+        return False, "tls"              # 其它 TLS 错可能发生在响应读取阶段 → 不能断言未发送
     if isinstance(reason, (socket.timeout, TimeoutError)):
         return False, "timeout"
     if isinstance(reason, OSError) and getattr(reason, "errno", None) in (
@@ -271,8 +273,10 @@ class SlackClient:
             return CallResult(ok=False, error="dns", exc=e, not_sent=True)
         except ConnectionRefusedError as e:
             return CallResult(ok=False, error="connection_refused", exc=e, not_sent=True)
+        except ssl.SSLCertVerificationError as e:
+            return CallResult(ok=False, error="tls_cert", exc=e, not_sent=True)
         except ssl.SSLError as e:
-            return CallResult(ok=False, error="tls", exc=e, not_sent=True)
+            return CallResult(ok=False, error="tls", exc=e)   # 可能已写出 → unknown
         except (http.client.HTTPException, ConnectionError, OSError) as e:
             # 请求可能已写出(RemoteDisconnected / reset / broken pipe)→ 不能断言未发送
             return CallResult(ok=False, error="transport:%s" % type(e).__name__, exc=e)

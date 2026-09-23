@@ -230,6 +230,15 @@ def run(req, opener=None):
         return RC_TRANSIENT, _result(http_status=status, content_type=ctype, error="write:%s" % e)
     finally:
         _close(resp)
+    if clen is not None:
+        try:
+            expected = int(clen)
+        except ValueError:
+            expected = None
+        if expected is not None and n != expected:
+            _unlink(dest)   # 正文提前结束 = 截断;绝不把残缺文件判成功(瞬态,走预算重试)
+            return RC_TRANSIENT, _result(http_status=status, content_type=ctype,
+                                         error="truncated:%d/%d" % (n, expected))
     return RC_OK, _result(ok=True, nbytes=n, content_type=ctype, http_status=status)
 
 

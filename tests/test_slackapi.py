@@ -6,6 +6,7 @@ import http.server
 import io
 import json
 import socket
+import ssl
 import threading
 import urllib.error
 from email.message import Message
@@ -423,3 +424,21 @@ def test_real_connection_refused_is_not_sent():
     r = c.call("auth.test")
     assert r.not_sent and r.error == "connection_refused"
     assert slackapi.classify_send_error(r) == "not_sent"
+
+
+def test_tls_error_during_read_is_unknown_not_not_sent(net):
+    """Codex 实现 review R1:响应读取阶段的 TLS 错误可能发生在请求写出之后,不能算 not_sent。"""
+    net(urllib.error.URLError(ssl.SSLError(1, "read failed")))
+    r = mk().call("m")
+    assert not r.not_sent and r.error == "tls" and slackapi.classify_send_error(r) == "unknown"
+    net(ssl.SSLError(1, "eof in violation of protocol"))
+    r = mk().call("m")
+    assert not r.not_sent and r.error == "tls"
+
+
+def test_tls_cert_verification_failure_is_not_sent(net):
+    net(urllib.error.URLError(ssl.SSLCertVerificationError(1, "certificate verify failed")))
+    r = mk().call("m")
+    assert r.not_sent and r.error == "tls_cert" and slackapi.classify_send_error(r) == "not_sent"
+    net(ssl.SSLCertVerificationError(1, "certificate verify failed"))
+    assert mk().call("m").not_sent

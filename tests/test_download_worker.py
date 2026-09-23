@@ -73,6 +73,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif parts[0] == "truncated":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b"t" * 40)   # 声明 100 字节只发 40 字节后关闭连接
+            self.wfile.flush()
         elif parts[0] == "biglen":
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
@@ -289,6 +296,12 @@ class TestSubprocess:
         assert rc == 0 and out["ok"] and out["nbytes"] == 17 and out["content_type"].startswith("application/octet")
         assert dest.read_bytes() == b"x" * 17
         assert server.seen == [("/ok/17", "Bearer xoxb-t")]
+
+    def test_truncated_body_is_transient_not_success(self, server, tmp_path):
+        """Codex 实现 review R1:正文短于 Content-Length 时 read() 返回 EOF,不能判成功。"""
+        dest = tmp_path / "a.bin"
+        rc, out, _ = run_worker(req(server.url + "/truncated", dest))
+        assert rc == 4 and not out["ok"] and out["error"] == "truncated:40/100" and not dest.exists()
 
     def test_no_content_length_streams(self, server, tmp_path):
         dest = tmp_path / "a.bin"
