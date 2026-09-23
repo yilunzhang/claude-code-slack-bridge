@@ -6,6 +6,7 @@
   /badsize       写 3 字节但报 nbytes=5 → rc 0(父进程应判不一致)
   /symlink       把 dest_tmp 做成符号链接后报 ok(父进程应拒绝)
   /hang          sleep 60(父进程 deadline 应 SIGTERM)
+  /slow/<sec>/<n> sleep sec 秒后写 n 字节 → rc 0(「慢但能完成」的附件)
   /nojson        rc 0 但不输出 JSON
 """
 import json
@@ -45,6 +46,14 @@ def main():
         return 0
     if parts[0] == "hang":
         time.sleep(60)
+        return 0
+    if parts[0] == "slow":
+        time.sleep(float(parts[1]))
+        n = int(parts[2]) if len(parts) > 2 else 4
+        with open(dest, "wb") as f:
+            f.write(b"x" * n)
+        print(json.dumps({"ok": True, "nbytes": n, "content_type": "application/octet-stream",
+                          "http_status": 200, "error": None}))
         return 0
     if parts[0] == "nojson":
         with open(dest, "wb") as f:

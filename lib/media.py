@@ -1,8 +1,10 @@
 """media 物化(contracts §5.3 / §6):Slack 附件按文件在子进程 `bin/download_worker.py` 下载到
 `.tmp-*` 目录;父进程持**绝对**截止时刻、映射退出码、**只有父进程**把 tmp 目录原子 rename 为正式目录。
 
-    materialize(client_tokens, media_root, binding_id, message_id, files, deadline_s=…) -> (paths, skipped)
-        瞬态失败 → None(调用方走 materializing 预算);确定性失败 → raise MediaError。
+    materialize(client_tokens, media_root, binding_id, message_id, files, deadline_s=…, heartbeat=None)
+        -> (paths, skipped);瞬态失败 → None(调用方走 materializing 预算);确定性失败 → raise MediaError。
+        `deadline_s` 是**整条消息**的共享绝对截止(R1-M6):所有文件合计不超过它,每个 worker 只拿剩余秒数;
+        每个文件下载结束后调用 `heartbeat()`(daemon 心跳),多附件不会把主循环拖过挂死阈值。
 
 零网络的本地判定(`file_plan` / `skip_reason`)供 inbound 复用(带下载 vs 纯文本预算分类、payload files[])。
 保留 feishu 版的安全检查:id 只作单层目录名、realpath 收容、symlink 一律拒绝、配额。
@@ -23,6 +25,7 @@ from .slackapi import DownloadResult
 WORKER_PATH = pathlib.Path(__file__).resolve().parents[1] / "bin" / "download_worker.py"
 TMP_PREFIX = ".tmp-"
 KILL_GRACE_S = 2.0                 # 父进程到期:SIGTERM → 2s → SIGKILL
+_monotonic = time.monotonic        # 截止时刻用的单调钟(测试可替换;不动全局 time 模块)
 NAME_MAX = 200
 TRANSIENT_RCS = (constants.WORKER_RC_TRANSIENT, constants.WORKER_RC_HTTP_RETRY,
                  constants.WORKER_RC_DEADLINE, constants.WORKER_RC_ORPHAN)
@@ -204,6 +207,16 @@ def _log(log, msg):
         pass
 
 
+def _beat(heartbeat):
+    """心跳是旁路:任何异常都不得影响物化结果。"""
+    if heartbeat is None:
+        return
+    try:
+        heartbeat()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 子进程下载
 def _parse_worker_line(out):
     try:
@@ -217,12 +230,12 @@ def _parse_worker_line(out):
         return None
 
 
-def _download_one(url, dest_tmp, token, max_bytes, deadline_s, worker_path=None, python=None,
+def _download_one(url, dest_tmp, token, max_bytes, deadline_at, worker_path=None, python=None,
                   log=None, allow_plain_http_hosts=None):
-    """一个文件一个 worker 子进程。父进程持绝对截止时刻;到期 SIGTERM → 2s → SIGKILL,视为瞬态。
+    """一个文件一个 worker 子进程。`deadline_at` = 调用方(materialize)持有的**绝对**截止时刻
+    (`_monotonic()` 秒,整条消息共享);到期 SIGTERM → 2s → SIGKILL,视为瞬态。
     → DownloadResult(ok / permanent / rc / path)。"""
-    deadline_at = time.monotonic() + float(deadline_s)   # 绝对截止(覆盖连接、响应头、正文)
-    remaining = deadline_at - time.monotonic()
+    remaining = float(deadline_at) - _monotonic()
     if remaining <= 0:
         return DownloadResult(ok=False, error="deadline_before_start", rc=None)
     req = {"url": url, "dest_tmp": str(dest_tmp), "token": token,
@@ -304,12 +317,16 @@ def is_unexpected_rc(rc):
 def materialize(client_tokens, media_root, binding_id, message_id, files,
                 deadline_s=constants.DOWNLOAD_DEADLINE_S, worker_path=None, log=None, clock=None,
                 max_bytes=None, quota_bytes=None, stats=None, python=None,
-                allow_plain_http_hosts=None):
+                allow_plain_http_hosts=None, heartbeat=None):
     """contracts §5.3。→ (paths, skipped);瞬态 → None;确定性 → MediaError。
     - skipped 元素 {"id","name","skipped_reason"},reason ∈ FILE_SKIP_REASONS。
     - dest 已存在(此前成功发布过)→ 幂等复用。
     - stats(可选 dict):worker_unexpected_exit 计数交给调用方落 daemon_state。
-    - clock 仅供调用方一致性注入;截止时刻用真实单调钟(子进程等待是真实时间)。"""
+    - clock 仅供调用方一致性注入;截止时刻用真实单调钟(子进程等待是真实时间)。
+    - deadline_s:**整条消息**的共享绝对截止(R1-M6)——进入下载循环时记 `deadline_at`,每个 worker
+      只拿剩余秒数;剩余 ≤ 0 → 瞬态 None(走预算),绝不让 N 个文件各占满一个 deadline。
+    - heartbeat(可选 callable):每个文件下载结束后调用一次(异常吞掉),让 daemon 在多附件消息
+      中间也能刷 last_loop_at(挂死阈值 ctl.HUNG_THRESHOLD_MS 只需覆盖单个文件的 deadline)。"""
     if max_bytes is None:
         max_bytes = constants.MEDIA_FILE_MAX_BYTES
     if quota_bytes is None:
@@ -340,11 +357,13 @@ def materialize(client_tokens, media_root, binding_id, message_id, files,
         tmp = dest.parent / ("%s%s-%s" % (TMP_PREFIX, message_id, uuid.uuid4().hex[:8]))
         tmp.mkdir()
         total = 0
+        deadline_at = _monotonic() + float(deadline_s)   # 整条消息共享的绝对截止(覆盖全部文件)
         for e in todo:
             dest_tmp = tmp / e["dest_name"]
-            r = _download_one(e["url"], dest_tmp, token, max_bytes, deadline_s,
+            r = _download_one(e["url"], dest_tmp, token, max_bytes, deadline_at,
                               worker_path=worker_path, python=python, log=log,
                               allow_plain_http_hosts=allow_plain_http_hosts)
+            _beat(heartbeat)   # 文件之间刷心跳(无论成败),多附件不会把主循环拖过挂死阈值
             if r.permanent:
                 raise MediaError("download rejected (%s): rc=%s %s" % (e["id"], r.rc, r.error))
             if not r.ok:

@@ -614,6 +614,29 @@ class TestMaterializeBudget:
         row = env.inbox_row(mid_of(ev))
         assert row["state"] == "materializing" and row["materialize_attempts"] == 1
 
+    def test_inbound_passes_heartbeat_into_materialize_between_files(self, env, tokens, monkeypatch):
+        """R1-M6:Inbound 把自己的心跳交给 media.materialize —— 两个附件之间必有一次心跳,
+        再加每条之后的一次(drive_materializing_rows)。"""
+        import subprocess as sp
+        from tests.test_media import FAKE_WORKER
+        env.make_binding(status="active")
+        env.inbound.worker_path = FAKE_WORKER
+        events = []
+        env.inbound.heartbeat = lambda: events.append("beat")
+        real = sp.Popen
+
+        class Rec(real):
+            def __init__(self, argv, **kw):
+                events.append("spawn")
+                super().__init__(argv, **kw)
+
+        monkeypatch.setattr(media.subprocess, "Popen", Rec)
+        files = [slack_file(id="F1", name="a.bin", size=1, url_private_download="https://files.slack.com/ok/1"),
+                 slack_file(id="F2", name="b.bin", size=2, url_private_download="https://files.slack.com/ok/2")]
+        receive(env, message_event(text=mention("two"), user=OWNER, files=files))
+        assert events == ["spawn", "beat", "spawn", "beat", "beat"]
+        assert env.conn.execute("SELECT state FROM inbox").fetchone()[0] == "enqueued"
+
     def test_real_media_with_fake_worker_via_inbound(self, env, tokens):
         """走真实 media.materialize + 假 worker 子进程(tokens 来自 tokens.json)。"""
         from tests.test_media import FAKE_WORKER

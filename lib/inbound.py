@@ -4,7 +4,8 @@
   drop 序 → INSERT inbox(received)→ IntegrityError 分支(同一行 / 双投升级 / dup_message)。
 - `Inbound.drive_pending_rows(budget)`:先零网络本地分流(received→resolving→决策;
   waiting_binding 激活/终止;不限量),再按预算做需要网络的物化(materializing;
-  每 tick ≤ budget[0] 条带下载、≤ budget[1] 条纯文本),每条之后 heartbeat。
+  每 tick ≤ budget[0] 条带下载、≤ budget[1] 条纯文本),每条之后 heartbeat;多附件消息在
+  **文件之间**也 heartbeat(media.materialize(heartbeat=…)),整条消息共享一个 DOWNLOAD_DEADLINE_S。
 - 附件预算(§5.2)四条路径(owner / allowlist / approved / waiting 激活后)统一在
   `materializing` 的四列上,持久化在库、重启不重置。
 决策与入队单事务内复验绑定 active(I3);投递判定零模型参与(I1)。"""
@@ -584,7 +585,7 @@ class Inbound:
                 client_tokens=tokens, media_root=self.media_root,
                 binding_id=row["binding_id"], message_id=mid, files=files,
                 deadline_s=constants.DOWNLOAD_DEADLINE_S, worker_path=self.worker_path,
-                log=self.log, clock=self.clock, stats=stats)
+                log=self.log, clock=self.clock, stats=stats, heartbeat=self._beat)
         except media.MediaError as e:
             self._log("materialize %s MediaError: %s" % (mid, e))
             self._materialize_terminal(row, reason, pending, "media_error")

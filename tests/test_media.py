@@ -1,6 +1,7 @@
 """media 物化(contracts §5.3 / §6 父进程侧):零网络本地判定(file_plan / skip_reason / describe_files)、
 子进程协议映射(假 worker:rc 0/2/3/4/5/124/125/异常 rc/结果不一致/符号链接/挂起)、
 只有父进程发布(tmp → 原子 rename)、幂等复用、路径安全(id/realpath/symlink)、配额。"""
+import json
 import os
 import pathlib
 import time
@@ -185,6 +186,70 @@ class TestMaterialize:
         assert time.monotonic() - t0 < 5
         assert any("parent deadline" in l for l in logs)
         assert tmp_leftovers(env) == []
+
+    def test_shared_deadline_across_files_clock_driven(self, env, monkeypatch):
+        """R1-M6:deadline_s 是**整条消息**的共享绝对截止。假单调钟每次 spawn 前进 80s:
+        3 个文件、deadline 90 → 第 1 个 worker 拿 90s,第 2 个只拿剩余 10s,第 3 个剩余 ≤ 0 → 不再 spawn、
+        瞬态 None(走预算)。旧实现每个文件各拿完整 90s(3 次 spawn、timeout 都是 90)。
+        心跳在每个文件之后都刷(含未 spawn 的第 3 个),两次 spawn 之间至少一次。"""
+        import subprocess as sp
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(media, "_monotonic", lambda: clock["t"])
+        events = []
+        real = sp.Popen
+
+        class Rec(real):
+            def __init__(self, argv, **kw):
+                clock["t"] += 80.0                    # 这个 worker「耗时」80s
+                events.append("spawn")
+                super().__init__(argv, **kw)
+
+            def communicate(self, input=None, timeout=None):
+                events.append(("timeout_s", round(json.loads(input)["timeout_s"], 3)))
+                return super().communicate(input=input, timeout=None)   # 真等假 worker(瞬间完成)
+
+        monkeypatch.setattr(media.subprocess, "Popen", Rec)
+        beats = []
+        logs = []
+        files = [f_ok(id="F1", name="a", n=1), f_ok(id="F2", name="b", n=1), f_ok(id="F3", name="c", n=1)]
+        res = mat(env, files, deadline_s=90, heartbeat=lambda: beats.append(len(events)), log=logs.append)
+        assert res is None                                            # 第 3 个文件超共享截止 → 瞬态
+        assert events.count("spawn") == 2                             # 第 3 个根本不 spawn
+        assert [e[1] for e in events if isinstance(e, tuple)] == [90.0, 10.0]   # 第 2 个只拿剩余
+        assert any("deadline_before_start" in l for l in logs)
+        assert len(beats) == 3 and beats[0] >= 2 and beats[1] >= 4      # 每个文件之后一次;两次 spawn 之间有心跳
+        assert not (env.media_root / BID / MID).exists() and tmp_leftovers(env) == []
+
+    def test_heartbeat_called_between_slow_files(self, env, monkeypatch):
+        """真慢 worker(每个 0.15s):事件序列必须是 spawn → beat → spawn → beat(文件之间刷心跳)。"""
+        import subprocess as sp
+        events = []
+        real = sp.Popen
+
+        class Rec(real):
+            def __init__(self, argv, **kw):
+                events.append("spawn")
+                super().__init__(argv, **kw)
+
+        monkeypatch.setattr(media.subprocess, "Popen", Rec)
+        files = [slack_file(id="S1", name="s1.bin", url_private_download="https://files.slack.com/slow/0.15/2"),
+                 slack_file(id="S2", name="s2.bin", url_private_download="https://files.slack.com/slow/0.15/3")]
+        paths, skipped = mat(env, files, deadline_s=10, heartbeat=lambda: events.append("beat"))
+        assert events == ["spawn", "beat", "spawn", "beat"]
+        assert [os.path.getsize(p) for p in paths] == [2, 3] and skipped == []
+
+    def test_heartbeat_exception_does_not_break_materialize(self, env):
+        def boom():
+            raise RuntimeError("heartbeat exploded")
+        paths, skipped = mat(env, [f_ok()], heartbeat=boom)
+        assert len(paths) == 1
+
+    def test_hung_threshold_covers_shared_deadline(self):
+        """ctl.HUNG_THRESHOLD_MS 必须 > 整条消息的共享 deadline + SIGTERM→SIGKILL 宽限 + 余量:
+        文件之间已刷心跳,两次心跳之间最长只有一个文件的 deadline。"""
+        from lib import ctl
+        worst_gap_ms = (constants.DOWNLOAD_DEADLINE_S + media.KILL_GRACE_S) * 1000
+        assert ctl.HUNG_THRESHOLD_MS >= worst_gap_ms + 30_000
 
     def test_no_token_is_transient(self, env):
         assert media.materialize({}, env.media_root, BID, MID, [f_ok()], worker_path=FAKE_WORKER) is None

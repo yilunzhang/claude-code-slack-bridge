@@ -511,8 +511,10 @@ def daemon_lock_held():
 
 # daemon 挂死恢复:锁被持有但心跳陈旧(>HUNG_THRESHOLD)= 挂死 → 按记录的 (daemon_pid, daemon_proc_start)
 # 精确匹配后 SIGTERM → 等退出 → 接管重启;身份不匹配(pid 复用/无记录)绝不杀随机进程 → failed。
-# 阈值必须 ≥ 单次**最长同步网络操作** + 余量:daemon 单线程,一次附件下载(子进程,父进程 proc.wait
-# 到 DOWNLOAD_DEADLINE_S=90s 绝对截止)期间主循环阻塞、不刷心跳 → 90s + 60s = 150s。
+# 阈值必须 ≥ 单次**最长同步网络操作** + 余量:daemon 单线程,一次附件物化期间主循环阻塞;
+# media.materialize 让整条消息的所有附件共享一个 DOWNLOAD_DEADLINE_S=90s 绝对截止,且文件之间刷心跳
+# (R1-M6),所以两次心跳之间最长 = 90s + SIGTERM→SIGKILL 宽限 2s;取 90s + 60s = 150s。
+# 守卫:tests/test_media.py::test_hung_threshold_covers_shared_deadline。
 HUNG_THRESHOLD_MS = (constants.DOWNLOAD_DEADLINE_S + 60) * 1000
 _POLL_STEP_S = 0.3
 

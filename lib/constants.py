@@ -38,7 +38,7 @@ INBOX_NONTERMINAL_CAP = 500      # 非终态 inbox 总量配额(非 owner 消息
 # media
 MEDIA_MSG_QUOTA_BYTES = 100 * 1024 * 1024   # 单 message 物化配额(全部文件之和)
 MEDIA_FILE_MAX_BYTES = MEDIA_MSG_QUOTA_BYTES  # download_worker `max_bytes` 缺省
-DOWNLOAD_DEADLINE_S = 90         # 单文件下载**绝对**截止(父进程持有;worker 收到的是剩余秒数)
+DOWNLOAD_DEADLINE_S = 90         # **整条消息**物化的绝对截止(所有附件共享;父进程持有;每个 worker 只拿剩余秒数)
 MEDIA_RETRY_DEADLINE_MS = 10 * 60 * 1000     # materializing 预算:首次实际尝试起 10 分钟
 MEDIA_RETRY_BACKOFF_MS = 10_000              # 瞬态失败退避基数(min(10s·2^n, 5min))
 MEDIA_RETRY_BACKOFF_MAX_MS = 5 * 60 * 1000
