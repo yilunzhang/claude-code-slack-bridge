@@ -1,173 +1,232 @@
-"""media 物化:临时目录+原子 rename / 防符号链接 / 配额 / 幂等复用 / 写失败 fail-closed。"""
+"""media 物化(contracts §5.3 / §6 父进程侧):零网络本地判定(file_plan / skip_reason / describe_files)、
+子进程协议映射(假 worker:rc 0/2/3/4/5/124/125/异常 rc/结果不一致/符号链接/挂起)、
+只有父进程发布(tmp → 原子 rename)、幂等复用、路径安全(id/realpath/symlink)、配额。"""
 import os
 import pathlib
+import time
 
 import pytest
 
-from tests.conftest import CHAT, OWNER
-from tests.helpers import mget_snapshot, ok_envelope, err_envelope
-from lib import media
+from lib import constants, media
 from lib.media import MediaError
+from tests.conftest import CHAT
+from tests.helpers import slack_file
 
-
+FAKE_WORKER = str(pathlib.Path(__file__).resolve().parent / "fake_worker.py")
 BID = "bind-1"
-MID = "om_m"
+MID = "%s:1700000000.000100" % CHAT
+TOKENS = {"bot_token": "xoxb-test"}
 
 
-def dl_responder(env, files, snap=None):
-    snap = snap or mget_snapshot(MID, CHAT, OWNER, msg_type="file")
-
-    def fn(args, cwd):
-        d = pathlib.Path(cwd) / "lark-im-resources"
-        d.mkdir(parents=True, exist_ok=True)
-        for name, data in files.items():
-            p = d / name
-            if data is None:  # 符号链接注入
-                os.symlink("/etc/hosts", p)
-            else:
-                p.write_bytes(data)
-        return ok_envelope({"messages": [snap]})
-
-    env.runner.on(lambda a: "--download-resources" in a, fn)
+def f_ok(id="F1", name="a.pdf", n=4, **kw):
+    return slack_file(id=id, name=name, url_private_download="https://files.slack.com/ok/%d" % n, **kw)
 
 
-def test_materialize_success_atomic(env):
-    dl_responder(env, {"a.pdf": b"x" * 10, "b.txt": b"y"})
-    paths = media.materialize(env.runner, env.media_root, BID, MID)
-    assert paths is not None and len(paths) == 2
-    for p in paths:
-        assert os.path.isabs(p) and os.path.exists(p)
-        assert str(env.media_root / BID / MID) in p
-    # 无临时目录残留
-    leftovers = [x for x in os.listdir(env.media_root / BID) if x.startswith(".tmp")]
-    assert leftovers == []
+def f_rc(code, id="F2", name="b.bin"):
+    return slack_file(id=id, name=name, url_private_download="https://files.slack.com/rc/%d" % code)
 
 
-def test_materialize_idempotent_reuse(env):
-    dl_responder(env, {"a.pdf": b"x"})
-    p1 = media.materialize(env.runner, env.media_root, BID, MID)
-    calls_before = len(env.runner.calls)
-    p2 = media.materialize(env.runner, env.media_root, BID, MID)
-    assert p1 == p2
-    assert len(env.runner.calls) == calls_before  # 复用,不再下载
+def mat(env, files, **kw):
+    kw.setdefault("worker_path", FAKE_WORKER)
+    kw.setdefault("binding_id", BID)
+    kw.setdefault("message_id", MID)
+    return media.materialize(TOKENS, env.media_root, kw.pop("binding_id"), kw.pop("message_id"),
+                             files, **kw)
 
 
-def test_symlink_rejected(env):
-    dl_responder(env, {"evil": None})
-    with pytest.raises(MediaError):
-        media.materialize(env.runner, env.media_root, BID, MID)
-    assert not (env.media_root / BID / MID).exists()
+def tmp_leftovers(env, bid=BID):
+    d = env.media_root / bid
+    return [x for x in os.listdir(d) if x.startswith(".tmp")] if d.exists() else []
 
 
-def test_quota_exceeded(env):
-    dl_responder(env, {"big.bin": b"z" * 1000})
-    with pytest.raises(MediaError):
-        media.materialize(env.runner, env.media_root, BID, MID, quota_bytes=100)
-    assert not (env.media_root / BID / MID).exists()
+# ---------------------------------------------------------------- 零网络本地判定
+class TestFilePlan:
+    def test_skip_reasons_matrix(self):
+        assert media.skip_reason(slack_file(mode="tombstone")) == "tombstone"
+        assert media.skip_reason(slack_file(hidden_by_limit=True)) == "hidden_by_limit"
+        assert media.skip_reason(dict(slack_file(), file_access="check_file_info")) == "check_file_info"
+        nourl = slack_file()
+        nourl.pop("url_private")
+        nourl.pop("url_private_download")
+        assert media.skip_reason(nourl) == "no_url"
+        assert media.skip_reason(slack_file(size=constants.MEDIA_FILE_MAX_BYTES + 1)) == "too_large"
+        assert media.skip_reason(slack_file()) is None
+        assert media.skip_reason("garbage") == "no_url"
+        for r in ("tombstone", "hidden_by_limit", "check_file_info", "no_url", "too_large"):
+            assert r in constants.FILE_SKIP_REASONS
+
+    def test_plan_quota_and_names(self):
+        big = constants.MEDIA_MSG_QUOTA_BYTES // 2 + 1
+        files = [slack_file(id="A", name="x.bin", size=big), slack_file(id="B", name="x.bin", size=big),
+                 slack_file(id="C", name="../evil", size=1), slack_file(id="D", name=".hidden", size=1),
+                 slack_file(id="E", name="", size=1)]
+        plan = media.file_plan(files)
+        by = {e["id"]: e for e in plan}
+        assert by["A"]["skip"] is None and by["B"]["skip"] == "too_large"   # 累计超配额
+        for k in ("C", "D"):   # 拍平:无分隔符、不以点开头(与 .tmp 约定冲突)
+            assert "/" not in by[k]["dest_name"] and not by[k]["dest_name"].startswith(".")
+        assert by["D"]["dest_name"] == "hidden"
+        assert by["E"]["dest_name"] == "file4"
+        assert media.needs_download(files) is True
+        assert media.needs_download([slack_file(mode="tombstone")]) is False
+        assert media.needs_download([]) is False
+
+    def test_dedupe_names(self):
+        plan = media.file_plan([slack_file(id="A", name="a.pdf"), slack_file(id="B", name="a.pdf")])
+        assert [e["dest_name"] for e in plan] == ["a.pdf", "1-a.pdf"]
+
+    def test_describe_files_maps_paths_and_skips(self, env):
+        files = [slack_file(id="A", name="a.pdf", size=10), slack_file(id="B", name="z.zip", mode="tombstone")]
+        out = media.describe_files(files, ["/x/y/a.pdf"])
+        assert out[0] == {"id": "A", "name": "a.pdf", "mimetype": "application/pdf", "size": 10,
+                          "local_path": "/x/y/a.pdf"}
+        assert out[1]["skipped_reason"] == "tombstone" and "local_path" not in out[1]
+        # 找不到对应路径(不应发生)→ 保守记 skipped
+        assert media.describe_files(files, [])[0]["skipped_reason"] == "no_url"
 
 
-def test_transient_download_failure_returns_none(env):
-    env.runner.on(lambda a: "--download-resources" in a, lambda a, c: err_envelope(500))
-    assert media.materialize(env.runner, env.media_root, BID, MID) is None
+# ---------------------------------------------------------------- 子进程协议映射
+class TestMaterialize:
+    def test_success_publishes_atomically_only_parent(self, env):
+        paths, skipped = mat(env, [f_ok(n=4), f_ok(id="F2", name="b.txt", n=1),
+                                   slack_file(id="F3", name="gone", mode="tombstone")])
+        assert [os.path.basename(p) for p in paths] == ["a.pdf", "b.txt"]
+        for p in paths:
+            assert os.path.isabs(p) and os.path.isfile(p) and not os.path.islink(p)
+            assert str(env.media_root / BID / MID) + os.sep in p
+        assert os.path.getsize(paths[0]) == 4
+        assert skipped == [{"id": "F3", "name": "gone", "skipped_reason": "tombstone"}]
+        assert tmp_leftovers(env) == []                       # 无 .tmp 残留
 
+    def test_empty_or_all_skipped_needs_no_worker(self, env):
+        assert mat(env, []) == ([], [])
+        paths, skipped = mat(env, [slack_file(id="H", hidden_by_limit=True)], worker_path="/nonexistent")
+        assert paths == [] and skipped[0]["skipped_reason"] == "hidden_by_limit"
+        assert not (env.media_root / BID).exists()
 
-def test_write_failure_fail_closed(env, monkeypatch):
-    """ENOSPC 模拟:rename 失败 → MediaError,无半成品 dest。"""
-    dl_responder(env, {"a.pdf": b"x"})
-    real_replace = os.replace
+    def test_idempotent_reuse_no_new_download(self, env):
+        p1 = mat(env, [f_ok()])
+        p2 = mat(env, [f_ok()], worker_path="/nonexistent-would-fail")
+        assert p1 == p2
 
-    def boom(src, dst):
-        raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(os, "replace", boom)
-    monkeypatch.setattr(os, "rename", boom)
-    with pytest.raises(MediaError):
-        media.materialize(env.runner, env.media_root, BID, MID)
-    monkeypatch.setattr(os, "replace", real_replace)
-    assert not (env.media_root / BID / MID).exists()
-
-
-def test_path_traversal_names_sanitized(env):
-    dl_responder(env, {"a.pdf": b"x"})
-
-    # 注入带路径分隔符的文件名(下载器不会这么干,纵深防御)
-    def fn(args, cwd):
-        d = pathlib.Path(cwd) / "lark-im-resources" / "sub"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "deep.txt").write_bytes(b"k")
-        return ok_envelope({"messages": []})
-
-    env.runner.responders.insert(0, (lambda a: "--download-resources" in a, fn))
-    paths = media.materialize(env.runner, env.media_root, BID, "om_m2")
-    assert paths is not None
-    for p in paths:
-        assert pathlib.Path(p).parent == env.media_root / BID / "om_m2"  # 拍平,无穿越
-
-
-def test_dot_segment_ids_rejected(env):
-    for bad in (".", "..", ".hidden"):
+    @pytest.mark.parametrize("code", [2, 3])
+    def test_permanent_rc_raises_media_error(self, env, code):
         with pytest.raises(MediaError):
-            media.materialize(env.runner, env.media_root, bad, "om_x")
+            mat(env, [f_rc(code)])
+        assert not (env.media_root / BID / MID).exists() and tmp_leftovers(env) == []
+
+    @pytest.mark.parametrize("code", [4, 5, 124, 125])
+    def test_transient_rc_returns_none(self, env, code):
+        stats = {}
+        assert mat(env, [f_ok(), f_rc(code)], stats=stats) is None
+        assert stats == {}                                    # §6 列内退出码不计 unexpected
+        assert not (env.media_root / BID / MID).exists() and tmp_leftovers(env) == []
+
+    def test_unexpected_rc_counts(self, env):
+        stats = {}
+        assert mat(env, [f_rc(7)], stats=stats) is None
+        assert stats == {"worker_unexpected_exit": 1}
+
+    def test_inconsistent_size_is_transient_not_published(self, env):
+        stats = {}
+        f = slack_file(id="S", name="s.bin", url_private_download="https://files.slack.com/badsize")
+        assert mat(env, [f], stats=stats) is None
+        assert stats.get("worker_unexpected_exit") == 1
+        assert not (env.media_root / BID / MID).exists()
+
+    def test_rc0_without_json_is_transient(self, env):
+        f = slack_file(id="N", name="n.bin", url_private_download="https://files.slack.com/nojson")
+        assert mat(env, [f]) is None
+
+    def test_worker_symlink_rejected(self, env):
+        f = slack_file(id="L", name="l.bin", url_private_download="https://files.slack.com/symlink")
+        assert mat(env, [f]) is None                          # 不是普通文件 → 结果不一致 → 不发布
+        assert not (env.media_root / BID / MID).exists()
+
+    def test_parent_deadline_kills_hung_worker(self, env):
+        f = slack_file(id="H", name="h.bin", url_private_download="https://files.slack.com/hang")
+        logs = []
+        t0 = time.monotonic()
+        assert mat(env, [f], deadline_s=0.5, log=logs.append) is None
+        assert time.monotonic() - t0 < 5
+        assert any("parent deadline" in l for l in logs)
+        assert tmp_leftovers(env) == []
+
+    def test_no_token_is_transient(self, env):
+        assert media.materialize({}, env.media_root, BID, MID, [f_ok()], worker_path=FAKE_WORKER) is None
+        assert media.materialize(None, env.media_root, BID, MID, [f_ok()], worker_path=FAKE_WORKER) is None
+
+    def test_quota_exceeded_after_download(self, env):
         with pytest.raises(MediaError):
-            media.materialize(env.runner, env.media_root, "bind-ok", bad)
-    assert env.runner.calls == []  # 拒绝发生在任何下载之前
+            mat(env, [f_ok(n=1000, size=10)], quota_bytes=100)
+        assert not (env.media_root / BID / MID).exists() and tmp_leftovers(env) == []
+
+    def test_spawn_failure_is_transient(self, env):
+        assert mat(env, [f_ok()], python="/nonexistent/python") is None
+
+    def test_token_passed_via_stdin_not_argv(self, env, monkeypatch):
+        import subprocess as sp
+        seen = {}
+        real = sp.Popen
+
+        class Rec(real):
+            def __init__(self, argv, **kw):
+                seen["argv"] = list(argv)
+                super().__init__(argv, **kw)
+
+            def communicate(self, input=None, timeout=None):
+                seen["stdin"] = input
+                return super().communicate(input=input, timeout=timeout)
+
+        monkeypatch.setattr(media.subprocess, "Popen", Rec)
+        mat(env, [f_ok()])
+        assert "xoxb-test" not in " ".join(seen["argv"])
+        assert b"xoxb-test" in seen["stdin"]
 
 
-def test_realpath_escape_via_symlinked_binding_dir(env, tmp_path):
-    outside = tmp_path / "outside-victim"
-    outside.mkdir()
-    (env.media_root).mkdir(parents=True, exist_ok=True)
-    os.symlink(outside, env.media_root / "bind-link")
-    with pytest.raises(MediaError):
-        media.materialize(env.runner, env.media_root, "bind-link", "om_x")
-    assert env.runner.calls == []
+# ---------------------------------------------------------------- 路径安全(继承)
+class TestPathSafety:
+    def test_dot_segment_ids_rejected(self, env):
+        for bad in (".", "..", ".hidden", "a/b"):
+            with pytest.raises(MediaError):
+                media.materialize(TOKENS, env.media_root, bad, MID, [f_ok()], worker_path=FAKE_WORKER)
+            with pytest.raises(MediaError):
+                media.materialize(TOKENS, env.media_root, "bind-ok", bad, [f_ok()], worker_path=FAKE_WORKER)
 
+    def test_realpath_escape_via_symlinked_binding_dir(self, env, tmp_path):
+        outside = tmp_path / "outside-victim"
+        outside.mkdir()
+        env.media_root.mkdir(parents=True, exist_ok=True)
+        os.symlink(outside, env.media_root / "bind-link")
+        with pytest.raises(MediaError):
+            media.materialize(TOKENS, env.media_root, "bind-link", MID, [f_ok()], worker_path=FAKE_WORKER)
+        assert os.listdir(outside) == []
 
-def test_symlinked_dest_inside_root_rejected(env):
-    """r2-m3:dest 已存在但是 symlink(即使指向 root 内)→ 拒绝复用。"""
-    real = env.media_root / "bind-real" / "om_real"
-    real.mkdir(parents=True)
-    (real / "f.bin").write_bytes(b"x")
-    linkdir = env.media_root / "bind-a"
-    linkdir.mkdir(parents=True)
-    os.symlink(real, linkdir / "om_link")
-    with pytest.raises(MediaError):
-        media.materialize(env.runner, env.media_root, "bind-a", "om_link")
-    assert env.runner.calls == []  # 任何下载之前拒绝
+    def test_symlinked_dest_inside_root_rejected(self, env):
+        real = env.media_root / "bind-real" / "m_real"
+        real.mkdir(parents=True)
+        (real / "f.bin").write_bytes(b"x")
+        linkdir = env.media_root / "bind-a"
+        linkdir.mkdir(parents=True)
+        os.symlink(real, linkdir / "m_link")
+        with pytest.raises(MediaError):
+            media.materialize(TOKENS, env.media_root, "bind-a", "m_link", [f_ok()], worker_path=FAKE_WORKER)
 
+    def test_symlinked_parent_inside_root_rejected(self, env):
+        other = env.media_root / "bind-b"
+        other.mkdir(parents=True)
+        os.symlink(other, env.media_root / "bind-linked")
+        with pytest.raises(MediaError):
+            media.materialize(TOKENS, env.media_root, "bind-linked", MID, [f_ok()], worker_path=FAKE_WORKER)
 
-def test_symlinked_parent_inside_root_rejected(env):
-    """r2-m3:binding 目录本身是 symlink(指向 root 内他处)→ 拒绝(mkdir 后 lstat 校验)。"""
-    other = env.media_root / "bind-b"
-    other.mkdir(parents=True)
-    os.symlink(other, env.media_root / "bind-linked")
-    with pytest.raises(MediaError):
-        media.materialize(env.runner, env.media_root, "bind-linked", "om_x")
-    assert env.runner.calls == []
+    def test_write_failure_fail_closed(self, env, monkeypatch):
+        real_rename = os.rename
 
+        def boom(src, dst):
+            raise OSError(28, "No space left on device")
 
-def test_materialize_transient_failure_logged(env):
-    """r3-6:下载瞬态失败留原始现场。"""
-    env.runner.on(lambda a: "--download-resources" in a, lambda a, c: err_envelope(500))
-    logs = []
-    assert media.materialize(env.runner, env.media_root, "bind-log", "om_log",
-                             log=logs.append) is None
-    joined = "\n".join(logs)
-    assert "download" in joined and "rc=1" in joined
-
-
-def test_no_resources_downloaded_logged(env):
-    """r4-4:下载 ok:true 但没有资源文件 → MediaError 前记原因。"""
-    from tests.helpers import ok_envelope
-    logs = []
-
-    def empty_dl(args, cwd):
-        import pathlib as _pl
-        (_pl.Path(cwd) / "lark-im-resources").mkdir(parents=True, exist_ok=True)
-        return ok_envelope({"messages": []})
-
-    env.runner.on(lambda a: "--download-resources" in a, empty_dl)
-    with pytest.raises(MediaError):
-        media.materialize(env.runner, env.media_root, "bind-x", "om_empty", log=logs.append)
-    joined = "\n".join(logs)
-    assert "om_empty" in joined and "no resource" in joined
+        monkeypatch.setattr(media.os, "rename", boom)
+        with pytest.raises(MediaError):
+            mat(env, [f_ok()])
+        monkeypatch.setattr(media.os, "rename", real_rename)
+        assert not (env.media_root / BID / MID).exists() and tmp_leftovers(env) == []
