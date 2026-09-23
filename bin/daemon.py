@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
-"""bridge daemon:flock 单例;真实依赖装配;单线程事件循环(I2:唯一发送进程)。"""
+"""bridge daemon:flock 单例;真实依赖装配;单线程事件循环(I2:唯一发送进程)。
+
+装配(contracts §7 / §8 / §9):
+- `ConfigSnapshot` 唯一共享对象,每循环 `refresh()` 原地更新;
+- **唯一** `SlackClient(tokens_path=…, cooldown_store=DaemonStateCooldownStore(conn))`,gate 与出站共用
+  (`_prepare` 校验的凭据快照 = `_transmit` 实际使用的快照);
+- `FingerprintGate(conn, cfg, client, clock, notifier=…)`;
+- consumer argv `[cfg.consumer_python or sys.executable, <root>/bin/slack_consumer.py]`;
+  xapp(app_token)变化 → SIGTERM consumer,ConsumerManager 立即重拉(consumer 自读文件)。"""
 import fcntl
+import hashlib
 import os
 import pathlib
 import signal
@@ -15,77 +24,119 @@ from lib.clock import SystemClock  # noqa: E402
 from lib.daemon_core import (ConsumerManager, DaemonCore, make_status_writer,  # noqa: E402
                              mark_consumers_down, record_daemon_identity,
                              set_startup_state)
+from lib.fingerprint import FingerprintGate  # noqa: E402
 from lib.inbound import Inbound  # noqa: E402
 from lib.outbound import Outbound  # noqa: E402
 from lib.recovery import Recovery  # noqa: E402
-from lib.fingerprint import FingerprintGate  # noqa: E402
-from lib.runner import LarkRunner  # noqa: E402
+from lib.slackapi import DaemonStateCooldownStore, SlackClient  # noqa: E402
 
 
 def log_line(msg):
     import datetime
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        util.append_log_line(paths.daemon_log_path(), f"{ts} {msg}")
+        util.append_log_line(paths.daemon_log_path(), "%s %s" % (ts, msg))
     except OSError:
         pass
 
 
+class AppTokenWatch:
+    """每循环 stat tokens.json(廉价);mtime 变化才重读文件,比对 app_token 的摘要 —— 只有 xapp 真变了
+    才让 consumer 重拉(bot_token 变化由 FingerprintGate/SlackClient 处理,与 consumer 无关)。
+    token 本身不保存,只留 sha256。"""
+
+    def __init__(self, tokens_path):
+        self.tokens_path = tokens_path
+        self.mtime_ns = configmod.tokens_mtime_ns(tokens_path)
+        self.app_digest = self._digest()
+
+    def _digest(self):
+        try:
+            tokens, _ver = configmod.load_tokens(self.tokens_path, allow_env=False)
+        except configmod.ConfigError:
+            return None
+        app = tokens.get("app_token") or ""
+        return hashlib.sha256(app.encode("utf-8")).hexdigest() if app else None
+
+    def app_token_changed(self):
+        m = configmod.tokens_mtime_ns(self.tokens_path)
+        if m == self.mtime_ns:
+            return False
+        self.mtime_ns = m
+        d = self._digest()
+        if d is None:
+            return False  # 文件缺失/畸形:consumer 下次自读会以 rc 2 退出,不在此裁决
+        if d == self.app_digest:
+            return False
+        self.app_digest = d
+        return True
+
+
+def build_consumer_argv(cfg, root):
+    return [cfg.get("consumer_python") or sys.executable, str(root / "bin" / "slack_consumer.py")]
+
+
 def main():
     paths.ensure_data_dir()
-    # flock 单例(F7):锁被持有 → 已有 daemon → 静默退出
+    # flock 单例:锁被持有 → 已有 daemon → 静默退出
     lock_fd = os.open(str(paths.lock_path()), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return 0
     try:
-        cfg = configmod.require_config()
+        cfg = configmod.ConfigSnapshot.load()
     except configmod.ConfigError as e:
-        log_line(f"refuse start: {e}")
+        log_line("refuse start: %s" % e)
         return 2
     clock = SystemClock()
     conn = db.connect(paths.db_path(), busy_timeout_ms=constants.BUSY_TIMEOUT_DAEMON_MS)
     db.init_schema(conn, paths.schema_path())
     prober = procs.SystemProber()
-    # r3-5/r4-1:拿锁+身份落库后**立即**写首次心跳 + startup_state=probing:<gen>(gate 前)。
-    # heartbeat 只表"活着";startup_state 才表"就绪"——ensure/daemon_healthy 以后者判就绪,
-    # 消除"首心跳被当启动完成"的 bind 假成功窗(daemon 可能因 mismatch 随后退出)。
-    # MAJOR 3:发布本 daemon 跑的**代码身份**(pkg_root|version),供 CLI bind 前比对,
-    # 检测「plugin 更新/迁移后复用跑旧代码的旧 daemon」。
+    # 拿锁+身份落库后**立即**写首次心跳 + startup_state=probing:<gen>(gate 前)。
     generation = record_daemon_identity(
         conn, clock, prober, code_identity=version.code_identity_str())
-    runner = LarkRunner(cfg["profile"])
-    # 修复项1:指纹/版本门 fail-closed(缺字段≠ok;unknown/版本不符 → 出站停摆+退避重探)
-    gate = FingerprintGate(conn, cfg, runner, clock)
+    try:
+        # 唯一 SlackClient:文件是真相(allow_env=False);冷却存储 = daemon_state(与 notify/probe 共用)
+        client = SlackClient(tokens_path=paths.tokens_path(),
+                             cooldown_store=DaemonStateCooldownStore(conn), clock=clock)
+    except configmod.ConfigError as e:
+        set_startup_state(conn, "refused", generation)
+        log_line("refuse start: tokens: %s" % e)
+        db.set_state(conn, "last_error", "tokens.json unusable — daemon refused to start")
+        return 2
+    # 指纹/凭据门 fail-closed(缺字段≠ok;unknown/版本不符 → 出站停摆+退避重探)
+    gate = FingerprintGate(conn, cfg, client, clock, notifier=None)
     state = gate.startup()
     if state == "mismatch":
-        set_startup_state(conn, "refused", generation)  # r4-1:refused 不算就绪
-        log_line("refuse start: identity fingerprint mismatch (profile/app_id/owner)")
+        set_startup_state(conn, "refused", generation)  # refused 不算就绪
+        log_line("refuse start: identity fingerprint mismatch (team/bot/app)")
         db.set_state(conn, "last_error", "fingerprint mismatch — daemon refused to start")
         return 3
     if state == "degraded":
         set_startup_state(conn, "degraded", generation)  # 就绪(出站停摆但 daemon 正常运行)
-        log_line(f"degraded start: outbound gated "
-                 f"({db.get_state(conn, 'outbound_gate')}); 入站照常入库,带退避重探")
+        log_line("degraded start: outbound gated (%s); 入站照常入库,带退避重探"
+                 % db.get_state(conn, constants.GATE_KEY))
     else:
-        set_startup_state(conn, "running", generation)  # r4-1:就绪
+        set_startup_state(conn, "running", generation)  # 就绪
 
     def heartbeat():
-        # r2-M1②:多点心跳 —— 含网络条目处理完即 touch,长下载不会被误判挂死
+        # 多点心跳:含网络条目处理完即 touch,长下载不会被误判挂死
         db.set_state(conn, "last_loop_at", clock.wall_ms())
 
-    inbound = Inbound(conn, cfg, runner, clock, paths.media_root(),
+    inbound = Inbound(conn, cfg, client, clock, paths.media_root(),
                       heartbeat=heartbeat, log=log_line)
-    outbound = Outbound(conn, cfg, runner, clock, heartbeat=heartbeat, log=log_line)
+    outbound = Outbound(conn, cfg, client, clock, heartbeat=heartbeat, log=log_line)
     approval = Approval(conn, cfg, clock, inbound=inbound)
-    recovery = Recovery(conn, cfg, runner, clock, inbound, prober)
+    recovery = Recovery(conn, cfg, client, clock, inbound, prober)
     core = DaemonCore(conn, cfg, clock, inbound, approval, outbound, recovery,
-                      log=log_line, gate=gate)  # r2-M2:gate.tick 在 loop 内先于出站
+                      log=log_line, gate=gate)  # gate.tick 在 loop 内先于出站
 
-    on_status = make_status_writer(conn, log_line)  # r2-m2:ready 置位/清除同步 daemon_state
-    mgr = ConsumerManager(cfg["profile"], clock,
-                          on_line=core.route_line, on_status=on_status)
+    root = paths.pkg_root()
+    on_status = make_status_writer(conn, log_line)  # ready 置位/清除同步 daemon_state
+    mgr = ConsumerManager(clock, on_line=core.on_consumer_line, on_status=on_status,
+                          argv_builder=lambda key: build_consumer_argv(cfg, root))
+    app_watch = AppTokenWatch(paths.tokens_path())
 
     stop = {"flag": False}
 
@@ -99,29 +150,32 @@ def main():
     outbound.startup_scan()
     recovery.slow_tick()
     mgr.start_all()
-    log_line(f"daemon started pid={os.getpid()} profile={cfg['profile']}")
+    log_line("daemon started pid=%d team=%s tokens_version=%s"
+             % (os.getpid(), cfg.get("team_id"), client.tokens_version))
     try:
         while True:
             mgr.poll(1.0)
-            # r7-2:退出检查提到 loop_iteration/刷心跳**之前** —— 收到 SIGTERM 后不再刷新鲜心跳,
-            # 让 supervisor 更快看到该 daemon 停摆(缩窗;非根治冷启动竞态)。
+            # 退出检查提到 loop_iteration/刷心跳**之前**:收到 SIGTERM 后不再刷新鲜心跳
             if stop["flag"]:
                 break
-            core.loop_iteration()  # 内含刷心跳 + gate.tick(先于出站)
+            cfg.refresh()  # 配置原地更新(所有组件持同一引用)
+            core.loop_iteration()  # 内含刷心跳 + drain + followup + gate.tick(先于出站)
+            if app_watch.app_token_changed():
+                log_line("app_token changed → restarting consumer")
+                mgr.restart(constants.SOCKET_KEY, "app_token_changed")
             mgr.tick()
     finally:
-        # r7-2:安全点标记 stopping(finally 首步,mgr.shutdown 前)—— supervisor 由此可观测到
-        # "daemon 正在退出",且 state_ready 天然排除 stopping(缩窗+可观测,**非根治**冷启动竞态)。
+        # 安全点标记 stopping(finally 首步,mgr.shutdown 前)—— supervisor 由此可观测到"正在退出"
         try:
             set_startup_state(conn, "stopping", generation)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
         log_line("daemon shutting down")
         mgr.shutdown()
-        mark_consumers_down(conn, list(mgr.consumers.keys()))  # r3-3:正常退出清 ready
+        mark_consumers_down(conn, list(mgr.consumers.keys()))  # 正常退出清 ready
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
         conn.close()
         os.close(lock_fd)
