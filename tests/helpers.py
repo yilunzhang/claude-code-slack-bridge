@@ -155,9 +155,9 @@ class FakeSlackClient:
         if until is not None and until > now:
             self.waits.append((method, until))
             return wait(until)
-        self.calls.append((method, params))
         for m, fn in self.responders:
             if m == method or m == "*":
+                self.calls.append((method, params))  # 只记录真正"发出"的调用;未注册的不记(直接 raise)
                 res = fn(method, params) if callable(fn) else fn
                 if not isinstance(res, CallResult):
                     raise AssertionError(
