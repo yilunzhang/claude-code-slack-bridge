@@ -1,8 +1,16 @@
-"""unbind 级联 + 线性化语义(plan 4.5/4.6):
-提交前已 pending→sending 的 job 允许其后可见(≤1 在途),此后零新增。"""
+"""unbind 级联 + 线性化语义:
+提交前已 pending→sending 的 job 允许其后可见(≤1 在途,如实声明),此后零新增外发。"""
+import json
+
+from lib import jobs, lifecycle, texts
 from tests.conftest import CHAT
-from tests.helpers import ok_envelope
-from lib import db as dbmod, jobs, lifecycle
+from tests.helpers import posted
+
+PM = "chat.postMessage"
+
+
+def _row(env, key):
+    return env.conn.execute("SELECT * FROM outbound_jobs WHERE idempotency_key=?", (key,)).fetchone()
 
 
 def test_inflight_sending_survives_unbind_then_completes(env):
@@ -10,46 +18,38 @@ def test_inflight_sending_survives_unbind_then_completes(env):
     jobs.create_job(env.conn, kind="session_turn", chat_id=CHAT, binding_id=bid,
                     idempotency_key="turn:g:0", turn_group="g", chunk_index=0,
                     body="hello", now=env.clock.wall_ms())
-    # 模拟:daemon 已把该 job CAS 到 sending(线性化点已过),网络发送尚未返回
-    assert dbmod.cas(env.conn,
-                     "UPDATE outbound_jobs SET state='sending', attempt_count=1, sending_at=? "
-                     "WHERE idempotency_key='turn:g:0' AND state='pending'",
-                     (env.clock.wall_ms(),))
+    # daemon 已把该 job CAS 到 sending(线性化点已过,op_* 已冻结),网络发送尚未返回
+    assert env.outbound._prepare(_row(env, "turn:g:0")) == "send"
+    r = _row(env, "turn:g:0")
+    assert r["state"] == "sending" and r["op_method"] == PM
     # 并发 unbind(bridgectl 进程):立即生效
     assert lifecycle.terminate_binding(env.conn, bid, "user_unbind", env.clock)
-    row = env.conn.execute(
-        "SELECT state FROM outbound_jobs WHERE idempotency_key='turn:g:0'").fetchone()
-    assert row[0] == "sending"  # 在途豁免(如实声明,不虚称绝无)
-    # 发送完成 → sending→sent 仍然成立
-    env.runner.on_prefix(["im", "+messages-send"],
-                         lambda a, c: ok_envelope({"message_id": "om_late"}))
-    env.outbound._send_and_finalize(env.conn.execute(
-        "SELECT job_id FROM outbound_jobs WHERE idempotency_key='turn:g:0'").fetchone()[0])
-    row = env.conn.execute(
-        "SELECT state, sent_message_id FROM outbound_jobs "
-        "WHERE idempotency_key='turn:g:0'").fetchone()
-    assert row[0] == "sent" and row[1] == "om_late"
+    assert _row(env, "turn:g:0")["state"] == "sending"  # 在途豁免(如实声明,不虚称绝无)
+    # 发送完成 → sending→sent 仍然成立(结果按冻结 op_* 收口,不受绑定终止影响)
+    env.client.on(PM, lambda m, p: posted(channel=p["channel"], ts="1700000000.000900"))
+    env.outbound._send_and_finalize(r["job_id"])
+    r = _row(env, "turn:g:0")
+    assert r["state"] == "sent" and r["sent_message_id"] == CHAT + ":1700000000.000900"
 
 
 def test_zero_new_sends_after_unbind(env):
     bid = env.make_binding(status="active")
-    env.runner.on_prefix(["im", "+messages-send"],
-                         lambda a, c: ok_envelope({"message_id": "om_lc"}))
+    env.client.on(PM, lambda m, p: posted(channel=p["channel"]))
     lifecycle.terminate_binding(env.conn, bid, "user_unbind", env.clock)
     # unbind 之后才轮到的 pending job → 守卫取消,零外发
     jobs.create_job(env.conn, kind="session_turn", chat_id=CHAT, binding_id=bid,
                     idempotency_key="turn:g2:0", turn_group="g2", chunk_index=0,
                     body="post-unbind", now=env.clock.wall_ms())
-    env.outbound.tick()
+    for _ in range(3):
+        env.outbound.tick()
+        env.clock.tick(2000)
     st = {r["idempotency_key"]: r["state"] for r in env.jobs("session_turn")}
     assert st["turn:g2:0"] == "cancelled"
-    sends = env.runner.calls_matching("im", "+messages-send")
-    # 只允许本次终止的 lifecycle_notice 外发(通知 --text;若有 session_turn 会是 --markdown)
-    def _body(argv):
-        flag = "--markdown" if "--markdown" in argv else "--text"
-        return argv[argv.index(flag) + 1]
-    texts_sent = [_body(c[0]) for c in sends]
-    assert all("post-unbind" not in t for t in texts_sent)
+    sends = env.client.calls_for(PM)
+    assert all("post-unbind" not in json.dumps(p, ensure_ascii=False) for p in sends)
+    # 只允许本次终止的 lifecycle_notice 外发(固定文案,text 形态)
+    assert [p.get("text") for p in sends] == [texts.lifecycle_close_body("user_unbind")]
+    assert _row(env, "lc:%s:user_unbind" % bid)["state"] == "sent"
 
 
 def test_unbind_race_two_terminators_single_cascade(env):
