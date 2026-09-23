@@ -118,6 +118,16 @@ NOT_SENT_ERRORS = frozenset({
 })
 # 幂等类的"已达成"错误:reactions.add already_reacted = sent
 ALREADY_DONE_ERRORS = frozenset({"already_reacted"})
+# 核验(conversations.history / replies)的 ok:false 错误码分流(contracts §2.6「永久错」细分):
+# 全局能力错 → 本 job unconfirmed 且 daemon_state.verify_capability = degraded:<err>;
+# 频道级错 → 只本 job unconfirmed,**不动** verify_capability;其余任何错误码 → error 分支(退避 / cap)。
+VERIFY_GLOBAL_DEGRADE_ERRORS = frozenset({
+    "missing_scope", "invalid_auth", "not_authed", "account_inactive", "token_revoked",
+    "token_expired", "no_permission", "not_allowed_token_type",
+})
+VERIFY_CHANNEL_ERRORS = frozenset({
+    "channel_not_found", "not_in_channel", "is_archived", "thread_not_found", "message_not_found",
+})
 
 # ======================================================================
 # 入站(events_api)

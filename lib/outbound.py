@@ -796,6 +796,8 @@ class Outbound:
     def _verify_unknown(self, job):
         """postMessage 类 unknown 的核验:replies(有 op_thread_ts)/ history;≤ VERIFY_MAX_PAGES 页;
         命中 = bot_id ∧ metadata.event_type ∧ event_payload.job_id;三分结果 + CAS WHERE state='unknown' AND verify_round=?。
+        永久错细分:VERIFY_GLOBAL_DEGRADE_ERRORS → unconfirmed + verify_capability=degraded:<err>(全局);
+        VERIFY_CHANNEL_ERRORS → 只本 job unconfirmed(不动能力);其余任何错误码 → error 分支(退避 / cap)。
         → 'hit' | 'absent' | 'resend' | 'unconfirmed' | 'error' | 'wait' | 'ratelimited' | 'stale'。"""
         job_id = job["job_id"]
         round_ = job["verify_round"]
@@ -833,10 +835,12 @@ class Outbound:
                 outcome = "wait"
             elif cls == "ratelimited":
                 outcome = "ratelimited"
-            elif cls == "failed":
-                outcome = "permanent"
+            elif res.error in constants.VERIFY_GLOBAL_DEGRADE_ERRORS:
+                outcome = "permanent_global"    # 能力级永久错:degraded 全局 + 本 job unconfirmed
+            elif res.error in constants.VERIFY_CHANNEL_ERRORS:
+                outcome = "permanent_channel"   # 频道级永久错:只本 job unconfirmed,不动 verify_capability
             else:
-                outcome = "error"
+                outcome = "error"               # 其余任何 ok:false / 传输错 → 退避 / cap
             break
         if outcome is None:
             outcome = "error"
@@ -891,8 +895,9 @@ class Outbound:
                 db.cas(self.conn, "UPDATE outbound_jobs SET verify_after=?" + where, (until, job_id, round_))
                 db.bump_counter(self.conn, "ratelimit_hits")
                 return "ratelimited"
-            if outcome == "permanent":
-                db.set_state(self.conn, constants.VERIFY_CAPABILITY_KEY, "degraded:%s" % err)
+            if outcome in ("permanent_global", "permanent_channel"):
+                if outcome == "permanent_global":
+                    db.set_state(self.conn, constants.VERIFY_CAPABILITY_KEY, "degraded:%s" % err)
                 self._set_unconfirmed(fresh, "unknown", "verify-permanent: %s" % err, now, verify_round=round_)
                 db.bump_counter(self.conn, "verify_unconfirmed")
                 return "unconfirmed"

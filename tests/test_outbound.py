@@ -902,16 +902,58 @@ class TestVerify:
         assert env.client.waits == [(HIST, until)] and counter(env, "cooldown_waits") == 1
         assert len(env.client.calls_for(PM)) == 1
 
-    def test_permanent_error_unconfirmed_and_degrades_capability(self, env):
+    @pytest.mark.parametrize("code", ["not_in_channel", "channel_not_found"])
+    def test_channel_error_unconfirmed_only_this_job_capability_unchanged(self, env, code):
+        """频道级永久错(VERIFY_CHANNEL_ERRORS):只本 job unconfirmed(+告警),verify_capability 不动,
+        其它频道的 job 仍可获准重发。"""
+        bid_a = env.make_binding(status="active", chat_id=CHAT, session_id="sA", cc_pid=1111, cc_start="t1")
+        bid_b = env.make_binding(status="active", chat_id="C_B", session_id="sB", cc_pid=2222, cc_start="t2")
+        set_verify_ok(env)
+        arm_post(env, timeout(), timeout(), post_ok)   # A、B 首发超时;之后(A 的告警)正常发出
+        mk_turn(env, bid_a, group="ga", chat_id=CHAT)
+        mk_turn(env, bid_b, group="gb", chat_id="C_B")
+        env.outbound.tick()
+        ra, rb = row(env, "turn:ga:0"), row(env, "turn:gb:0")
+        assert ra["state"] == "unknown" and rb["state"] == "unknown"
+        env.client.on(HIST, lambda m, q: err(code) if q["channel"] == CHAT else history([]))
+        verify_tick(env)   # 两者同时到期:A 频道错 → unconfirmed;B 成功未见 n=1
+        ra = row(env, "turn:ga:0")
+        assert ra["state"] == "unconfirmed" and code in ra["error"]
+        assert dbmod.get_state(env.conn, C.VERIFY_CAPABILITY_KEY) == C.VERIFY_CAP_OK   # 能力不动
+        assert [a["chat_id"] for a in alerts(env)] == [CHAT] and alerts(env)[0]["body"] == texts.unconfirmed_alert_body()
+        assert counter(env, "verify_unconfirmed") == 1
+        verify_tick(env)
+        verify_tick(env)   # B 第三次成功未见 → 仍获准重发(能力未被 A 的频道错拖累)
+        rb = row(env, "turn:gb:0")
+        assert rb["state"] == "pending" and rb["resend_count"] == 1 and rb["verify_round"] == 1
+        ids = [q["metadata"]["event_payload"]["job_id"] for q in env.client.calls_for(PM)]
+        assert ids.count(ra["job_id"]) == 1 and ids.count(rb["job_id"]) == 1   # 各一次首发;B 尚未重发
+        assert alerts(env)[0]["state"] == "sent"
+
+    @pytest.mark.parametrize("code", ["missing_scope", "invalid_auth"])
+    def test_global_error_unconfirmed_and_degrades_capability(self, env, code):
+        """能力级永久错(VERIFY_GLOBAL_DEGRADE_ERRORS,含 NOT_SENT_ERRORS 族的 invalid_auth):
+        本 job unconfirmed + verify_capability=degraded:<err>。"""
         bid = env.make_binding(status="active")
         set_verify_ok(env)
         send_unknown(env, bid)
-        env.client.on(HIST, lambda m, q: err("channel_not_found"))
+        env.client.on(HIST, lambda m, q: err(code))
         verify_tick(env)
         r = row(env, "turn:g:0")
-        assert r["state"] == "unconfirmed" and "channel_not_found" in r["error"]
-        assert dbmod.get_state(env.conn, C.VERIFY_CAPABILITY_KEY) == "degraded:channel_not_found"
+        assert r["state"] == "unconfirmed" and code in r["error"]
+        assert dbmod.get_state(env.conn, C.VERIFY_CAPABILITY_KEY) == "degraded:%s" % code
         assert len(env.client.calls_for(PM)) == 1 and len(alerts(env)) == 1
+
+    @pytest.mark.parametrize("code", ["msg_too_long", "some_new_code", "internal_error"])
+    def test_other_error_codes_stay_in_error_branch(self, env, code):
+        bid = env.make_binding(status="active")
+        set_verify_ok(env)
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: err(code))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_error_count"] == 1 and r["verify_absent_count"] == 0
+        assert dbmod.get_state(env.conn, C.VERIFY_CAPABILITY_KEY) == C.VERIFY_CAP_OK
 
     def test_pagination_cursor_then_hit(self, env):
         bid = env.make_binding(status="active")
