@@ -301,6 +301,37 @@ class TestTokensVersionChange:
         assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == configmod.load_tokens(allow_env=False)[1]
         assert "恢复" in notes.calls[-1][1]
 
+    def test_chmod_only_without_mtime_change_closes_gate_then_reopens(self, env, tokens):
+        """R1-M8:`chmod 644 tokens.json` 只改 ctime/mode、不改 mtime。旧探针只比 mtime → 直接 same,
+        跳过 load_tokens 的 0600 检查,门永远关不上。现在 stat 签名(ino/mode/size/mtime/ctime)任一变化
+        → 完整 load_tokens → ConfigError → degraded:tokens_error(fail-closed);chmod 回 0600 → 退避后重验通过。"""
+        notes = _Notes()
+        g, c, auth = self._ok_gate(env, tokens, notes)
+        st0 = os.stat(tokens.path)
+        os.chmod(tokens.path, 0o644)                   # **不** utime
+        st1 = os.stat(tokens.path)
+        assert st1.st_mtime_ns == st0.st_mtime_ns and st1.st_mode != st0.st_mode
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "degraded:tokens_error"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == tokens.version   # 版本不动
+        assert g.state == "degraded" and len(notes.calls) == 1 and "停摆" in notes.calls[0][2]
+        assert c.reloads == []                          # 读文件失败在 reload 之前
+        # 权限修回(仍不动 mtime):签名再变 → 重读成功 → 版本没变 → 到退避点重验 → ok
+        os.chmod(tokens.path, 0o600)
+        g.tick()                                        # 退避未到:先不重探,但已重读成功
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "degraded:tokens_error"
+        env.clock.tick(fingerprint.PROBE_BACKOFF_START_MS + 1)
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == tokens.version
+        assert "恢复" in notes.calls[-1][1]
+
+    def test_stat_signature_shape(self, tokens):
+        sig = configmod.tokens_stat_signature(tokens.path)
+        st = os.stat(tokens.path)
+        assert sig == (st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        assert configmod.tokens_stat_signature(str(tokens.path) + ".missing") is None
+
     def test_app_token_change_signal_once(self, env, tokens):
         g, c, auth = self._ok_gate(env, tokens)
         assert g.app_token_changed() is False

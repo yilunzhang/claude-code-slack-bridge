@@ -137,12 +137,24 @@ def tokens_version_of(raw, mtime_ns):
 
 
 def tokens_mtime_ns(path=None):
-    """廉价探针:每 tick stat 用;文件不存在 → None。"""
+    """廉价探针(仅 mtime):文件不存在 → None。FingerprintGate 用的是 `tokens_stat_signature`。"""
     p = str(path or paths.tokens_path())
     try:
         return os.stat(p).st_mtime_ns
     except OSError:
         return None
+
+
+def tokens_stat_signature(path=None):
+    """每 tick 的廉价探针(R1-M8):`(st_ino, st_mode, st_size, st_mtime_ns, st_ctime_ns)`;文件不存在 → None。
+    只看 mtime 会漏掉 `chmod 644`(改 ctime/mode、不改 mtime)—— 权限变坏时 load_tokens 的 0600 检查
+    永远不再执行,门也就关不上。任何一项变化 → 调用方走完整 `load_tokens`(fail-closed)。"""
+    p = str(path or paths.tokens_path())
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def _validate_tokens(tokens, where):

@@ -2,8 +2,10 @@
 
 - `verify_identity(client, cfg)`:`auth.test` → 比对 `team_id / user_id==bot_user_id / bot_id`;
   缺字段绝不算 ok(fail-closed);确证不符 = `mismatch`;调用失败/缺字段 = `unknown`。
-- `FingerprintGate.tick()` 每 tick **stat** tokens 文件(`config.tokens_mtime_ns`,廉价);
-  文件版本变 → `client.reload_tokens(version)` → **立即** `auth.test` → **同一事务**写
+- `FingerprintGate.tick()` 每 tick **stat** tokens 文件(`config.tokens_stat_signature`:
+  ino/mode/size/mtime_ns/ctime_ns 五元组,廉价;只看 mtime 会漏掉 `chmod 644`,R1-M8);签名变 → 完整
+  `load_tokens`(0600 检查在此)→ 文件版本变 → `client.reload_tokens(version)` → **立即** `auth.test` →
+  **同一事务**写
   `outbound_gate` + `outbound_gate_tokens_version` + `tokens_version_seen`,并把 `verify_capability`
   置回 `unverified`(除非 `verify_capability_tokens_version == 新版本`,即 probe 已对这一版凭据确证过)。
 - 身份漂移 → `outbound_gate='mismatch'`(关门;daemon 启动时 `startup()=='mismatch'` 拒启);
@@ -86,7 +88,7 @@ class FingerprintGate:
         self._backoff = PROBE_BACKOFF_START_MS
         self._next_probe_at = 0
         self._last_notified_state = None
-        self._last_mtime_ns = None
+        self._last_sig = None          # config.tokens_stat_signature 五元组(ino/mode/size/mtime/ctime)
         self._reload_pending = False
         self._app_token_digest = None
         self._app_token_changed_flag = False
@@ -180,11 +182,12 @@ class FingerprintGate:
 
     def _check_tokens_file(self):
         """每 tick 的廉价探针。→ ('same', None) | ('changed', new_version) | ('error', detail)。
-        mtime 变(或上次读失败待重试)才真正读文件 + `client.reload_tokens`。"""
-        mtime = configmod.tokens_mtime_ns(self._tokens_path)
-        if mtime == self._last_mtime_ns and not self._reload_pending:
+        stat 签名(ino/mode/size/mtime_ns/ctime_ns)变(或上次读失败待重试)才真正读文件
+        (`load_tokens` 含 0600 检查 → 权限变坏 = error,fail-closed)+ `client.reload_tokens`。"""
+        sig = configmod.tokens_stat_signature(self._tokens_path)
+        if sig == self._last_sig and not self._reload_pending:
             return "same", None
-        self._last_mtime_ns = mtime
+        self._last_sig = sig
         try:
             tokens, ver = self._read_tokens_file()
             new_ver = self.client.reload_tokens(ver)
@@ -204,7 +207,7 @@ class FingerprintGate:
     def startup(self):
         """只检测(一次 auth.test),绝不发消息。→ 'ok' | 'degraded' | 'mismatch'。
         健康启动不通知(否则每次重启都弹"已恢复");degraded/mismatch 通知。"""
-        self._last_mtime_ns = configmod.tokens_mtime_ns(self._tokens_path)
+        self._last_sig = configmod.tokens_stat_signature(self._tokens_path)
         try:
             tokens, _ver = self._read_tokens_file()
             self._app_token_digest = _app_token_digest(tokens)
