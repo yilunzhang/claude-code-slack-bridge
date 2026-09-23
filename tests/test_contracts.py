@@ -18,7 +18,6 @@ from tests.helpers import (FakeSlackClient, app_mention_event, block_action, env
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 WP1 = pytest.mark.xfail(strict=True, reason="WP1 传输/daemon_core 未落地")
-WP2 = pytest.mark.xfail(strict=True, reason="WP2 入站/审批/媒体/恢复/生命周期 未落地")
 WP3 = pytest.mark.xfail(strict=True, reason="WP3 出站状态机 未落地")
 WP4 = pytest.mark.xfail(strict=True, reason="WP4 控制面/hooklib/notify/fingerprint 未落地")
 
@@ -374,7 +373,6 @@ def test_consumer_script_exists():
 # ======================================================================
 # WP2:inbound / approval / media / lifecycle / recovery
 # ======================================================================
-@WP2
 def test_ingest_in_tx_exists_never_opens_transaction_and_returns_mapping(env):
     from lib import inbound
     env.make_binding(status="active", chat_id=CHAT)
@@ -390,7 +388,6 @@ def test_ingest_in_tx_exists_never_opens_transaction_and_returns_mapping(env):
     assert res[0] == "dropped" and isinstance(res[1], str)
 
 
-@WP2
 def test_process_in_tx_return_mapping(env):
     from lib import approval
     with dbmod.tx(env.conn):
@@ -405,7 +402,6 @@ def test_process_in_tx_return_mapping(env):
     assert res == ("dropped", "dup")
 
 
-@WP2
 def test_media_materialize_signature_returns_paths_and_skipped(env):
     from lib import media
     sig = inspect.signature(media.materialize)
@@ -414,7 +410,6 @@ def test_media_materialize_signature_returns_paths_and_skipped(env):
     assert out == ([], [])
 
 
-@WP2
 def test_terminate_in_tx_closed_undelivered(env):
     from lib import lifecycle
     bid = env.make_binding(status="active", chat_id=CHAT)
@@ -432,7 +427,6 @@ def test_terminate_in_tx_closed_undelivered(env):
     assert "dec:p1:closed_undelivered" in keys
 
 
-@WP2
 def test_expire_pendings_single_scope(env):
     bid = env.make_binding(status="active", chat_id=CHAT)
     now = env.clock.wall_ms()
@@ -456,13 +450,11 @@ def test_expire_pendings_single_scope(env):
     assert any(j["idempotency_key"] == "dec:p0:expired" for j in env.jobs("decision_notice"))
 
 
-@WP2
 def test_recovery_never_revives_terminal_jobs():
     from lib.recovery import Recovery
     assert not hasattr(Recovery, "_rearm_failed_cards")
 
 
-@WP2
 def test_download_worker_exists():
     assert (ROOT / "bin" / "download_worker.py").exists()
 
