@@ -283,6 +283,76 @@ class TestListChats:
         assert [x["chat_id"] for x in ctl.list_chats(c, cfg)] == ["C0A", "C0B"]
 
 
+# ============================================================================ preflight: slack_sdk 探针(R1-m3)
+def _fake_sdk_dir(tmp_path, init_src, version_src=None):
+    d = tmp_path / "fakesdk"
+    (d / "slack_sdk").mkdir(parents=True)
+    (d / "slack_sdk" / "__init__.py").write_text(init_src, encoding="utf-8")
+    if version_src is not None:
+        (d / "slack_sdk" / "version.py").write_text(version_src, encoding="utf-8")
+    return d
+
+
+def _metadata_version_or_none():
+    try:
+        import importlib.metadata as m
+        return m.version("slack_sdk")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class TestPreflightSdkProbe:
+    def test_probe_code_never_imports_sdk_at_module_level(self):
+        import re
+        src = (ROOT / "bin" / "bridgectl.py").read_text(encoding="utf-8")
+        assert not re.search(r"^\s*(from|import)\s+slack_sdk\b", src, re.M)
+
+    def test_installed_sdk_without_toplevel___version___is_importable(self, tmp_path):
+        """slack_sdk 3.44.x 的形状:顶层没有 __version__,版本在 slack_sdk.version。
+        旧探针 `print(slack_sdk.__version__)` → AttributeError → 误报 importable=false。"""
+        mod = _load_bridgectl()
+        d = _fake_sdk_dir(tmp_path, "# no __version__ here\n", "__version__ = '3.44.1-fake'\n")
+        env = dict(os.environ, PYTHONPATH=str(d))
+        res = mod._slack_sdk_status(sys.executable, env=env)
+        assert res["importable"] is True and res["python"] == sys.executable
+        meta = _metadata_version_or_none()      # 同一解释器:有 dist 元数据则优先它,否则回落到 slack_sdk.version
+        if meta:
+            assert (res["version"], res["source"]) == (meta, "metadata")
+        else:
+            assert (res["version"], res["source"]) == ("3.44.1-fake", "slack_sdk.version")
+
+    def test_fallback_order_metadata_then_version_module_then_attr(self, tmp_path):
+        mod = _load_bridgectl()
+        if _metadata_version_or_none():
+            pytest.skip("此解释器装了真 slack_sdk dist,元数据总是优先")
+        d = _fake_sdk_dir(tmp_path, "__version__ = 'attr-only'\n")      # 只有顶层属性
+        res = mod._slack_sdk_status(sys.executable, env=dict(os.environ, PYTHONPATH=str(d)))
+        assert (res["importable"], res["version"], res["source"]) == (True, "attr-only", "slack_sdk.__version__")
+        d2 = _fake_sdk_dir(tmp_path / "b", "__version__ = 'attr'\n", "__version__ = 'vermod'\n")
+        res = mod._slack_sdk_status(sys.executable, env=dict(os.environ, PYTHONPATH=str(d2)))
+        assert (res["version"], res["source"]) == ("vermod", "slack_sdk.version")   # version 模块先于顶层属性
+
+    def test_import_failure_reported_as_not_importable(self, tmp_path):
+        mod = _load_bridgectl()
+        d = _fake_sdk_dir(tmp_path, "raise ImportError('broken install')\n")
+        res = mod._slack_sdk_status(sys.executable, env=dict(os.environ, PYTHONPATH=str(d)))
+        assert res["importable"] is False and res["version"] is None
+
+    def test_unrunnable_interpreter_is_none_not_false(self):
+        mod = _load_bridgectl()
+        res = mod._slack_sdk_status("/nonexistent/python3")
+        assert res["importable"] is None
+
+    def test_real_sdk_in_venv_test_if_present(self):
+        py = ROOT / ".venv-test" / "bin" / "python"
+        if not py.exists():
+            pytest.skip(".venv-test 未建(docs/dev.md)")
+        mod = _load_bridgectl()
+        res = mod._slack_sdk_status(str(py))
+        assert res["importable"] is True and res["version"] and res["version"].startswith("3.")
+        assert res["source"] in ("metadata", "slack_sdk.version")
+
+
 # ============================================================================ open-dm
 class TestOpenDm:
     def test_pins_owner_dm_id_on_disk(self, cfg):

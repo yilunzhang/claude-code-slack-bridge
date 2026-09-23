@@ -97,17 +97,49 @@ def cmd_bootstrap(args):
 
 
 # ---------------------------------------------------------------- preflight
-def _slack_sdk_status(python_exe):
-    """consumer 依赖 slack_sdk(>=3.44,<4)。用 consumer 将使用的解释器探测;失败 → importable=None(信息性)。"""
+# consumer 解释器里跑的探针(以**字符串**形式存在:本文件顶层不 import slack_sdk,
+# tests/test_consumer.py::test_only_consumer_imports_slack_sdk 守着)。版本来源优先级(R1-m3):
+#   importlib.metadata.version("slack_sdk")(dist 元数据)→ slack_sdk.version.__version__ → slack_sdk.__version__。
+# slack_sdk 3.44.x **没有**顶层 __version__(在 slack_sdk.version),旧探针 `print(slack_sdk.__version__)`
+# 会 AttributeError → 把已安装的 sdk 误报成 importable=false。
+SDK_PROBE_CODE = "\n".join([
+    "import json, sys",
+    "try:",
+    "    import slack_sdk",
+    "except Exception as e:",
+    "    print(json.dumps({'importable': False, 'error': type(e).__name__})); sys.exit(0)",
+    "v = None; src = None",
+    "for name in ('metadata', 'slack_sdk.version', 'slack_sdk.__version__'):",
+    "    try:",
+    "        if name == 'metadata':",
+    "            from importlib.metadata import version as _mv; v = _mv('slack_sdk')",
+    "        elif name == 'slack_sdk.version':",
+    "            from slack_sdk.version import __version__ as v",
+    "        else:",
+    "            v = slack_sdk.__version__",
+    "    except Exception:",
+    "        v = None",
+    "    if v:",
+    "        src = name; break",
+    "print(json.dumps({'importable': True, 'version': (str(v) if v else None), 'source': src}))",
+])
+
+
+def _slack_sdk_status(python_exe, env=None):
+    """consumer 依赖 slack_sdk(>=3.44,<4)。用 consumer 将使用的解释器跑 SDK_PROBE_CODE:
+    → {"importable": True|False|None, "version": str|None, "source": str|None, "python": python_exe}。
+    importable=None = 探针本身没跑成(解释器不可执行 / 超时 / 输出不可解析),信息性,不当作"未安装"。"""
     try:
-        r = subprocess.run(
-            [python_exe, "-c", "import slack_sdk; print(slack_sdk.__version__)"],
-            capture_output=True, text=True, timeout=15)
-        if r.returncode == 0:
-            return {"importable": True, "version": (r.stdout or "").strip(), "python": python_exe}
-        return {"importable": False, "version": None, "python": python_exe}
+        r = subprocess.run([python_exe, "-c", SDK_PROBE_CODE], capture_output=True, text=True,
+                           timeout=15, env=env)
+        lines = [l for l in (r.stdout or "").splitlines() if l.strip()]
+        obj = json.loads(lines[-1]) if (r.returncode == 0 and lines) else None
+        if not isinstance(obj, dict) or "importable" not in obj:
+            return {"importable": None, "version": None, "source": None, "python": python_exe}
+        return {"importable": bool(obj["importable"]), "version": obj.get("version"),
+                "source": obj.get("source"), "python": python_exe}
     except Exception:  # noqa: BLE001
-        return {"importable": None, "version": None, "python": python_exe}
+        return {"importable": None, "version": None, "source": None, "python": python_exe}
 
 
 def cmd_preflight(args):
