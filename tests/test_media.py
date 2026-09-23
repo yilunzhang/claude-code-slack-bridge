@@ -65,21 +65,55 @@ class TestFilePlan:
         assert by["A"]["skip"] is None and by["B"]["skip"] == "too_large"   # 累计超配额
         for k in ("C", "D"):   # 拍平:无分隔符、不以点开头(与 .tmp 约定冲突)
             assert "/" not in by[k]["dest_name"] and not by[k]["dest_name"].startswith(".")
-        assert by["D"]["dest_name"] == "hidden"
-        assert by["E"]["dest_name"] == "file4"
+        assert by["C"]["dest_name"] == "f03-C-_evil"            # 序号 + id 前缀(R1-M7);前导点已剥
+        assert by["D"]["dest_name"] == "f04-D-hidden"
+        assert by["E"]["dest_name"] == "f05-E-file4"
         assert media.needs_download(files) is True
         assert media.needs_download([slack_file(mode="tombstone")]) is False
         assert media.needs_download([]) is False
 
     def test_dedupe_names(self):
         plan = media.file_plan([slack_file(id="A", name="a.pdf"), slack_file(id="B", name="a.pdf")])
-        assert [e["dest_name"] for e in plan] == ["a.pdf", "1-a.pdf"]
+        assert [e["dest_name"] for e in plan] == ["f01-A-a.pdf", "f02-B-a.pdf"]
+
+    def test_dest_names_unique_even_when_input_names_mimic_dedupe_suffix(self):
+        """R1-M7:输入 a.txt / 2-a.txt / a.txt 旧实现得 a.txt / 2-a.txt / **2-a.txt**(第三个撞第二个,
+        worker O_EXCL 失败 → 永久 MediaError → 整条消息含正文永久不投递)。
+        现在名字 = f<idx>-<id>-<name>:确定性、同一消息内两两不同;id 相同/为空也不撞。"""
+        files = [slack_file(id="A", name="a.txt"), slack_file(id="B", name="2-a.txt"),
+                 slack_file(id="C", name="a.txt")]
+        names = [e["dest_name"] for e in media.file_plan(files)]
+        assert names == ["f01-A-a.txt", "f02-B-2-a.txt", "f03-C-a.txt"]
+        assert len(set(names)) == 3
+        # 极端:id 全空 / 全相同 / 名字全相同 / 含分隔符与点 —— 仍两两不同且确定
+        weird = [slack_file(id="", name="x"), slack_file(id="", name="x"), slack_file(id="F/../", name="../x"),
+                 slack_file(id="F/../", name="../x")]
+        for f in weird:
+            f["id"] = f["id"] or None
+        names = [e["dest_name"] for e in media.file_plan(weird)]
+        assert len(set(names)) == 4 and names == [e["dest_name"] for e in media.file_plan(weird)]
+        assert all("/" not in n and not n.startswith(".") and len(n) <= media.NAME_MAX for n in names)
+        # 超长名字:前缀 + 截断后的名字仍 ≤ NAME_MAX,扩展名保留
+        longn = media.dest_name_for({"id": "F" * 100, "name": "n" * 500 + ".pdf"}, 0)
+        assert len(longn) <= media.NAME_MAX and longn.endswith(".pdf") and longn.startswith("f01-")
+        # seen 循环:即便前缀相同(人为构造)也会追加 -2/-3
+        seen = {"f01-A-a.txt", "f01-A-a-2.txt"}
+        assert media.dest_name_for({"id": "A", "name": "a.txt"}, 0, seen) == "f01-A-a-3.txt"
+
+    def test_materialize_three_files_with_colliding_names_all_published(self, env):
+        """R1-M7 端到端:三个文件(a.txt / 2-a.txt / a.txt)经假 worker 全部落盘,payload 三条 local_path 各不相同。"""
+        files = [f_ok(id="A", name="a.txt", n=1), f_ok(id="B", name="2-a.txt", n=2), f_ok(id="C", name="a.txt", n=3)]
+        paths, skipped = mat(env, files)
+        assert [os.path.basename(p) for p in paths] == ["f01-A-a.txt", "f02-B-2-a.txt", "f03-C-a.txt"]
+        assert [os.path.getsize(p) for p in paths] == [1, 2, 3] and skipped == []
+        desc = media.describe_files(files, paths)
+        assert [d["local_path"] for d in desc] == paths
 
     def test_describe_files_maps_paths_and_skips(self, env):
         files = [slack_file(id="A", name="a.pdf", size=10), slack_file(id="B", name="z.zip", mode="tombstone")]
-        out = media.describe_files(files, ["/x/y/a.pdf"])
+        out = media.describe_files(files, ["/x/y/f01-A-a.pdf"])
         assert out[0] == {"id": "A", "name": "a.pdf", "mimetype": "application/pdf", "size": 10,
-                          "local_path": "/x/y/a.pdf"}
+                          "local_path": "/x/y/f01-A-a.pdf"}
         assert out[1]["skipped_reason"] == "tombstone" and "local_path" not in out[1]
         # 找不到对应路径(不应发生)→ 保守记 skipped
         assert media.describe_files(files, [])[0]["skipped_reason"] == "no_url"
@@ -90,7 +124,7 @@ class TestMaterialize:
     def test_success_publishes_atomically_only_parent(self, env):
         paths, skipped = mat(env, [f_ok(n=4), f_ok(id="F2", name="b.txt", n=1),
                                    slack_file(id="F3", name="gone", mode="tombstone")])
-        assert [os.path.basename(p) for p in paths] == ["a.pdf", "b.txt"]
+        assert [os.path.basename(p) for p in paths] == ["f01-F1-a.pdf", "f02-F2-b.txt"]
         for p in paths:
             assert os.path.isabs(p) and os.path.isfile(p) and not os.path.islink(p)
             assert str(env.media_root / BID / MID) + os.sep in p

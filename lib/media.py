@@ -10,6 +10,7 @@ token 只经 stdin 传给 worker(不上 argv、不进日志)。"""
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -71,7 +72,7 @@ def skip_reason(f, max_bytes=None):
     return None
 
 
-def _safe_name(name, index):
+def _safe_name(name, index, max_len=NAME_MAX):
     """落盘文件名:只取 basename;去分隔符/NUL/前导点(与 .tmp 约定冲突);空 → file<i>;限长。"""
     s = name if isinstance(name, str) else ""
     s = s.replace("\x00", "")
@@ -83,16 +84,45 @@ def _safe_name(name, index):
     s = os.path.basename(s).strip().lstrip(".")
     if not s:
         s = "file%d" % index
-    if len(s) > NAME_MAX:
+    if len(s) > max_len:
         stem, ext = os.path.splitext(s)
-        s = stem[: NAME_MAX - len(ext)] + ext if len(ext) < NAME_MAX else s[:NAME_MAX]
+        s = stem[: max_len - len(ext)] + ext if len(ext) < max_len else s[:max_len]
     return s
+
+
+_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9_-]+")
+ID_MAX = 32
+
+
+def _safe_id_fragment(file_id, index):
+    """文件 id 作为文件名片段:只留 [A-Za-z0-9_-],空 → noid<i>,限长。"""
+    s = file_id if isinstance(file_id, str) else ""
+    s = _ID_SAFE_RE.sub("", s)[:ID_MAX]
+    return s or ("noid%d" % index)
+
+
+def dest_name_for(f, index, seen=None):
+    """附件落盘名(确定性、同一消息内唯一,R1-M7):`f<idx:02d>-<file_id>-<sanitized_name>`。
+    1-based 序号 + 文件 id 已经使不同条目不可能同名;仍在 `seen` 集合上循环加 `-2`/`-3`… 直到不撞
+    (防御截断/畸形 id 的极端情况),绝不让第三个文件撞上第二个的名字。"""
+    prefix = "f%02d-%s-" % (index + 1, _safe_id_fragment(f.get("id") if isinstance(f, dict) else None, index))
+    base = _safe_name((f.get("name") or f.get("title")) if isinstance(f, dict) else None, index,
+                      max_len=max(NAME_MAX - len(prefix), 16))
+    cand = prefix + base
+    if seen is None:
+        return cand
+    n = 1
+    stem, ext = os.path.splitext(cand)
+    while cand in seen:
+        n += 1
+        cand = "%s-%d%s" % (stem, n, ext)
+    return cand
 
 
 def file_plan(files, max_bytes=None, quota_bytes=None):
     """→ [{"file", "id", "name", "url", "skip", "dest_name"}](保序)。零网络。
     skip=None 的条目才下载;累计声明大小超 quota_bytes 的后续文件 → too_large。
-    dest_name 对可下载条目确定(同名以 `<i>-` 前缀去重),供 payload 反查 local_path。"""
+    dest_name 对可下载条目确定(`f<idx>-<file_id>-<name>`,`dest_name_for`),供 payload 反查 local_path。"""
     if max_bytes is None:
         max_bytes = constants.MEDIA_FILE_MAX_BYTES
     if quota_bytes is None:
@@ -113,10 +143,7 @@ def file_plan(files, max_bytes=None, quota_bytes=None):
                 else:
                     total += int(size)
         if reason is None:
-            base = _safe_name(f.get("name") or f.get("title"), i)
-            dest_name = base
-            if dest_name in seen:
-                dest_name = "%d-%s" % (i, base)
+            dest_name = dest_name_for(f, i, seen)
             seen.add(dest_name)
         plan.append({"file": f, "id": _s(f.get("id")), "name": f.get("name") or f.get("title"),
                      "url": file_url(f), "skip": reason, "dest_name": dest_name})

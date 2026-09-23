@@ -449,7 +449,7 @@ class TestActiveGate:
         row = env.inbox_row(mid_of(ev))
         assert row["state"] == "enqueued"
         p = json.loads(env.deliveries(bid)[0]["payload_json"])
-        assert len(p["media_paths"]) == 1 and p["media_paths"][0].endswith("/a.pdf")
+        assert len(p["media_paths"]) == 1 and p["media_paths"][0].endswith("/f01-F1-a.pdf")
         assert p["files"][0]["local_path"] == p["media_paths"][0] and p["files"][0]["id"] == "F1"
         assert p["files"][1] == {"id": "F2", "name": "big.zip", "mimetype": "application/zip",
                                  "size": constants.MEDIA_FILE_MAX_BYTES + 1, "skipped_reason": "too_large"}

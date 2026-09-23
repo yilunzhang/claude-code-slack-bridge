@@ -401,7 +401,7 @@ class TestSubprocess:
                  {"id": "F2", "name": "gone", "mode": "tombstone"}]
         paths, skipped = media.materialize({"bot_token": "xoxb-t"}, env.media_root, "b1", "%s:1.1" % CHAT,
                                            files, deadline_s=10, allow_plain_http_hosts=LOCAL)
-        assert [os.path.basename(p) for p in paths] == ["a.bin"] and os.path.getsize(paths[0]) == 5
+        assert [os.path.basename(p) for p in paths] == ["f01-F1-a.bin"] and os.path.getsize(paths[0]) == 5
         assert skipped == [{"id": "F2", "name": "gone", "skipped_reason": "tombstone"}]
         assert server.seen == [("/ok/5", "Bearer xoxb-t")]
         assert [x for x in os.listdir(env.media_root / "b1") if x.startswith(".tmp")] == []

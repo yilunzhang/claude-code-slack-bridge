@@ -248,8 +248,8 @@ def classify_send_error(res) -> "sent"|"failed"|"ratelimited"|"wait"|"not_sent"|
 {"type":"slack_message","delivery_seq":12,"message_id":"C0CHAT:1700000000.000100","chat_id":"C0CHAT",
  "ts":"1700000000.000100","thread_ts":null,"sender_user_id":"U0MEMBER","sender_is_owner":false,
  "approved_by":"U0OWNER","message_type":"message","text":"look at this",
- "media_paths":["/…/media/<binding_id>/<channel>:<ts>/a.pdf"],
- "files":[{"id":"F1","name":"a.pdf","mimetype":"application/pdf","size":1234,"local_path":"/…/a.pdf"},
+ "media_paths":["/…/media/<binding_id>/<channel>:<ts>/f01-F1-a.pdf"],
+ "files":[{"id":"F1","name":"a.pdf","mimetype":"application/pdf","size":1234,"local_path":"/…/f01-F1-a.pdf"},
           {"id":"F2","name":"big.zip","mimetype":"application/zip","size":999999999,"skipped_reason":"too_large"}]}
 ```
 `approved_by`:owner 本人 → null;白名单 → `"allowlist"`;审批 → 点击者 user id。`skipped_reason ∈ FILE_SKIP_REASONS`。控制行:`{"type":"farewell","code":…}` / `{"type":"daemon_alert","code":"daemon_down"}`。
@@ -418,3 +418,4 @@ ListenerCore(...) / InstanceFollower(...)                          # 不变
 | WP4 | `ctl.bind_prepare` 对**任何** `D…` chat 都要求 `cfg.owner_dm_id` 已钉住且相等,否则 `foreign_dm` 拒绝(plan 只写「拒绝非 owner_dm_id 的 D…」) | 没跑过 `open-dm` 时 `owner_dm_id` 为空,此时任何 DM 都拒(fail-closed),而不是放行 |
 | WP5 | daemon 的 xapp 变化探测只保留 `FingerprintGate.app_token_changed()` 一处(WP1 的 `AppTokenWatch` 已删) | 一个 stat、一个真相;主循环在 `core.loop_iteration()`(内含 gate.tick)之后读一次性信号并 `mgr.restart(SOCKET_KEY, "app_token_changed")` |
 | R1-m2 | `util.chunk_text_with_footer`:末块装不下时,§2.1 写的「前 `limit-len(footer)` 字符留原位」只在 `len(footer) ≤ limit/2` 时能保证新末块 ≤ limit;页脚更长时(body=10 / footer=8 / limit=10 曾得 `[2,16]`)改为把**尾部**限制在 `limit-len(footer)` 字符、前段随之变长 | 「每块(含页脚的末块)≤ limit」是主不变量;页脚 ≤ limit/2 时行为与契约文本完全一致,守卫 `tests/test_contracts.py::test_chunk_text_with_footer_invariant_sweep` |
+| R1-M7 | 附件落盘名 = `f<idx:02d>-<file_id>-<sanitized_name>`(`media.dest_name_for`),不再是「原名,同名加 `<i>-`」 | 旧去重会撞(`a.txt / 2-a.txt / a.txt` → 第三个与第二个同名 → worker O_EXCL → 永久 MediaError,整条消息含正文不投递);序号 + id 使同一消息内名字确定且两两不同,`seen` 循环再兜底。payload `files[].name` 仍是 Slack 原名,只有 `local_path` 的 basename 变了 |
