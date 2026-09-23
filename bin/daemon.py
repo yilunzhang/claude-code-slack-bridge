@@ -7,9 +7,11 @@
   (`_prepare` 校验的凭据快照 = `_transmit` 实际使用的快照);
 - `FingerprintGate(conn, cfg, client, clock, notifier=…)`;
 - consumer argv `[cfg.consumer_python or sys.executable, <root>/bin/slack_consumer.py]`;
-  xapp(app_token)变化 → SIGTERM consumer,ConsumerManager 立即重拉(consumer 自读文件)。"""
+  xapp(app_token)变化的**唯一**探测点是 `FingerprintGate.tick()`(它已经每 tick stat tokens.json),
+  主循环在 `core.loop_iteration()`(内含 gate.tick)之后读一次性信号 `gate.app_token_changed()`
+  → `mgr.restart(SOCKET_KEY, "app_token_changed")`(SIGTERM consumer,ConsumerManager 立即重拉,
+  consumer 自读文件)。bot_token 变化只影响 gate / SlackClient,不重拉 consumer。"""
 import fcntl
-import hashlib
 import os
 import pathlib
 import signal
@@ -40,36 +42,14 @@ def log_line(msg):
         pass
 
 
-class AppTokenWatch:
-    """每循环 stat tokens.json(廉价);mtime 变化才重读文件,比对 app_token 的摘要 —— 只有 xapp 真变了
-    才让 consumer 重拉(bot_token 变化由 FingerprintGate/SlackClient 处理,与 consumer 无关)。
-    token 本身不保存,只留 sha256。"""
-
-    def __init__(self, tokens_path):
-        self.tokens_path = tokens_path
-        self.mtime_ns = configmod.tokens_mtime_ns(tokens_path)
-        self.app_digest = self._digest()
-
-    def _digest(self):
-        try:
-            tokens, _ver = configmod.load_tokens(self.tokens_path, allow_env=False)
-        except configmod.ConfigError:
-            return None
-        app = tokens.get("app_token") or ""
-        return hashlib.sha256(app.encode("utf-8")).hexdigest() if app else None
-
-    def app_token_changed(self):
-        m = configmod.tokens_mtime_ns(self.tokens_path)
-        if m == self.mtime_ns:
-            return False
-        self.mtime_ns = m
-        d = self._digest()
-        if d is None:
-            return False  # 文件缺失/畸形:consumer 下次自读会以 rc 2 退出,不在此裁决
-        if d == self.app_digest:
-            return False
-        self.app_digest = d
-        return True
+def restart_consumer_if_app_token_changed(gate, mgr, log=None):
+    """主循环每轮一次(在 gate.tick 之后):gate 的一次性信号为 True → 主动重拉 consumer。→ 是否重拉。
+    app_token 变化的探测只有这一处来源(FingerprintGate._check_tokens_file),不另开文件监视。"""
+    if not gate.app_token_changed():
+        return False
+    (log or log_line)("app_token changed → restarting consumer")
+    mgr.restart(constants.SOCKET_KEY, "app_token_changed")
+    return True
 
 
 def build_consumer_argv(cfg, root):
@@ -136,7 +116,6 @@ def main():
     on_status = make_status_writer(conn, log_line)  # ready 置位/清除同步 daemon_state
     mgr = ConsumerManager(clock, on_line=core.on_consumer_line, on_status=on_status,
                           argv_builder=lambda key: build_consumer_argv(cfg, root))
-    app_watch = AppTokenWatch(paths.tokens_path())
 
     stop = {"flag": False}
 
@@ -160,9 +139,7 @@ def main():
                 break
             cfg.refresh()  # 配置原地更新(所有组件持同一引用)
             core.loop_iteration()  # 内含刷心跳 + drain + followup + gate.tick(先于出站)
-            if app_watch.app_token_changed():
-                log_line("app_token changed → restarting consumer")
-                mgr.restart(constants.SOCKET_KEY, "app_token_changed")
+            restart_consumer_if_app_token_changed(gate, mgr)  # gate.tick 之后读一次性信号
             mgr.tick()
     finally:
         # 安全点标记 stopping(finally 首步,mgr.shutdown 前)—— supervisor 由此可观测到"正在退出"

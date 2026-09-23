@@ -1,6 +1,6 @@
 """daemon 装配层(WP1):drain 事务机制(fake *_in_tx,真实 SQLite)/ followup 预算 / loop 顺序 /
 睡眠 gap suspect 窗 / ConsumerManager 真子进程管道(单 key、ready 哨兵、stdout 只计数、rc 退避、主动重拉)/
-daemon_state 同步 / 身份与启动阶段 / bin/daemon.py 装配辅助。"""
+daemon_state 同步 / 身份与启动阶段 / bin/daemon.py 装配辅助(argv、xapp 变化 → 恰一次重拉 consumer)。"""
 import importlib.util
 import json
 import pathlib
@@ -16,7 +16,8 @@ from lib.daemon_core import (RESTART_BACKOFF_MAX_MS, RESTART_BACKOFF_START_MS, S
                              STARTUP_PHASES, ConsumerManager, DaemonCore, make_status_writer,
                              mark_consumers_down, record_daemon_identity, set_startup_state)
 from tests.conftest import CHAT, OWNER, TEAM
-from tests.helpers import FakeClock, block_action, envelope, message_event
+from tests.helpers import FakeClock, block_action, envelope, message_event, ok
+from tests.test_fingerprint import AUTH_OK, _rewrite_tokens
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -534,7 +535,7 @@ class TestDaemonStateSync:
 
 
 # ======================================================================
-# bin/daemon.py 装配辅助(argv / xapp 变化监测)
+# bin/daemon.py 装配辅助(argv / xapp 变化 → 重拉 consumer)
 # ======================================================================
 def _load_daemon_module():
     spec = importlib.util.spec_from_file_location("slack_bridge_daemon_bin", ROOT / "bin" / "daemon.py")
@@ -551,20 +552,41 @@ class TestDaemonAssembly:
         cfg["consumer_python"] = "/opt/py/bin/python3"
         assert mod.build_consumer_argv(cfg, root)[0] == "/opt/py/bin/python3"
 
-    def test_app_token_watch_only_fires_on_xapp_change(self, tokens):
-        import os
+    def test_app_token_change_restarts_consumer_exactly_once_via_gate(self, env, tokens):
+        """xapp 变化的唯一来源 = FingerprintGate(daemon 不再有独立的 AppTokenWatch):
+        主循环 = gate.tick() → restart_consumer_if_app_token_changed(gate, mgr)。
+        只换 bot token → 不重拉;换 app token → 恰一次 mgr.restart(SOCKET_KEY, "app_token_changed");
+        之后每轮不再重拉。"""
+        from lib.fingerprint import FingerprintGate
         mod = _load_daemon_module()
-        w = mod.AppTokenWatch(tokens.path)
-        assert w.app_token_changed() is False
-        # 只换 bot token(mtime 变)→ 不重拉 consumer
-        os.utime(tokens.path, ns=(1, 1))
-        from lib import config as configmod
-        configmod.save_tokens({"bot_token": "xoxb-new", "app_token": tokens.tokens["app_token"]}, overwrite=True)
-        assert w.app_token_changed() is False
-        os.utime(tokens.path, ns=(2, 2))
-        configmod.save_tokens({"bot_token": "xoxb-new", "app_token": "xapp-NEW"}, overwrite=True)
-        assert w.app_token_changed() is True
-        assert w.app_token_changed() is False
-        os.chmod(tokens.path, 0o644)   # 文件不可用:不裁决(consumer 自己会以 rc 2 退出)
-        os.utime(tokens.path, ns=(3, 3))
-        assert w.app_token_changed() is False
+        assert not hasattr(mod, "AppTokenWatch")
+
+        class Mgr:
+            def __init__(self):
+                self.restarts = []
+
+            def restart(self, key, reason=None):
+                self.restarts.append((key, reason))
+                return True
+
+        env.client.on("auth.test", lambda m, p: ok(AUTH_OK))
+        gate = FingerprintGate(env.conn, env.cfg, env.client, env.clock, notifier=lambda *a: None)
+        assert gate.startup() == "ok"
+        mgr = Mgr()
+        logs = []
+
+        def loop_once():
+            gate.tick()
+            return mod.restart_consumer_if_app_token_changed(gate, mgr, log=logs.append)
+
+        assert loop_once() is False and mgr.restarts == []
+        _rewrite_tokens(tokens, bot="xoxb-new", app=tokens.tokens["app_token"])   # 只换 bot token
+        assert loop_once() is False and mgr.restarts == []
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok"           # gate 重验了新 bot token
+        _rewrite_tokens(tokens, bot="xoxb-new", app="xapp-ROTATED")            # 换 app token
+        assert loop_once() is True
+        assert mgr.restarts == [(SOCKET_KEY, "app_token_changed")]
+        assert logs == ["app_token changed → restarting consumer"]
+        for _ in range(3):                                                     # 一次性信号:不再重拉
+            assert loop_once() is False
+        assert mgr.restarts == [(SOCKET_KEY, "app_token_changed")]
