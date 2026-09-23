@@ -17,7 +17,9 @@ from tests.helpers import (FakeSlackClient, app_mention_event, block_action, env
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-WP1 = pytest.mark.xfail(strict=True, reason="WP1 传输/daemon_core 未落地")
+# WP1 的 drain_staging / ConsumerManager 已落地;下面两条的断言还要 WP2 的 lib/inbound.ingest_in_tx
+# (真实 handed/dropped 语义 + monkeypatch 目标属性),WP2 合入即转绿 → WP5 摘标记。
+WP1 = pytest.mark.xfail(strict=True, reason="WP1 done; needs WP2 inbound.ingest_in_tx")
 WP2 = pytest.mark.xfail(strict=True, reason="WP2 入站/审批/媒体/恢复/生命周期 未落地")
 WP3 = pytest.mark.xfail(strict=True, reason="WP3 出站状态机 未落地")
 WP4 = pytest.mark.xfail(strict=True, reason="WP4 控制面/hooklib/notify/fingerprint 未落地")
@@ -310,8 +312,8 @@ def test_env_click_stages_interactive(env):
     row = env.click(pending_id="p1", nonce="n1", act="reject", card_ts="1.1", action_ts="2.2")
     assert row["envelope_type"] == "interactive" and row["binding_id"] == bid
     assert row["event_key"] == "act:%s:%s:1.1:%s:sb_reject:2.2" % (TEAM, CHAT, OWNER)
-    with pytest.raises(NotImplementedError):
-        env.drain()
+    res = env.drain()   # WP1 已落地:返回四计数(process_in_tx 未落地时该行走 retried 分支)
+    assert set(res) == {"handed", "dropped", "retried", "quarantined"}
 
 
 # ======================================================================
@@ -354,7 +356,6 @@ def test_drain_exception_rolls_back_keeps_staged_and_backs_off(env, monkeypatch)
     assert int(dbmod.get_state(env.conn, "drain_quarantined", "0")) == 1
 
 
-@WP1
 def test_consumer_manager_single_socket_key_and_ready_sentinel(clock):
     from lib import daemon_core
     statuses = []
@@ -366,7 +367,6 @@ def test_consumer_manager_single_socket_key_and_ready_sentinel(clock):
     assert c.ready and (constants.SOCKET_KEY, "ready") in statuses
 
 
-@WP1
 def test_consumer_script_exists():
     assert (ROOT / "bin" / "slack_consumer.py").exists()
 

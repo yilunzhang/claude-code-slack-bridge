@@ -7,7 +7,10 @@ from lib import constants, db as dbmod
 from tests.conftest import CHAT, DM, MEMBER, OWNER, TEAM
 from tests.helpers import app_mention_event, block_action, envelope, message_event, slack_file
 
-WP1 = pytest.mark.xfail(strict=True, reason="WP1 daemon_core.drain_staging 未落地")
+# WP1 的 drain_staging 已落地(事务/退避/隔离机制在 tests/test_daemon_plumbing.py 用契约形状的假 ingest 验证);
+# 下面标 WP1 的用例还依赖 WP2 的 lib/inbound.ingest_in_tx(真实 handed/dropped 语义、monkeypatch 目标属性),
+# WP2 合入即转绿(strict → 报错提醒)→ WP5 摘标记。
+WP1 = pytest.mark.xfail(strict=True, reason="WP1 done; needs WP2 inbound.ingest_in_tx")
 WP2 = pytest.mark.xfail(strict=True, reason="WP2 inbound/approval 事务接口未落地")
 
 
