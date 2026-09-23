@@ -261,6 +261,10 @@ class SlackClient:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
             return self._on_http_error(method, e)
+        except ValueError:
+            # http.client 的 header 校验(token 含 \r/\n 等)/ 非法 URL:请求根本没写出 → not_sent。
+            # **不**附带异常对象/文本:这类 ValueError 的文本是 `Invalid header value b'Bearer <token>…'`(R1-M5)。
+            return CallResult(ok=False, error="bad_request", not_sent=True)
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", None)
             if isinstance(reason, (socket.timeout, TimeoutError)):

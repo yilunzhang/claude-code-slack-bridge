@@ -5,7 +5,8 @@
 (不解析业务、不联网发消息、stdout 不承载数据)。daemon 每 tick 只 drain `slack_events` 表。
 
 - tokens:自读 `tokens.json`(`config.load_tokens(allow_env=False)`;文件是真相;尊重
-  `SLACK_BRIDGE_DATA_DIR`);token 只在内存,**绝不进 stderr / stdout / 异常文本**。
+  `SLACK_BRIDGE_DATA_DIR`);token 只在内存,**绝不进 stderr / stdout / 异常文本**:
+  `status()` 对每一行 `util.redact_secrets`;凭据相关异常只打类型名(`_exc_label`,R1-M5)。
 - 客户端(R2-N3,关键字参数):`WebClient(token=app_token, retry_handlers=[])`;
   `SocketModeClient(app_token=…, web_client=…, auto_reconnect_enabled=True, ping_interval=10)`。
 - `on_request(client, req)`(sdk 线程池线程,每线程独立 `db.connect_short(CONSUMER_DB_BUSY_MS)`):
@@ -47,13 +48,15 @@ FATAL_AUTH_ERRORS = frozenset(constants.NOT_SENT_ERRORS) | frozenset({
 })
 
 _status_lock = threading.Lock()
+_SECRETS = []   # main() 读到 tokens 后填入(bot/app token);status() 对每一行遮蔽(R1-M5)
 
 
 def status(line):
-    """stderr 状态行(唯一输出通道;绝不含 token / payload)。"""
+    """stderr 状态行(唯一输出通道;绝不含 token / payload)。每一行都过 util.redact_secrets:
+    显式 token + Slack token 形态兜底 —— 即便某处不慎把异常文本拼进来也不会泄漏。"""
     with _status_lock:
         try:
-            sys.stderr.write(line + "\n")
+            sys.stderr.write(util.redact_secrets(line, _SECRETS) + "\n")
             sys.stderr.flush()
         except (OSError, ValueError):
             pass
@@ -69,9 +72,13 @@ def _env_float(name, default):
         return default
 
 
-def _exc_label(e):
-    """异常 → 安全短标签(类型名 + 截断文本;sqlite/网络异常文本不含凭据)。"""
-    text = str(e).replace("\n", " ")[:120]
+def _exc_label(e, with_text=False):
+    """异常 → 安全短标签。缺省**只有类型名**(R1-M5:凭据相关路径 —— connect / sdk / 未知异常 —— 的
+    异常文本可能含 `Bearer <token>`,一律不打);`with_text=True` 仅供 sqlite 路径(文本形如
+    "database is locked",对排障有用),且仍经 status() 遮蔽。"""
+    if not with_text:
+        return type(e).__name__
+    text = util.redact_secrets(str(e).replace("\n", " ")[:120], _SECRETS)
     return "%s:%s" % (type(e).__name__, text) if text else type(e).__name__
 
 
@@ -141,7 +148,7 @@ class Consumer:
             with db.tx(conn):
                 db.bump_counter(conn, key)
         except Exception as e:  # noqa: BLE001
-            status("[socket] warn count_failed key=%s err=%s" % (key, _exc_label(e)))
+            status("[socket] warn count_failed key=%s err=%s" % (key, _exc_label(e, with_text=True)))
             self._drop_conn()
 
     # ------------------------------------------------------------------ ack
@@ -188,11 +195,11 @@ class Consumer:
                     db.bump_counter(conn, "staged_dup")
         except sqlite3.OperationalError as e:
             # busy / locked / I/O:未提交 → 不 ack(Slack 重投)
-            status("[socket] warn db_locked envelope=%s err=%s" % (req.envelope_id, _exc_label(e)))
+            status("[socket] warn db_locked envelope=%s err=%s" % (req.envelope_id, _exc_label(e, with_text=True)))
             self._drop_conn()
             return
         except Exception as e:  # noqa: BLE001
-            status("[socket] warn db_error envelope=%s err=%s" % (req.envelope_id, _exc_label(e)))
+            status("[socket] warn db_error envelope=%s err=%s" % (req.envelope_id, _exc_label(e, with_text=True)))
             self._drop_conn()
             return
         self._ack(client, req)  # 只有提交之后才到这里
@@ -339,9 +346,10 @@ def main(argv=None):
     try:
         tokens, _version = configmod.load_tokens(paths.tokens_path(), allow_env=False)
     except configmod.ConfigError as e:
-        status("[socket] fatal tokens %s" % str(e).replace("\n", " ")[:160])
+        status("[socket] fatal tokens %s" % util.redact_secrets(str(e).replace("\n", " ")[:160]))
         return constants.CONSUMER_RC_TOKENS
     app_token = tokens.get("app_token")
+    _SECRETS[:] = [v for v in tokens.values() if isinstance(v, str) and v]
     if not app_token:
         status("[socket] fatal tokens missing app_token")
         return constants.CONSUMER_RC_TOKENS
@@ -356,7 +364,7 @@ def main(argv=None):
         finally:
             probe.close()
     except Exception as e:  # noqa: BLE001
-        status("[socket] fatal db_schema %s" % _exc_label(e))
+        status("[socket] fatal db_schema %s" % _exc_label(e, with_text=True))
         return constants.CONSUMER_RC_OTHER
     consumer = Consumer(sdk, app_token, db_file)
     try:

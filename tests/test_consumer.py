@@ -301,6 +301,31 @@ def test_rc_connect_network_exception(conn, tokens, tmp_path):
     assert run.stderr_lines()[1].startswith("[socket] fatal connect_failed")
 
 
+def test_header_valueerror_on_connect_never_leaks_token(conn, tokens, tmp_path):
+    """R1-M5:sdk connect 路径抛出携带 `Bearer <xapp token>` 的 ValueError(真 sdk 里 token 含换行时
+    http.client 的 header 校验就是这样抛的)—— stderr 只有类型名,整份输出零 token。"""
+    run = ConsumerRun(tmp_path, [{"__control": "connect_exception", "kind": "header_valueerror"}, HELLO])
+    assert run.finish() == constants.CONSUMER_RC_OTHER == 5
+    lines = run.stderr_lines()
+    assert lines[1] == "[socket] fatal connect_failed ValueError"
+    assert "Bearer" not in run.err and "Invalid header" not in run.err
+    assert_no_secret(run)
+
+
+def test_rc_tokens_with_embedded_newline_rejected_at_load(conn, data_dir, tmp_path):
+    """含内部换行的 xapp token 在装载处就拒(rc 2),stderr 不含 token。"""
+    from lib import paths
+    paths.ensure_data_dir()
+    util.atomic_write(str(paths.tokens_path()),
+                      json.dumps({"bot_token": BOT_TOKEN, "app_token": "xapp-part1\npart2-secret"}).encode(),
+                      mode=0o600)
+    run = ConsumerRun(tmp_path, [HELLO])
+    assert run.finish() == constants.CONSUMER_RC_TOKENS == 2
+    assert run.stderr_lines()[0].startswith("[socket] fatal tokens") and "app_token" in run.err
+    assert "part2-secret" not in run.err and "part1" not in run.err
+    assert_no_secret(run)
+
+
 def test_rc_no_hello_is_fatal_auth(conn, tokens, tmp_path):
     run = ConsumerRun(tmp_path, [{"__control": "sleep", "seconds": 5}],
                       env_extra={"SLACK_BRIDGE_CONSUMER_HELLO_TIMEOUT_S": "0.3"})

@@ -17,7 +17,7 @@ import subprocess
 from . import approval as approval_mod
 from . import constants, db
 from . import inbound as inbound_mod
-from . import slackwire
+from . import slackwire, util
 
 SOCKET_KEY = constants.SOCKET_KEY
 
@@ -422,7 +422,7 @@ class DaemonCore:
 
     def _record_drain_failure(self, row, exc, now, counts):
         attempts = int(row["drain_attempts"] or 0) + 1
-        err = repr(exc)[:DRAIN_ERROR_MAX_LEN]
+        err = util.redact_secrets(repr(exc))[:DRAIN_ERROR_MAX_LEN]   # 入库/进 status 输出前遮蔽(R1-M5)
         try:
             if attempts >= constants.DRAIN_MAX_ATTEMPTS:
                 with db.tx(self.conn):
@@ -455,8 +455,9 @@ class DaemonCore:
             res = self.inbound.drive_pending_rows(budget)
         except Exception as e:  # noqa: BLE001
             db.bump_counter(self.conn, "event_processing_errors")
-            db.set_state(self.conn, "last_error", ("followup %s: %s" % (type(e).__name__, e))[:200])
-            self.log("followup error: %s: %s" % (type(e).__name__, e))
+            text = util.redact_secrets(str(e))   # last_error 会被 bridgectl status 打进模型输出(R1-M5)
+            db.set_state(self.conn, "last_error", ("followup %s: %s" % (type(e).__name__, text))[:200])
+            self.log("followup error: %s: %s" % (type(e).__name__, text))
             return {}
         return res if isinstance(res, dict) else {}
 

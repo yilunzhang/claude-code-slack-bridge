@@ -33,11 +33,15 @@ from lib.recovery import Recovery  # noqa: E402
 from lib.slackapi import DaemonStateCooldownStore, SlackClient  # noqa: E402
 
 
+_SECRETS = []   # 启动读到 tokens 后填入;daemon.log 每一行都过 util.redact_secrets(R1-M5)
+
+
 def log_line(msg):
     import datetime
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        util.append_log_line(paths.daemon_log_path(), "%s %s" % (ts, msg))
+        util.append_log_line(paths.daemon_log_path(),
+                             "%s %s" % (ts, util.redact_secrets(msg, _SECRETS)))
     except OSError:
         pass
 
@@ -85,6 +89,11 @@ def main():
         log_line("refuse start: tokens: %s" % e)
         db.set_state(conn, "last_error", "tokens.json unusable — daemon refused to start")
         return 2
+    try:   # 遮蔽表:bot/app token(daemon.log 每行 redact;失败不影响启动,形态兜底仍在)
+        _SECRETS[:] = [v for v in configmod.load_tokens(paths.tokens_path(), allow_env=False)[0].values()
+                       if isinstance(v, str) and v]
+    except configmod.ConfigError:
+        pass
     # 指纹/凭据门 fail-closed(缺字段≠ok;unknown/版本不符 → 出站停摆+退避重探)
     gate = FingerprintGate(conn, cfg, client, clock, notifier=None)
     state = gate.startup()

@@ -32,12 +32,15 @@ def _validate_bootstrap_tokens(tokens):
     bot = bot.strip()
     if not bot.startswith("xoxb-"):
         raise configmod.ConfigError("bot_token 应为 bot token(xoxb-…);拒绝 user/其它类型 token")
+    configmod.check_token_chars(bot, "bootstrap", "bot_token")   # 内部换行/空白:联网前就拒(R1-M5)
     if app is not None:
         if not isinstance(app, str):
             raise configmod.ConfigError("app_token 须为字符串")
         app = app.strip() or None
         if app and not app.startswith("xapp-"):
             raise configmod.ConfigError("app_token 应为 app-level token(xapp-…,scope connections:write)")
+        if app:
+            configmod.check_token_chars(app, "bootstrap", "app_token")
     return {"bot_token": bot, "app_token": app}
 
 

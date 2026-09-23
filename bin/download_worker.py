@@ -33,6 +33,7 @@ RC_TRANSIENT = constants.WORKER_RC_TRANSIENT
 RC_HTTP_RETRY = constants.WORKER_RC_HTTP_RETRY
 RC_DEADLINE = constants.WORKER_RC_DEADLINE
 RC_ORPHAN = constants.WORKER_RC_ORPHAN
+RC_UNEXPECTED = 1                      # run() 抛出未预期异常:不在 §6 列内 → 父进程计 worker_unexpected_exit
 CHUNK = 64 * 1024
 WATCHDOG_INTERVAL_S = 1.0
 USER_AGENT = "slack-bridge-download-worker/1"
@@ -183,6 +184,9 @@ def run(req, opener=None):
         return RC_PERMANENT, _result(http_status=code, error="http_%d" % code)
     except (urllib.error.URLError, socket.timeout, http.client.HTTPException, OSError) as e:
         return RC_TRANSIENT, _result(error="network:%s" % (getattr(e, "reason", None) or e))
+    except ValueError:
+        # header 校验(token 含 \r/\n)/ 非法 URL:永久;**只给固定码**,异常文本含 `Bearer <token>`(R1-M5)
+        return RC_PERMANENT, _result(error="bad_request")
     status = int(getattr(resp, "status", None) or resp.getcode() or 0)
     headers = resp.headers
     ctype = headers.get("Content-Type") if headers is not None else None
@@ -264,7 +268,11 @@ def main(stdin=None, out=None):
         return RC_ARGS
     signal.signal(signal.SIGALRM, _on_alarm)
     signal.alarm(int(req["timeout_s"]) + constants.WORKER_ALARM_SLACK_S)
-    rc, result = run(req)
+    try:
+        rc, result = run(req)
+    except Exception as e:  # noqa: BLE001 —— 绝不让 traceback(可能含 token)落到 stderr(R1-M5)
+        emit(_result(error="worker_exception:%s" % type(e).__name__), out)
+        return RC_UNEXPECTED
     emit(result, out)
     return rc
 

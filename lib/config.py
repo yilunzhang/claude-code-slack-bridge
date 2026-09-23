@@ -157,15 +157,32 @@ def tokens_stat_signature(path=None):
     return (st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+def check_token_chars(token, where, name):
+    """token 只允许可打印 ASCII 且不含空白(0x21–0x7E,R1-M5)。含 \\r / \\n / \\t / 空格 / 控制字符 /
+    非 ASCII 的 token 会让 HTTP header 校验抛出**把整个 `Bearer <token>` 写进文本**的 ValueError,
+    再经异常文本进 stderr / daemon.log —— 在装载处就拒掉(错误文案绝不带 token 本身)。"""
+    if not isinstance(token, str):
+        raise ConfigError(f"{where}: {name} 须为字符串")
+    bad = [c for c in token if not (0x21 <= ord(c) <= 0x7E)]
+    if bad:
+        kinds = sorted({("空白" if c.isspace() else "控制字符" if ord(c) < 0x20 or ord(c) == 0x7F
+                         else "非 ASCII") for c in bad})
+        raise ConfigError(f"{where}: {name} 含非法字符({'/'.join(kinds)});token 只能是可打印 ASCII 且不含空白")
+    return token
+
+
 def _validate_tokens(tokens, where):
     if not isinstance(tokens, dict):
         raise ConfigError(f"{where}: 顶层必须是 JSON 对象")
     bot = tokens.get("bot_token")
     if not isinstance(bot, str) or not bot:
         raise ConfigError(f"{where}: 缺 bot_token")
+    check_token_chars(bot, where, "bot_token")
     app = tokens.get("app_token")
     if app is not None and not isinstance(app, str):
         raise ConfigError(f"{where}: app_token 须为字符串")
+    if app:
+        check_token_chars(app, where, "app_token")
     return {"bot_token": bot, "app_token": app or None}
 
 

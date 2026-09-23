@@ -19,7 +19,7 @@ import sys
 import time
 import uuid
 
-from . import constants
+from . import constants, util
 from .slackapi import DownloadResult
 
 WORKER_PATH = pathlib.Path(__file__).resolve().parents[1] / "bin" / "download_worker.py"
@@ -268,7 +268,8 @@ def _download_one(url, dest_tmp, token, max_bytes, deadline_at, worker_path=None
             out, err = proc.communicate()
     rc = proc.returncode
     resp = _parse_worker_line(out)
-    err_text = (err or b"")[:300].decode("utf-8", "replace") if err else ""
+    # worker stderr / 错误文本进 daemon.log 前遮蔽 token(worker 自身也不打 traceback,双保险;R1-M5)
+    err_text = util.redact_secrets((err or b"")[:300].decode("utf-8", "replace"), (token,)) if err else ""
     if killed:
         _log(log, "download worker killed by parent deadline rc=%s stderr=%r" % (rc, err_text))
         _unlink(dest_tmp)
@@ -284,7 +285,7 @@ def _download_one(url, dest_tmp, token, max_bytes, deadline_at, worker_path=None
         _log(log, "download worker rc=0 but result inconsistent resp=%r" % (resp,))
         _unlink(dest_tmp)
         return DownloadResult(ok=False, error="inconsistent_result", rc=-1000)   # 计 worker_unexpected_exit
-    error = (resp or {}).get("error") or ("rc=%s" % rc)
+    error = util.redact_secrets((resp or {}).get("error") or ("rc=%s" % rc), (token,))
     _unlink(dest_tmp)
     if rc in PERMANENT_RCS:
         _log(log, "download worker permanent rc=%s error=%r" % (rc, error))

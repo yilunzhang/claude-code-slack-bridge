@@ -1,10 +1,16 @@
 """小工具:id/nonce/marker/chunk/原子写/日志轮转 + Slack 文本/消息标识辅助。"""
 import json
 import os
+import re
 import secrets
 import uuid
 
 from . import constants
+
+# Slack token 形态(xoxb-/xoxp-/xoxa-/xoxr-/xoxe-… 与 xapp-):显式 secrets 之外的兜底遮蔽。
+SLACK_TOKEN_RE = re.compile(r"\bxox[a-z]-[A-Za-z0-9._-]{6,}|\bxapp-[A-Za-z0-9._-]{6,}")
+REDACT_MASK = "***"
+REDACT_MIN_LEN = 6   # 太短的"秘密"不做子串替换(会把日志打成筛子);token 长度远大于此
 
 
 def new_id():
@@ -114,6 +120,33 @@ def atomic_write(path, data, mode=0o600):
         except OSError:
             pass
         raise
+
+
+def redact_secrets(text, secrets=(), mask=REDACT_MASK):
+    """把 `secrets` 里每个非空字符串在 `text` 中的出现替换为 `mask`(R1-M5):任何可能带异常文本的
+    stderr / daemon.log / daemon_state.last_error / CLI JSON 行都要先过这里。
+    - 同时替换其 repr 转义形态(`repr(s)[1:-1]` / `repr(s.encode())[2:-1]`):异常文本常是
+      `Invalid header value b'Bearer xapp-…\\n'` 这种 bytes repr,含换行的 token 在里面是转义过的;
+    - 兜底:Slack token 形态(SLACK_TOKEN_RE)一律遮蔽,调用方不知道具体 secret 时也有效;
+    - text 非 str → str();None → ""。"""
+    if text is None:
+        return ""
+    s = text if isinstance(text, str) else str(text)
+    forms = []
+    for sec in secrets or ():
+        if not isinstance(sec, str) or len(sec) < REDACT_MIN_LEN:
+            continue
+        forms.append(sec)
+        esc = repr(sec)[1:-1]
+        if esc != sec:
+            forms.append(esc)
+        besc = repr(sec.encode("utf-8", "replace"))[2:-1]
+        if besc not in (sec, esc):
+            forms.append(besc)
+    for f in sorted(set(forms), key=len, reverse=True):   # 长的先替,避免残留片段
+        if f in s:
+            s = s.replace(f, mask)
+    return SLACK_TOKEN_RE.sub(mask, s)
 
 
 def append_log_line(path, line, max_bytes=constants.LOG_MAX_BYTES):

@@ -15,7 +15,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from lib import config as configmod  # noqa: E402
-from lib import constants, ctl, db, lifecycle, paths, procs, senderallow  # noqa: E402
+from lib import constants, ctl, db, lifecycle, paths, procs, senderallow, util  # noqa: E402
 from lib.clock import SystemClock  # noqa: E402
 from lib.slackapi import SlackClient  # noqa: E402
 
@@ -74,7 +74,7 @@ def cmd_bootstrap(args):
             owner=args.owner, owner_email=args.owner_email, app_id=args.app_id,
             tokens=tokens, chat_allowlist=allow, clock=SystemClock())
     except configmod.ConfigError as e:
-        out({"ok": False, "error": str(e)}, 2)
+        out({"ok": False, "error": util.redact_secrets(str(e))}, 2)
     tok = ctl.tokens_file_status()
     res = {
         "ok": True,
@@ -335,7 +335,11 @@ def main():
     try:
         args.fn(args)
     except configmod.ConfigError as e:
-        out({"ok": False, "error": str(e)}, 2)
+        out({"ok": False, "error": util.redact_secrets(str(e))}, 2)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 —— 绝不裸 traceback(异常文本可能含 token;R1-M5)
+        out({"ok": False, "error": "internal-error", "type": type(e).__name__}, 2)
 
 
 if __name__ == "__main__":

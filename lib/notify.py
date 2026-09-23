@@ -17,7 +17,7 @@ run_notify 全依赖注入(stdin_text/environ/prober/start_pid/make_client)→ �
 import re
 
 from . import config as configmod
-from . import constants, db, paths, procs
+from . import constants, db, paths, procs, util
 from .slackapi import DaemonStateCooldownStore, SlackClient, classify_send_error
 
 # Slack user id 形态(U… / W…);fullmatch 而非 `^…$`(后者 `$` 会放过尾换行)。
@@ -101,6 +101,11 @@ def run_notify(*, stdin_text, environ, prober, start_pid, make_client):
     一律 `sent:"unknown"`(绝不降 sent:false 免重复 @);置位前异常 = 确定未发 → internal-error。
     `make_client(tokens, version, cooldown_store) -> client`(生产 = default_make_client)。"""
     may_have_sent = False
+    secrets = []   # 已读到的 token(仅用于遮蔽异常文本;R1-M5)
+
+    def _detail(e):
+        return util.redact_secrets(str(e), secrets)
+
     try:
         # 1. 读消息(前置)。strip 只用于判空与去两端空白;<! / NUL / 超长 在进 call 前拒。
         msg = (stdin_text or "").strip()
@@ -174,7 +179,8 @@ def run_notify(*, stdin_text, environ, prober, start_pid, make_client):
                 tokens, file_version = configmod.load_tokens(allow_env=False)
             except configmod.ConfigError as e:
                 return ({"ok": False, "sent": False, "reason": "credentials-unverified",
-                         "detail": "tokens.json 不可用:%s" % e}, 3)
+                         "detail": "tokens.json 不可用:%s" % _detail(e)}, 3)
+            secrets.extend(v for v in tokens.values() if isinstance(v, str))
 
             # 8a. 身份门 + 凭据版本门,**一条 SELECT 同一读快照**联合判定(R1-M4)。
             #     分两次读会有跨版本拼接竞态:先读到旧版本的 `ok`,随后 token 轮换、daemon 原子写入
@@ -216,11 +222,13 @@ def run_notify(*, stdin_text, environ, prober, start_pid, make_client):
         finally:
             conn.close()
     except configmod.ConfigError as e:
-        return ({"ok": False, "sent": False, "reason": "config", "detail": str(e)}, 3)
+        return ({"ok": False, "sent": False, "reason": "config", "detail": _detail(e)}, 3)
     except db.SchemaMismatch as e:
-        return ({"ok": False, "sent": False, "reason": "schema-mismatch", "detail": str(e)}, 3)
+        return ({"ok": False, "sent": False, "reason": "schema-mismatch", "detail": _detail(e)}, 3)
     except Exception as e:  # noqa: BLE001 —— 绝不裸 traceback;按 may_have_sent 分主信号
+        # detail = 类型名 + 遮蔽后的文本(输出会进模型上下文,token 绝不能出现;R1-M5)
         if may_have_sent:
             return ({"ok": False, "sent": "unknown", "reason": "internal-error-after-send",
-                     "detail": str(e)}, 5)
-        return ({"ok": False, "sent": False, "reason": "internal-error", "detail": str(e)}, 3)
+                     "detail": "%s: %s" % (type(e).__name__, _detail(e))}, 5)
+        return ({"ok": False, "sent": False, "reason": "internal-error",
+                 "detail": "%s: %s" % (type(e).__name__, _detail(e))}, 3)
