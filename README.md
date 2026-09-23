@@ -6,8 +6,10 @@
 一轮因 API 错误结束时 StopFailure hook 自动告警。多个 session 可各绑不同会话;bind 可在 session 半途进行;
 启动 Claude Code 不需要任何特殊参数。
 
-> **状态**:WP0–WP4 已落地(脚手架 / 传输 / 入站审批媒体 / 出站状态机 / 控制面与文档),**WP5 集成前
-> 不保证可运行**;真机验证清单见文末。跨模块语义冻结在 [`docs/contracts.md`](docs/contracts.md)。
+> **状态**:v0.1.0 —— 离线测试全绿(`python3` / `python3.9` 全量 + `.venv-test` 真实 slack_sdk 运行层契约),
+> **真机验证清单(文末)尚未跑**,真机能力探测结果 `docs/capability-probe.md` 仍为 UNCONFIRMED。
+> 跨模块语义冻结在 [`docs/contracts.md`](docs/contracts.md)(末尾附各工作包的实现偏差记录);开发/测试约定见
+> [`docs/dev.md`](docs/dev.md)。
 
 ## 出处
 
@@ -154,24 +156,37 @@ python3 …/bridgectl.py probe --chat-id C0TESTCHAN --write-config
    history/replies),核验能力经 probe 确证且凭据版本匹配时最多**自动重发一次**,否则进 `unconfirmed` 诚实终态并告警。
    残余风险:极小概率重复,以及重发后与后续块乱序(同组余块会被取消并告警,要你决定是否补发)。
 2. `markdown_text` 参数与 `metadata` 读回在你的 workspace 是否可用要靠 probe 真机确证;不可用则回退 `text` 模式 +
-   自动重发关闭。
+   自动重发关闭。**`verify_capability` 在跑过 `probe --write-config` 之前恒为 `unverified`**(换过 token 也会回到
+   `unverified`):此时发送结果不确定的消息只核验、绝不自动重发,三次未见即 `unconfirmed` + 告警。
 3. 频道 @bot 会双投(`message` + `app_mention`,同 `ts`):按 `message_id` 去重,files/blocks 只在 `message` 上时做快照升级;
    DM 内 bot 自身消息回流靠 `bot_id / user / app_id` 三组比较过滤。真机样本待确认(`docs/capability-probe.md`)。
-4. 争锁:consumer 每信封短事务(1.5s 超时;超时不 ack,Slack 会重投);drain 每 tick 限批;反复失败的事件进
-   `quarantined`(`status` 高亮,保留 30 天)。
-5. `slack_sdk` 缺失/版本不符 → consumer rc 4/致命鉴权 rc 3,daemon 直接最大退避重拉;`preflight` 会提示。
-6. 只有 owner 自己的 DM 可绑;别人 DM 给 bot 的消息不会被投递(也不回提示,以免打扰)。
-7. bot 不在频道 → 发送 `not_in_channel`/`channel_not_found` 永久失败并告警;`/invite` 后让 agent 补发。
-8. 限流:`SlackClient.call` 层统一方法级冷却(完整 `Retry-After`,daemon / notify / probe 共用 `daemon_state`);
-   每频道 postMessage 节流 1 条/秒。人为 429 时 notify 也会被冷却(`reason=cooldown`)。
-9. 长网络操作:附件下载在子进程里、父进程持绝对 deadline(90s);每 tick 只物化 1 条带下载 / 5 条纯文本;单文件
-   100MB 配额;失败按 10 分钟预算退避后终态。
-10. `markdown` Block Kit 块(notify / StopFailure 正文)按 Slack 的标准 markdown 子集渲染,不保证完整 CommonMark;
+4. 争锁:consumer 每信封短事务(`db.connect_short`,1.5s 超时;超时不 ack,Slack 会重投);drain 每 tick 限批;
+   反复失败的事件进 `quarantined`(`status` 高亮,保留 30 天)。**隔离的事件不会自动重放,需要人看
+   `status.quarantined[].error` + `daemon.log` 修复后自行处理**(重发消息或接受丢失)。
+5. **ack 没有别的模式**(`ack_mode` = none):consumer 只在事件**持久化提交后**才 ack,没有「先 ack 再处理」的选项;
+   故障模型是应用进程崩溃,不承诺断电;锁超时 / 异常一律不 ack,由 Slack 重投,重复经 `event_key` 唯一键吸收
+   (`counters.staged_dup`)。
+6. `slack_sdk` 缺失/版本不符 → consumer rc 4/致命鉴权 rc 3,daemon 直接最大退避重拉;`preflight` 会提示。
+7. 只有 owner 自己的 DM 可绑(`open-dm` 钉住的 `owner_dm_id`;其它任何 `D…` 一律拒);别人 DM 给 bot 的消息不会被投递
+   (也不回提示,以免打扰)。
+8. bot 不在频道 → 发送 `not_in_channel`/`channel_not_found` 永久失败并告警;`/invite` 后让 agent 补发。
+9. 限流:`SlackClient.call` 层统一方法级冷却(完整 `Retry-After`,daemon / notify / probe 共用 `daemon_state`);
+   每频道 postMessage 节流 1 条/秒。**冷却对 notify / StopFailure / probe 同样生效**:人为 429 后 `notifyctl` 返回
+   `not-sent: cooldown`,probe 以 rc 4 退出,到 `cooldown_until` 后再试。
+10. 长网络操作:附件下载在子进程里、父进程持绝对 deadline(90s);每 tick 只物化 1 条带下载 / 5 条纯文本;单文件
+    100MB 配额;失败按 10 分钟预算退避后终态。
+11. **v1 不读线程**:投递给 session 的只有触发消息本身(正文 + 附件 + `thread_ts`),不拉取线程上下文、不做引用提示;
+    agent 需要上下文时只能让 owner 在消息里带上。
+12. **附件只取 Slack 托管、可直接下载的文件**:超出套餐限额被隐藏的(`hidden_by_limit`)、已删除的(tombstone)、
+    无下载 URL 的、超 100MB 的都只在 payload `files[].skipped_reason` 里标注,不下载;外链/Google Drive 类文件同样不取。
+    **Slack Connect 共享频道不在 v1 支持范围**(未真机验证;来自外部 workspace 的用户只会落到成员审批门)。
+13. `markdown` Block Kit 块(notify / StopFailure 正文)按 Slack 的标准 markdown 子集渲染,不保证完整 CommonMark;
     正文 ≤ 12000 字符。
 
 **继承自 feishu-bridge、仍然适用**
-- listener 由 plugin monitor 承载:只有以 `/slack-bridge:bridge` 全名调用时才 arm;monitor 未 arm/启动失败时要按 bind 输出的
-  `listener_cmd` 手动起 Monitor(30 分钟到期要重挂)。
+- **monitor 生命周期限制**:listener 由 plugin monitor 承载,只有以 `/slack-bridge:bridge` 全名调用时才 arm;monitor 未 arm/
+  启动失败时要按 bind 输出的 `listener_cmd` 手动起 Monitor(30 分钟到期要重挂);Claude Code 重启后 monitor 不会自动恢复,
+  需重新 bind。
 - 其它阻断型 Stop hook 共存时,同一 turn 可能触发多次 Stop → 普通 turn 有重复转发组风险(bind turn 有链闩保护);
   `preflight` 会列出 `foreign_stop_hooks`。
 - 页脚里的 tokens/model 来自 transcript,可能滞后约一 turn;effort 取当前值。
@@ -234,14 +249,17 @@ python3 …/bridgectl.py probe --chat-id C0TESTCHAN --write-config
 python3 -m pytest tests/ -q            # 全离线(FakeSlackClient;真实 SQLite)
 python3.9 -m pytest tests/ -q          # 3.9 门禁(有则跑)
 python3 -m pytest tests/test_contracts.py tests/test_drain.py -q   # 冻结契约守卫
+python3 -m venv .venv-test && .venv-test/bin/pip install 'slack_sdk>=3.44,<4' pytest
+.venv-test/bin/python -m pytest tests/test_sdk_contract.py -q      # 真实 slack_sdk 运行层契约
 ```
-`tests/test_sdk_contract.py` 需要真实 `slack_sdk`(`.venv-test`),未安装则 skip。
+`tests/test_sdk_contract.py` 需要真实 `slack_sdk`(`.venv-test`),未安装则 skip。全链路离线集成见
+`tests/test_integration_flow.py`;开发约定(worktree、不用 stash、契约守卫怎么改)见 [`docs/dev.md`](docs/dev.md)。
 
 ## 目录
 
 - `.claude-plugin/` plugin 清单;`hooks/` Stop/SessionEnd/StopFailure;`monitors/` listener monitor;`skills/` bridge / notify
 - `bin/` `daemon.py` `listener.py` `slack_consumer.py` `download_worker.py` `bridgectl.py` `notifyctl.py`
 - `lib/` 核心模块;`schema.sql` 新库 schema(不做迁移);`scripts/capability_probe.py` 真机能力探测
-- `docs/` `contracts.md` `slack-app-manifest.json` `capability-probe.md`;`tests/` 离线测试
+- `docs/` `contracts.md` `dev.md` `slack-app-manifest.json` `capability-probe.md`;`tests/` 离线测试
 
 MIT(见 LICENSE)。

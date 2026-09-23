@@ -396,3 +396,24 @@ ListenerCore(...) / InstanceFollower(...)                          # 不变
 | `inbound.ingest_in_tx` 存在且不 BEGIN、返回映射;`approval.process_in_tx` 返回映射与 dup/invalid/late;`media.materialize` 返回 `(paths, skipped)`;`lifecycle._terminate_in_tx` closed_undelivered;`recovery._expire_pendings` 单条范围;`bin/download_worker.py` 存在 | WP2 |
 | `outbound.op_for` 纯函数与 decision_notice 二选一;`startup_scan` 的 sending→unknown had_unknown=1;`OUTBOUND_TERMINAL_STATES` 不被 recovery 复活 | WP3 |
 | `hooklib` 用 `chunk_text_with_footer`;`notify` credentials-unverified;`fingerprint` 同事务写 gate 版本 | WP4 |
+
+---
+
+## 12. 实现偏差记录(WP5 汇总;正文不改,偏差只在此登记)
+
+各工作包报告的、与上文冻结文本或 plan 原文有出入但已被守卫测试接受的实现选择。改动语义前先看这里。
+
+| WP | 偏差 | 现状 / 理由 |
+|---|---|---|
+| WP0 | `slackwire.event_key("interactive", …)` **不看按钮 value**(只用 team / channel / card_ts / user / action_id / action_ts 六段) | 去重键只由 Slack 自己给的标识组成;value 是我们写进卡片的 JSON,不参与键(§4.2 已按此写) |
+| WP0 | 鉴权族错误(`not_authed / invalid_auth / account_inactive / token_revoked / token_expired / two_factor_setup_required / org_login_required`)放在 `NOT_SENT_ERRORS` 而非永久错 | 这些错误在消息创建之前就被拒 = 肯定未发送 → `not_sent`(走 transient 退避 / cap),门由 FingerprintGate 收;不按 PERMANENT 直接 failed |
+| WP2 | `inbound.ingest_in_tx(conn, row)` / `approval.process_in_tx(conn, payload)` 只收 `(conn, row/payload)`,cfg / clock / inbound 经**模块级登记**(`register_defaults`,最近构造的 `Inbound` / `Approval` 实例)取得 | drain 只传 `(conn, row)`(§1 签名);daemon 内只有一个实例;未登记时 fail-closed(`process_in_tx` 抛错 → drain 退避/隔离,不静默判 undeliverable) |
+| WP2 | `bin/download_worker.py` 看门狗判「父亡」的条件是 `getppid()==1 ∨ getppid()!=启动时的 ppid`(§6 只写了 `==1`) | 超集:macOS 上被 launchd 以外的进程收养也算父亡;仍 `os._exit(125)` |
+| WP2 | `media.materialize(..., allow_plain_http_hosts=None)` 多一个仅测试用的旋钮(允许本地 `http://` 主机) | 只为 `tests/test_download_worker.py` 起本地 `http.server`;生产路径不传,worker 仍只认 https + 主机白名单 |
+| WP3 | 出站告警(`send_failure_alert_body / unconfirmed_alert_body / group_cancelled_alert_body`)**只对 `session_turn`** 入队;approval_card / 各类 notice 失败不告警 | 卡片失败在 `status` 高亮;通知类固定文案不值得再发一条通知去说通知没发出去(告警自身失败也不再生告警) |
+| WP3 | §2.6 error 分支的退避 `min(VERIFY_ERROR_BACKOFF_MS·2^ve, MAX)` 里的 `ve` 用**递增前**的 `verify_error_count`(首次出错退避 5s,而非 10s) | 首次错误不必等两档;cap 判定仍用递增后的值(`ve ≥ VERIFY_ERROR_CAP`) |
+| WP3 | §2.6「永久错」拆成两组:`VERIFY_GLOBAL_DEGRADE_ERRORS`(missing_scope / invalid_auth / …)→ 本 job unconfirmed **且** `verify_capability=degraded:<err>`;`VERIFY_CHANNEL_ERRORS`(channel_not_found / not_in_channel / thread_not_found / …)→ 只本 job unconfirmed,**不动**能力;其余错误码 → error 分支 | 频道级错误不代表核验能力坏了,不应让别的频道的 job 失去自动重发资格 |
+| WP4 | `FingerprintGate._apply` 在**每次**门判定(ok / degraded / mismatch)都写 `outbound_gate_tokens_version`(§4.5 写的是「= 通过 auth.test 的凭据版本」) | 版本键语义 = 「本次判定所绑定的凭据版本」;notify / StopFailure 的直发门仍要求 `outbound_gate=="ok" ∧ 版本相等`,degraded 时版本相等也不放行,语义不变 |
+| WP4 | `outbound_gate` 多一个值 `mismatch`(§4.5 已列)—— 身份漂移与 `degraded:*` 区分 | mismatch 不退避重探(换回 token 或重新 bootstrap 才会变),daemon 启动遇到即拒启(rc 3) |
+| WP4 | `ctl.bind_prepare` 对**任何** `D…` chat 都要求 `cfg.owner_dm_id` 已钉住且相等,否则 `foreign_dm` 拒绝(plan 只写「拒绝非 owner_dm_id 的 D…」) | 没跑过 `open-dm` 时 `owner_dm_id` 为空,此时任何 DM 都拒(fail-closed),而不是放行 |
+| WP5 | daemon 的 xapp 变化探测只保留 `FingerprintGate.app_token_changed()` 一处(WP1 的 `AppTokenWatch` 已删) | 一个 stat、一个真相;主循环在 `core.loop_iteration()`(内含 gate.tick)之后读一次性信号并 `mgr.restart(SOCKET_KEY, "app_token_changed")` |
