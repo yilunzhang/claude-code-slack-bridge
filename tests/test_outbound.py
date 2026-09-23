@@ -1000,6 +1000,51 @@ class TestVerify:
         r = row(env, "turn:g:0")
         assert r["state"] == "unknown" and r["verify_error_count"] == 1 and r["verify_absent_count"] == 0
 
+    @pytest.mark.parametrize("data", [
+        {"messages": [None], "has_more": False},                                  # 元素非 dict
+        {"messages": [], "response_metadata": {"next_cursor": 42}},               # cursor 非 str
+        {"messages": [], "has_more": "yes"},                                      # has_more 非 bool
+        {"messages": [], "has_more": None},                                       # has_more 存在但 null
+        {"messages": [], "has_more": False, "response_metadata": "junk"},         # response_metadata 非 dict
+        {"messages": [{"ts": "1.1"}, "str"], "has_more": False},                  # 混入非 dict 元素
+    ], ids=["null-element", "int-cursor", "str-has_more", "null-has_more", "junk-metadata", "mixed-element"])
+    def test_malformed_page_is_error_never_absent(self, env, data):
+        """R2-M1:畸形响应 = 不可解析 → error 分支(verify_error_count+1),绝不把非法 cursor / 非法元素
+        折叠成"完整且没有下一页"而记 absent(三次 absent 就会触发重发)。字段**缺省**才取默认值,
+        字段**存在但类型错**一律 error。"""
+        bid = env.make_binding(status="active")
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: ok(data))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_error_count"] == 1 and r["verify_absent_count"] == 0
+        assert len(env.client.calls_for(HIST)) == 1 and len(env.client.calls_for(PM)) == 1   # 不翻页、不重发
+
+    def test_empty_cursor_with_has_more_false_is_complete_page(self, env):
+        """R2-M1:`next_cursor: ""` 是 Slack 表示"没有下一页"的正规写法(与字段缺省等价)
+        → 完整查询未命中 → absent(不是 error)。"""
+        bid = env.make_binding(status="active")
+        send_unknown(env, bid)
+        env.client.on(HIST, lambda m, q: ok({"messages": [], "has_more": False,
+                                             "response_metadata": {"next_cursor": ""}}))
+        verify_tick(env)
+        r = row(env, "turn:g:0")
+        assert r["state"] == "unknown" and r["verify_absent_count"] == 1 and r["verify_error_count"] == 0
+
+    def test_page_validator_pure_function(self):
+        """`outbound.verify_page(data)` → (messages, next_cursor|None) 或 None(畸形)。"""
+        from lib import outbound as ob
+        assert ob.verify_page({"messages": []}) == ([], None)
+        assert ob.verify_page({"messages": [{"ts": "1"}], "has_more": False, "response_metadata": {}}) == ([{"ts": "1"}], None)
+        assert ob.verify_page({"messages": [], "has_more": True, "response_metadata": {"next_cursor": "c"}}) == ([], "c")
+        assert ob.verify_page({"messages": [], "has_more": False, "response_metadata": {"next_cursor": "c"}}) == ([], "c")
+        assert ob.verify_page({"messages": [], "response_metadata": {"next_cursor": ""}}) == ([], None)
+        for bad in ({"messages": [None]}, {"messages": [], "response_metadata": {"next_cursor": 42}},
+                    {"messages": [], "has_more": "yes"}, {"messages": [], "has_more": True},
+                    {"messages": [], "has_more": True, "response_metadata": {"next_cursor": ""}},
+                    {"messages": "x"}, {}, None, {"messages": [], "response_metadata": []}):
+            assert ob.verify_page(bad) is None, bad
+
     def test_hit_requires_bot_id_event_type_and_job_id(self, env):
         bid = env.make_binding(status="active")
         r = send_unknown(env, bid)

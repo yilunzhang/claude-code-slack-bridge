@@ -97,6 +97,37 @@ def _verify_method_for(thread_ts):
     return VERIFY_REPLIES if thread_ts else VERIFY_HISTORY
 
 
+def verify_page(data):
+    """严格校验 conversations.history / replies 的一页(R2-M1)。→ `(messages, next_cursor|None)`,
+    畸形 → `None`(调用方记 error,绝不算 absent)。**字段缺省取默认,字段存在但类型错一律畸形**:
+    - `messages` 必须是 list 且每个元素都是 dict;
+    - `has_more` 若存在必须是 bool;
+    - `response_metadata` 若存在必须是 dict;其 `next_cursor` 若存在必须是 str(空串 = 没有下一页);
+    - `has_more=True` 必须给出非空 cursor(否则无法翻页 = 不完整查询)。
+    纯函数:不读 DB / 时钟。"""
+    if not isinstance(data, dict):
+        return None
+    msgs = data.get("messages")
+    if not isinstance(msgs, list) or not all(isinstance(m, dict) for m in msgs):
+        return None
+    has_more = data.get("has_more", False)
+    if not isinstance(has_more, bool):
+        return None
+    cursor = None
+    if "response_metadata" in data:
+        meta = data["response_metadata"]
+        if not isinstance(meta, dict):
+            return None
+        if "next_cursor" in meta:
+            cursor = meta["next_cursor"]
+            if not isinstance(cursor, str):
+                return None
+            cursor = cursor or None
+    if has_more and not cursor:
+        return None
+    return msgs, cursor
+
+
 def _sql_in(values):
     return ",".join("?" for _ in values)
 
@@ -816,24 +847,19 @@ class Outbound:
             res = self.client.call(method, params, timeout_s=constants.SEND_TIMEOUT_S)
             cls = classify_send_error(res)
             if cls == "sent":
-                msgs = res.get("messages")
-                if not isinstance(msgs, list):
-                    outcome = "error"       # 响应没有 messages 列表 = 不完整查询,绝不算 absent
+                page = verify_page(res.data)
+                if page is None:
+                    outcome = "error"       # 畸形 / 不可解析的一页 = 不完整查询,绝不算 absent(R2-M1)
                     break
+                msgs, cursor = page
                 hit_ts = self._find_hit(job_id, msgs)
                 if hit_ts:
                     outcome = "hit"
                     break
-                meta = res.get("response_metadata")
-                cursor = meta.get("next_cursor") if isinstance(meta, dict) else None
-                cursor = cursor if isinstance(cursor, str) and cursor else None
-                if res.get("has_more") or cursor:
-                    if not cursor:
-                        outcome = "error"   # 声称还有更多却给不出 cursor → 无法翻页 → 不算 absent
-                        break
+                if cursor:
                     params = dict(params, cursor=cursor)
-                    continue  # 翻页;页数用尽仍 has_more → 循环结束 outcome None → error
-                outcome = "absent"          # 只有完整翻完且未命中才是 absent
+                    continue  # 翻页;页数用尽仍有 cursor → 循环结束 outcome None → error
+                outcome = "absent"          # 只有完整翻完(严格校验通过且无下一页)且未命中才是 absent
                 break
             if cls == "wait":
                 outcome = "wait"
