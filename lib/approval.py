@@ -39,6 +39,10 @@ def _resolve(cfg, clock, inbound):
             clock = SystemClock()
     if inbound is None:
         inbound = _DEFAULTS["inbound"]
+        if inbound is None:
+            # fail-closed:没有 Inbound 就无法入队;抛错让 drain 退避/隔离,而不是静默判 undeliverable
+            raise RuntimeError("approval.process_in_tx: no Inbound registered "
+                               "(construct Approval(conn, cfg, clock, inbound) first)")
     return cfg, clock, inbound
 
 
@@ -106,7 +110,7 @@ def process_in_tx(conn, payload, cfg=None, clock=None, inbound=None):
             binding = conn.execute("SELECT * FROM bindings WHERE binding_id=?",
                                    (pending["binding_id"],)).fetchone()
             ok = False
-            if binding is not None and inbound is not None:
+            if binding is not None:
                 ok = inbound._enqueue_in_tx(inbox_row, binding, snap, "awaiting_approval", now,
                                             approved_by=f["user"], create_receipt=False)
             if ok:

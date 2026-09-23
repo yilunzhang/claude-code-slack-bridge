@@ -287,6 +287,16 @@ class TestApproveWithFiles:
 
 
 class TestClassShape:
+    def test_module_function_without_registered_inbound_fails_closed(self, env, monkeypatch):
+        p, ev = member_pending(env)
+        monkeypatch.setitem(approval._DEFAULTS, "inbound", None)
+        payload = block_action(p["pending_id"], p["nonce"], user=OWNER, channel=CHAT, card_ts=CARD_TS)
+        with pytest.raises(RuntimeError, match="no Inbound registered"):
+            with dbmod.tx(env.conn):
+                approval.process_in_tx(env.conn, payload)
+        assert pending_row(env, p["pending_id"])["state"] == "pending"      # 随事务回滚,零副作用
+        assert cb_count(env) == 0
+
     def test_frozen_constructor_and_delegation(self, env):
         a = Approval(env.conn, env.cfg, env.clock, env.inbound)
         p, ev = member_pending(env)
