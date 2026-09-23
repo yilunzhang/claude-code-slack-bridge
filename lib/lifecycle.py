@@ -1,5 +1,7 @@
-"""绑定生命周期:bind 建行(1:1/TOCTOU 原子闭合)/ 统一终止事务 / 判死两条独立 CAS /
-confirmed→激活 / pending_bind 超时(r6:同一终止事务)。plan 4.1/4.6/4.8。"""
+"""绑定生命周期:bind 建行(1:1/TOCTOU 原子闭合)/ 统一终止事务(contracts §5.6 绑定范围)/
+判死两条独立 CAS / confirmed→激活 / pending_bind 超时(同一终止事务)。
+`create_decision_notice` 是六种 decision_notice outcome 的唯一入队点(contracts §5.5),
+供 approval / inbound / recovery / 本模块共用(本模块位于依赖链下游,故放在此处)。"""
 import sqlite3
 
 from . import constants, db, jobs, procs, texts, util
@@ -78,9 +80,31 @@ def map_terminated_to_inbox_state(binding_row):
     return "session_closed"  # 未知 reason 保守按"已关闭"提示
 
 
+def create_decision_notice(conn, *, pending_id, binding_id, chat_id, message_id, reply_to,
+                           outcome, now):
+    """decision_notice 入队(contracts §5.5):键 dec:<pid>:<outcome>,expected_state=outcome,
+    body = 纯文本形态(卡片身份未知时的 chat.postMessage/text;卡片已知时 outbound 按
+    expected_state + pendings.decided_by 构造 chat.update blocks)。→ 是否新插入。"""
+    if outcome not in constants.DECISION_OUTCOMES:
+        raise ValueError("unknown decision outcome: %r" % (outcome,))
+    return jobs.create_job(
+        conn, kind="decision_notice", chat_id=chat_id, binding_id=binding_id, reply_to=reply_to,
+        idempotency_key=jobs.key_dec(pending_id, outcome), ref_pending_id=pending_id,
+        ref_message_id=message_id, expected_state=outcome,
+        body=texts.decision_notice_body(outcome), now=now)
+
+
 def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
                      expect=("starting", "active"), notify=True):
-    """统一终止事务函数(4.6):CAS 带旧 status,胜者才级联。要求调用方已开事务。"""
+    """统一终止事务(contracts §5.6 绑定范围;调用方已开事务)。CAS 带旧 status,胜者才级联:
+    ① 取消该绑定的业务发送(session_turn、approval_card、receipt_reaction、未发的
+       decision_notice(approved_pending_files))—— **保留**已决审批的 delivered/rejected/
+       attachment_failed(以及 expired/closed_undelivered)更新;
+    ② 仍 pending 的审批 → expired(其 inbox awaiting_approval → expired)+ decision_notice(expired);
+    ③ approved ∧ inbox.materializing → inbox undeliverable + decision_notice(closed_undelivered);
+    ④ deliveries enqueued → dropped;pending_bind 终态化;lifecycle_notice(close);
+       waiting_binding → 4.2.4 映射 + inbound_notice。
+    全部新建 job 都在取消步骤(①)之后创建。"""
     qs = ",".join("?" for _ in expect)
     won = db.cas(
         conn,
@@ -91,29 +115,52 @@ def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
         return False
     row = conn.execute("SELECT * FROM bindings WHERE binding_id=?", (binding_id,)).fetchone()
 
-    # pendings pending→expired(其 inbox 行一并终态化)
-    pend_msgs = [r[0] for r in conn.execute(
-        "SELECT message_id FROM pendings WHERE binding_id=? AND state='pending'",
-        (binding_id,))]
+    # ① 取消业务发送(pending/unknown;终态不动;已决审批的决策更新不动)。
+    #    unknown 的取消要留痕 error='unbind-while-unknown':该消息**可能已送达**,status 据此显示。
+    scope = ("kind IN ('session_turn','receipt_reaction','approval_card') "
+             "OR (kind='decision_notice' AND expected_state='approved_pending_files')")
+    conn.execute(
+        "UPDATE outbound_jobs SET state='cancelled', error='unbind-while-unknown' "
+        f"WHERE binding_id=? AND state='unknown' AND ({scope})", (binding_id,))
+    conn.execute(
+        "UPDATE outbound_jobs SET state='cancelled', error=COALESCE(error,'binding-terminated') "
+        f"WHERE binding_id=? AND state='pending' AND ({scope})", (binding_id,))
+
+    # ② 仍 pending 的审批 → expired + decision_notice(expired)
+    pend = conn.execute(
+        "SELECT p.pending_id, p.message_id, i.chat_id, i.reply_thread_ts "
+        "FROM pendings p JOIN inbox i ON i.message_id=p.message_id "
+        "WHERE p.binding_id=? AND p.state='pending'", (binding_id,)).fetchall()
     conn.execute(
         "UPDATE pendings SET state='expired', decided_at=? WHERE binding_id=? AND state='pending'",
         (now, binding_id))
-    for mid in pend_msgs:
+    for p in pend:
         conn.execute(
             "UPDATE inbox SET state='expired', ts=? WHERE message_id=? "
-            "AND state IN ('awaiting_approval','approved_materializing')", (now, mid))
+            "AND state='awaiting_approval'", (now, p["message_id"]))
+        create_decision_notice(
+            conn, pending_id=p["pending_id"], binding_id=binding_id, chat_id=p["chat_id"],
+            message_id=p["message_id"], reply_to=p["reply_thread_ts"], outcome="expired", now=now)
 
-    # 未领 deliveries → dropped(leased 由恢复工人的 lease 超时收口)
+    # ③ approved ∧ materializing → undeliverable + decision_notice(closed_undelivered)
+    appr = conn.execute(
+        "SELECT p.pending_id, p.message_id, i.chat_id, i.reply_thread_ts "
+        "FROM pendings p JOIN inbox i ON i.message_id=p.message_id "
+        "WHERE p.binding_id=? AND p.state='approved' AND i.state='materializing'",
+        (binding_id,)).fetchall()
+    for p in appr:
+        if db.cas(conn,
+                  "UPDATE inbox SET state='undeliverable', ts=? WHERE message_id=? "
+                  "AND state='materializing'", (now, p["message_id"])):
+            create_decision_notice(
+                conn, pending_id=p["pending_id"], binding_id=binding_id, chat_id=p["chat_id"],
+                message_id=p["message_id"], reply_to=p["reply_thread_ts"],
+                outcome="closed_undelivered", now=now)
+
+    # ④ 未领 deliveries → dropped(leased 由恢复工人的 lease 超时收口)
     conn.execute(
         "UPDATE deliveries SET state='dropped' WHERE binding_id=? AND state='enqueued'",
         (binding_id,))
-
-    # 该绑定所有仍可重试(pending/unknown)的既有 job 全部 cancelled。
-    # 本次终止的 lifecycle_notice 是"唯一保留的既有 job 豁免"的实现方式=先 cancel 再新建;
-    # waiting 行的 inbound_notice 回执同理是本次终止事务新建的副作用(4.8),不属被豁免的存量。
-    conn.execute(
-        "UPDATE outbound_jobs SET state='cancelled' WHERE binding_id=? "
-        "AND state IN ('pending','unknown')", (binding_id,))
 
     # pending_bind 终态化并关闩(仅本次终态化的行;已终态行的闩通常不动——
     # 4.1.6 nonce-miss 路径要求 latch 仍置,链闩由下一个 fresh Stop 自愈,SessionEnd 另行显式关)
@@ -121,9 +168,8 @@ def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
         "UPDATE pending_bind SET state='expired', latch_open=0 "
         "WHERE request_id=? AND state='pending'", (binding_id,))
     if close_reason == "bind_superseded":
-        # r2-m1/r3-2:supersede 场景只关同实例 **consumed** tombstone 的闩
-        # (nonce-miss 的 failed 行留闩语义不变),否则新 bind 的 continuation Stop
-        # 会被旧闩误抑制而错过握手
+        # supersede 场景只关同实例 **consumed** tombstone 的闩(nonce-miss 的 failed 行留闩语义不变),
+        # 否则新 bind 的 continuation Stop 会被旧闩误抑制而错过握手
         conn.execute(
             "UPDATE pending_bind SET latch_open=0 "
             "WHERE cc_pid=? AND cc_start=? AND latch_open=1 AND state='consumed'",
@@ -136,7 +182,7 @@ def _terminate_in_tx(conn, binding_id, close_reason, now, new_status="closed",
             expected_state=f"{new_status}:{close_reason}",
             body=texts.lifecycle_close_body(close_reason), now=now)
 
-    # waiting_binding 行 → 4.2.4 同一映射终态 + 回执(r6-M1;冷却限速)
+    # waiting_binding 行 → 4.2.4 同一映射终态 + 回执(冷却限速)
     target = map_terminated_to_inbox_state(row)
     for r in conn.execute(
             "SELECT message_id, chat_id FROM inbox WHERE binding_id=? AND state='waiting_binding'",

@@ -1,44 +1,46 @@
-"""恢复工人(plan 4.8):驱动一切非终态;重驱只用行上钉死的 binding_id;
-幂等=DB 约束(唯一键 + 确定性 job 键 + 带旧状态 CAS)。
-r7-②:waiting_binding 专用分支先行,通用 undeliverable/dropped 分支绝不截获 waiting 行
-(通用清扫的 SELECT 按状态显式排除 waiting_binding,结构上不可能碰到)。"""
+"""恢复工人(contracts §2.9 / §2.10 / §5.2 / §5.6):驱动一切非终态;重驱只用行上钉死的 binding_id;
+幂等 = DB 约束(唯一键 + 确定性 job 键 + 带旧状态 CAS)。
+- received/resolving/waiting_binding:无条件本地重驱,**永不因排队/停机而 failed**(无死线)。
+- materializing:按 `materialize_next_at` 到期与 followup 预算重驱(预算列在库上,重启不重置)。
+- `_expire_pendings`:**单条审批范围**(§5.6)—— 只碰该审批、其 inbox、其未发的 approval_card。
+- `_replenish_cards`:只在**缺** card job 时创建;**绝不**复活终态 job(无 _rearm_failed_cards)。
+- `_legacy_sending`:postMessage 类 → unknown/had_unknown=1/verify_after=now;幂等类按 cap 收口。
+- `_retention`:终态正文裁剪(含 unconfirmed)、slack_events consumed/quarantined 清理、
+  终态 media TTL、孤儿 `.tmp-*`。"""
 import json
 import os
 import shutil
+import time
 
-from . import constants, db, jobs, lifecycle, texts, util
+from . import constants, db, inbound as inbound_mod, jobs, lifecycle, texts
+
+MEDIA_TMP_ORPHAN_AGE_S = 2 * constants.DOWNLOAD_DEADLINE_S   # 孤儿 worker 最晚 deadline+2s 自退
 
 
 class Recovery:
-    def __init__(self, conn, cfg, runner, clock, inbound, prober):
+    def __init__(self, conn, cfg, client, clock, inbound, prober):
         self.conn = conn
         self.cfg = cfg
-        self.runner = runner
+        self.client = client
         self.clock = clock
         self.inbound = inbound
         self.prober = prober
 
     # ---------------- 快节奏(每 loop ~1s / 判死 ~5s) ----------------
     def fast_tick(self, in_suspect_window=False):
-        # confirmed starting → 激活 / 30s 超时
         for b in self.conn.execute(
                 "SELECT binding_id FROM bindings WHERE status='starting' "
                 "AND bind_phase='confirmed'").fetchall():
             lifecycle.activate_if_ready(self.conn, b["binding_id"], self.clock)
-        # waiting_binding 专用分支(激活重过分流门 / 终止映射)
-        self.inbound.drive_waiting_rows()
-        # 判死
+        self.inbound.drive_local_rows()      # 激活后 waiting 行立即重过门(零网络)
         lifecycle.death_scan(self.conn, self.prober, self.clock,
                              in_suspect_window=in_suspect_window)
 
     # ---------------- 慢节奏(启动 + 每 60s) ----------------
     def slow_tick(self):
         now = self.clock.wall_ms()
-        # r7-②:waiting 专用分支先行
-        self.inbound.drive_waiting_rows()
         self._redrive_resolving(now)
         self._replenish_cards(now)
-        self._rearm_failed_cards(now)
         self._redrive_materializing(now)
         self._expire_pendings(now)
         lifecycle.expire_stale_pending_binds(self.conn, self.clock)
@@ -50,26 +52,22 @@ class Recovery:
 
     # ------------------------------------------------------------------
     def _redrive_resolving(self, now):
-        rows = self.conn.execute(
-            "SELECT * FROM inbox WHERE state IN ('received','resolving')").fetchall()
-        for r in rows:
-            if r["ts"] is not None and now - r["ts"] > constants.RESOLVE_DEADLINE_MS:
-                # 有限重试到期 → failed + 静默(未确认@bot 绝不回群,4.2.2)
-                with db.tx(self.conn):
-                    db.cas(self.conn,
-                           "UPDATE inbox SET state='failed', ts=? "
-                           "WHERE message_id=? AND state IN ('received','resolving')",
-                           (now, r["message_id"]))
-                    db.bump_counter(self.conn, "resolve_deadline_failed")
-                continue
-            self.inbound.drive_row(r)
+        """received/resolving/waiting_binding 本地重驱;无死线、零网络。"""
+        return self.inbound.drive_local_rows()
+
+    def _redrive_materializing(self, now, budget=constants.FOLLOWUP_BUDGET_PER_TICK):
+        """materializing 按 next_at 到期 + 同一预算重驱;超预算/MediaError 的终态由 inbound 收口。"""
+        return self.inbound.drive_materializing_rows(budget)
 
     def _replenish_cards(self, now):
-        """awaiting_approval 无卡片 job → 补发;已 sent 未回填 card_message_id → 补回填。"""
+        """awaiting 中的审批**缺** card job → 补建(同键幂等);已 sent 未回填 card_message_id → 补回填。
+        绝不改动任何既有 job 的状态。"""
         rows = self.conn.execute(
-            "SELECT p.*, i.chat_id AS chat_id, i.snapshot_json AS snapshot_json "
+            "SELECT p.*, i.chat_id AS chat_id, i.snapshot_json AS snapshot_json, "
+            "i.reply_thread_ts AS reply_thread_ts, i.sender_user_id AS sender_user_id "
             "FROM pendings p JOIN inbox i ON p.message_id=i.message_id "
             "WHERE p.state='pending'").fetchall()
+        bot = self.cfg.get("bot_user_id")
         for p in rows:
             job = self.conn.execute(
                 "SELECT * FROM outbound_jobs WHERE idempotency_key=?",
@@ -79,16 +77,18 @@ class Recovery:
                     snap = json.loads(p["snapshot_json"] or "{}")
                 except ValueError:
                     snap = {}
-                from . import inbound as inbound_mod
-                sender = (snap.get("sender") or {}).get("id") or "?"
+                if not isinstance(snap, dict):
+                    snap = {}
+                sender = inbound_mod.sender_of(snap)[0] or p["sender_user_id"] or "?"
                 jobs.create_job(
                     self.conn, kind="approval_card", chat_id=p["chat_id"],
-                    binding_id=p["binding_id"], reply_to=p["message_id"],
+                    binding_id=p["binding_id"], reply_to=p["reply_thread_ts"],
                     idempotency_key=jobs.key_card(p["pending_id"]),
-                    ref_pending_id=p["pending_id"], expected_state="pending",
+                    ref_pending_id=p["pending_id"], ref_message_id=p["message_id"],
+                    expected_state="pending",
                     body=texts.build_approval_card(
                         p["pending_id"], p["nonce"], sender,
-                        inbound_mod.extract_text(snap, self.cfg.get("app_id"))),
+                        inbound_mod.card_preview(snap, bot)),
                     now=now)
             elif (p["card_message_id"] is None and job["state"] == "sent"
                     and job["sent_message_id"]):
@@ -97,74 +97,16 @@ class Recovery:
                     "WHERE pending_id=? AND card_message_id IS NULL",
                     (job["sent_message_id"], p["pending_id"]))
 
-    def _rearm_failed_cards(self, now):
-        """修复项3:failed approval_card 重臂(修"member 消息悬挂到审批 TTL")。
-        CAS failed→pending + 退避 next_attempt_at;总尝试上限后放弃并 status 高亮(计一次)。"""
-        rows = self.conn.execute(
-            "SELECT o.* FROM outbound_jobs o JOIN pendings p ON p.pending_id=o.ref_pending_id "
-            "WHERE o.kind='approval_card' AND o.state='failed' "
-            "AND p.state='pending' AND p.card_message_id IS NULL").fetchall()
-        for j in rows:
-            if (j["attempt_count"] or 0) >= constants.CARD_REARM_MAX_ATTEMPTS:
-                with db.tx(self.conn):
-                    if db.cas(self.conn,
-                              "UPDATE outbound_jobs SET error='given-up' "
-                              "WHERE job_id=? AND state='failed' "
-                              "AND (error IS NULL OR error!='given-up')", (j["job_id"],)):
-                        db.bump_counter(self.conn, "approval_card_given_up")
-                continue
-            delay = min(
-                constants.CARD_REARM_BACKOFF_MS * (2 ** max((j["attempt_count"] or 1) - 1, 0)),
-                constants.CARD_REARM_BACKOFF_MAX_MS)
-            db.cas(self.conn,
-                   "UPDATE outbound_jobs SET state='pending', next_attempt_at=? "
-                   "WHERE job_id=? AND state='failed' "
-                   "AND EXISTS(SELECT 1 FROM bindings b "
-                   "  WHERE b.binding_id=outbound_jobs.binding_id AND b.status='active')",
-                   (now + delay, j["job_id"]))  # r2-M3:绑定复验在同一语句内
-
-    def _redrive_materializing(self, now):
-        rows = self.conn.execute(
-            "SELECT * FROM inbox WHERE state='approved_materializing'").fetchall()
-        for r in rows:
-            b = None
-            if r["binding_id"]:
-                b = self.conn.execute(
-                    "SELECT status FROM bindings WHERE binding_id=?",
-                    (r["binding_id"],)).fetchone()
-            if b is None or b["status"] != "active":
-                # 通用分支:绑定复验失败 → undeliverable(只针对非 waiting 状态,r7-②)
-                with db.tx(self.conn):
-                    db.cas(self.conn,
-                           "UPDATE inbox SET state='undeliverable', ts=? "
-                           "WHERE message_id=? AND state='approved_materializing'",
-                           (now, r["message_id"]))
-                continue
-            if r["ts"] is not None and now - r["ts"] > constants.MATERIALIZE_DEADLINE_MS:
-                p = self.conn.execute(
-                    "SELECT * FROM pendings WHERE message_id=?",
-                    (r["message_id"],)).fetchone()
-                with db.tx(self.conn):
-                    if db.cas(self.conn,
-                              "UPDATE inbox SET state='failed', ts=? "
-                              "WHERE message_id=? AND state='approved_materializing'",
-                              (now, r["message_id"])) and p is not None:
-                        jobs.create_job(
-                            self.conn, kind="decision_notice", chat_id=r["chat_id"],
-                            binding_id=r["binding_id"],
-                            idempotency_key=jobs.key_dec(p["pending_id"], "failed"),
-                            ref_pending_id=p["pending_id"], ref_message_id=r["message_id"],
-                            expected_state="failed",
-                            body=texts.decision_notice_body("failed"), now=now)
-                continue
-            self.inbound.drive_row(r)
-
     def _expire_pendings(self, now):
+        """审批过期(单条审批范围,contracts §5.6):该 pending → expired、其 inbox → expired、
+        其未发的 approval_card(pending/unknown)→ cancelled、入队 decision_notice(expired)。
+        不取消绑定的输出、不影响其它审批或正在物化的附件。"""
         rows = self.conn.execute(
-            "SELECT p.*, i.chat_id AS chat_id FROM pendings p "
-            "JOIN inbox i ON p.message_id=i.message_id "
+            "SELECT p.*, i.chat_id AS chat_id, i.reply_thread_ts AS reply_thread_ts "
+            "FROM pendings p JOIN inbox i ON p.message_id=i.message_id "
             "WHERE p.state='pending' AND p.created_at IS NOT NULL AND p.created_at+?<?",
             (constants.PENDING_TTL_MS, now)).fetchall()
+        n = 0
         for p in rows:
             with db.tx(self.conn):
                 if not db.cas(self.conn,
@@ -176,12 +118,16 @@ class Recovery:
                        "UPDATE inbox SET state='expired', ts=? "
                        "WHERE message_id=? AND state='awaiting_approval'",
                        (now, p["message_id"]))
-                jobs.create_job(
-                    self.conn, kind="decision_notice", chat_id=p["chat_id"],
-                    binding_id=p["binding_id"],
-                    idempotency_key=jobs.key_dec(p["pending_id"], "expired"),
-                    ref_pending_id=p["pending_id"], expected_state="expired",
-                    body=texts.decision_notice_body("expired"), now=now)
+                self.conn.execute(
+                    "UPDATE outbound_jobs SET state='cancelled', error=COALESCE(error,'pending-expired') "
+                    "WHERE idempotency_key=? AND state IN ('pending','unknown')",
+                    (jobs.key_card(p["pending_id"]),))
+                lifecycle.create_decision_notice(
+                    self.conn, pending_id=p["pending_id"], binding_id=p["binding_id"],
+                    chat_id=p["chat_id"], message_id=p["message_id"],
+                    reply_to=p["reply_thread_ts"], outcome="expired", now=now)
+                n += 1
+        return n
 
     def _close_orphan_starting(self, now):
         """安全网:unconfirmed starting 且其 pending_bind 已终态 → bind_timeout 终止。"""
@@ -194,8 +140,7 @@ class Recovery:
             lifecycle.terminate_binding(self.conn, r["binding_id"], "bind_timeout", self.clock)
 
     def _reclaim_leases(self, now):
-        """r2-M3:处置=单条 CAS,active 判定在同一语句内(EXISTS)——
-        读-判-写不再分离,与并发 unbind 交错时必落 dropped 而非复活 enqueued。"""
+        """处置 = 单条 CAS,active 判定在同一语句内(EXISTS)—— 与并发 unbind 交错时必落 dropped。"""
         self.conn.execute(
             "UPDATE deliveries SET "
             "state = CASE WHEN EXISTS(SELECT 1 FROM bindings b "
@@ -207,7 +152,7 @@ class Recovery:
             (now,))
 
     def _sweep_stranded_enqueued(self, now):
-        """r2-M3 防御性:终态绑定上滞留的 enqueued(理论不应再有)→ dropped。"""
+        """防御性:终态绑定上滞留的 enqueued(理论不应再有)→ dropped。"""
         cur = self.conn.execute(
             "UPDATE deliveries SET state='dropped' WHERE state='enqueued' "
             "AND EXISTS(SELECT 1 FROM bindings b WHERE b.binding_id=deliveries.binding_id "
@@ -216,14 +161,34 @@ class Recovery:
             db.bump_counter(self.conn, "stranded_enqueued_dropped", cur.rowcount)
 
     def _legacy_sending(self, now):
+        """contracts §2.9 末条:sending_at 过旧的 sending 行。postMessage 类(含 op_method 未冻结的)
+        → unknown, had_unknown=1, verify_after=now(只核验,绝不盲重发);
+        幂等类 → ac<cap → unknown, next=now;ac≥cap → failed。终态语义归 Outbound。"""
+        stale = now - 2 * constants.SEND_TIMEOUT_S * 1000
+        idem = ",".join("?" for _ in constants.IDEMPOTENT_METHODS)
+        # 幂等类 = op_method ∈ IDEMPOTENT_METHODS,或 op_method 未冻结但 kind 为 receipt_reaction;
+        # 其余(含未冻结的 session_turn/approval_card/*_notice)按 postMessage 类:只核验,绝不盲重发。
+        is_idem = (f"(COALESCE(op_method,'') IN ({idem}) "
+                   "OR (op_method IS NULL AND kind='receipt_reaction'))")   # NULL 安全
         self.conn.execute(
-            "UPDATE outbound_jobs SET state='unknown', error='stale-sending', "
-            "next_attempt_at=? WHERE state='sending' AND sending_at IS NOT NULL "
-            "AND sending_at<?", (now, now - 2 * constants.SEND_TIMEOUT_S * 1000))
+            "UPDATE outbound_jobs SET state='unknown', had_unknown=1, verify_after=?, "
+            "next_attempt_at=NULL, error='stale-sending' WHERE state='sending' "
+            f"AND sending_at IS NOT NULL AND sending_at<? AND NOT {is_idem}",
+            (now, stale, *constants.IDEMPOTENT_METHODS))
+        self.conn.execute(
+            "UPDATE outbound_jobs SET state='unknown', next_attempt_at=?, error='stale-sending' "
+            "WHERE state='sending' AND sending_at IS NOT NULL AND sending_at<? "
+            f"AND {is_idem} AND attempt_count<?",
+            (now, stale, *constants.IDEMPOTENT_METHODS, constants.IDEMPOTENT_CAP))
+        self.conn.execute(
+            "UPDATE outbound_jobs SET state='failed', error='stale-sending-cap' "
+            "WHERE state='sending' AND sending_at IS NOT NULL AND sending_at<? "
+            f"AND {is_idem} AND attempt_count>=?",
+            (stale, *constants.IDEMPOTENT_METHODS, constants.IDEMPOTENT_CAP))
 
     # ------------------------------------------------------------------
     def _retention(self, now):
-        """终态行 retention:正文裁剪、骨架保留;终态 media TTL 删(非终态禁删)。"""
+        """终态行 retention:正文裁剪、骨架保留;slack_events 清理;终态 media TTL 删;孤儿 .tmp-* 清理。"""
         cutoff = now - constants.RETENTION_MS
         qs = ",".join("?" for _ in constants.INBOX_TERMINAL_STATES)
         self.conn.execute(
@@ -233,24 +198,48 @@ class Recovery:
         self.conn.execute(
             "UPDATE deliveries SET payload_json='{}' WHERE state IN ('emitted','dropped') "
             "AND enq_at IS NOT NULL AND enq_at<? AND payload_json!='{}'", (cutoff,))
+        ts_ = ",".join("?" for _ in constants.OUTBOUND_TERMINAL_STATES)
         self.conn.execute(
-            "UPDATE outbound_jobs SET body=NULL WHERE state IN ('sent','failed','cancelled') "
-            "AND created_at IS NOT NULL AND created_at<? AND body IS NOT NULL", (cutoff,))
-        # media:仅终态消息的目录可删
+            f"UPDATE outbound_jobs SET body=NULL WHERE state IN ({ts_}) "
+            "AND created_at IS NOT NULL AND created_at<? AND body IS NOT NULL",
+            (*constants.OUTBOUND_TERMINAL_STATES, cutoff))
+        self.conn.execute(
+            "DELETE FROM slack_events WHERE state='consumed' AND consumed_at IS NOT NULL "
+            "AND consumed_at<?", (now - constants.SLACK_EVENTS_RETENTION_MS,))
+        self.conn.execute(
+            "DELETE FROM slack_events WHERE state='quarantined' AND received_at<?",
+            (now - constants.SLACK_EVENTS_QUARANTINE_RETENTION_MS,))
+        self._retention_media(cutoff)
+
+    def _retention_media(self, cutoff):
         media_root = self.inbound.media_root
         try:
             binding_dirs = os.listdir(media_root)
         except OSError:
             return
+        wall = time.time()
         for bdir in binding_dirs:
             bpath = os.path.join(media_root, bdir)
-            # 修复项8:lstat 语义,不跟随 symlink(绝不清 media root 之外)
+            # lstat 语义,不跟随 symlink(绝不清 media root 之外)
             if os.path.islink(bpath) or not os.path.isdir(bpath):
                 continue
-            for mdir in os.listdir(bpath):
+            try:
+                entries = os.listdir(bpath)
+            except OSError:
+                continue
+            for mdir in entries:
                 mpath = os.path.join(bpath, mdir)
-                if os.path.islink(mpath) or not os.path.isdir(mpath) \
-                        or mdir.startswith("."):
+                if os.path.islink(mpath) or not os.path.isdir(mpath):
+                    continue
+                if mdir.startswith("."):
+                    # 孤儿 .tmp-*(崩溃残留):足够老才删(在途 worker 最晚 deadline+2s 自退)
+                    if mdir.startswith(".tmp-"):
+                        try:
+                            age = wall - os.lstat(mpath).st_mtime
+                        except OSError:
+                            continue
+                        if age > MEDIA_TMP_ORPHAN_AGE_S:
+                            shutil.rmtree(mpath, ignore_errors=True)
                     continue
                 row = self.conn.execute(
                     "SELECT state, ts FROM inbox WHERE message_id=?", (mdir,)).fetchone()
