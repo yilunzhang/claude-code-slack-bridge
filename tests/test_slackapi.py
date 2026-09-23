@@ -426,14 +426,45 @@ def test_real_connection_refused_is_not_sent():
     assert slackapi.classify_send_error(r) == "not_sent"
 
 
-def test_tls_error_during_read_is_unknown_not_not_sent(net):
-    """Codex 实现 review R1:响应读取阶段的 TLS 错误可能发生在请求写出之后,不能算 not_sent。"""
+def test_tls_error_raised_at_open_is_unknown_not_not_sent(net):
+    """Codex 实现 review R1:`_open` 阶段抛出的非证书类 TLS 错(可能发生在请求写出之后,如握手后的
+    EOF / 读响应头时的 TLS 错)不能算 not_sent。注意这里异常由 `_open` 抛出;真正的响应体读取阶段
+    见 `test_tls_error_raised_by_response_read_is_unknown_not_not_sent`(R2-m2)。"""
     net(urllib.error.URLError(ssl.SSLError(1, "read failed")))
     r = mk().call("m")
     assert not r.not_sent and r.error == "tls" and slackapi.classify_send_error(r) == "unknown"
     net(ssl.SSLError(1, "eof in violation of protocol"))
     r = mk().call("m")
     assert not r.not_sent and r.error == "tls"
+
+
+class _RaisingReadResp(_Resp):
+    """`_open` 成功返回响应对象(请求已写出、状态行已收到),`read()` 阶段才抛(响应体读取时的传输错)。"""
+
+    def __init__(self, exc):
+        super().__init__(200, b"")
+        self.exc = exc
+        self.read_calls = 0
+
+    def read(self):
+        self.read_calls += 1
+        raise self.exc
+
+
+@pytest.mark.parametrize("exc, label", [
+    (ssl.SSLError(1, "read failed"), "tls"),
+    (http.client.IncompleteRead(b""), "transport:IncompleteRead"),
+    (ConnectionResetError(54, "reset by peer"), "transport:ConnectionResetError"),
+], ids=["ssl", "incomplete-read", "reset"])
+def test_tls_error_raised_by_response_read_is_unknown_not_not_sent(net, exc, label):
+    """R2-m2:真正的「读取阶段」错误:`_open` 已返回响应(请求肯定写出),`resp.read()` 才抛
+    → 绝不能算 not_sent(消息可能已创建),固定码 + unknown(只核验);不带 timed_out。"""
+    resp = _RaisingReadResp(exc)
+    n = net(resp)
+    r = mk().call("m")
+    assert resp.read_calls == 1 and len(n.requests) == 1        # 确实走到了 read()
+    assert not r.not_sent and not r.timed_out and r.error == label
+    assert slackapi.classify_send_error(r) == "unknown"
 
 
 def test_tls_cert_verification_failure_is_not_sent(net):
