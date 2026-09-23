@@ -1,266 +1,322 @@
-"""修复项1:指纹/版本门 fail-closed。缺字段≠ok;unknown→出站停摆(degraded)+退避重探;
-cli_version 必填且不符→出站停摆+doctor 重钉。"""
-import json
+"""FingerprintGate(Slack 版,contracts §7 / §4.5):
+- verify_identity:auth.test 三字段全比;缺字段 = unknown(fail-closed);确证不符 = mismatch;
+- 门:unknown → degraded:auth_error + 退避重探;mismatch → outbound_gate='mismatch'(daemon 拒启);
+- tokens.json 版本变化 → reload_tokens → 立即 auth.test → **同一事务**写 gate + gate 版本 + seen,
+  verify_capability 置回 unverified(除非 probe 版本 == 新版本);
+- app_token 变化 → app_token_changed() 一次性 True;通知只在跃迁;notifier 抛异常不炸门。
+全程离线(FakeSlackClient);不依赖 outbound(WP3)。"""
+import inspect
+import os
 
 import pytest
 
-from tests.conftest import CHAT, PROFILE
-from tests.helpers import FakeRunResult, FakeRunner, ok_envelope
+from tests.conftest import BOT_ID, BOT_USER, TEAM
+from tests.helpers import FakeSlackClient, err, not_sent, ok, timeout
 from lib import config as configmod
-from lib import constants, db as dbmod, fingerprint, jobs
+from lib import constants, db as dbmod, fingerprint
+
+AUTH_OK = {"url": "https://t.slack.com/", "team": "t", "user": "slack-bridge",
+           "team_id": TEAM, "user_id": BOT_USER, "bot_id": BOT_ID}
 
 
-def auth_resp(app_id="cli_testapp", owner="ou_owner"):
-    obj = {"identities": {"user": {"available": True}}}
-    if app_id is not None:
-        obj["appId"] = app_id
-    if owner is not None:
-        obj["identities"]["user"]["openId"] = owner
-    return FakeRunResult(0, json.dumps(obj))
+class _Notes:
+    def __init__(self, raising=False):
+        self.calls = []
+        self.raising = raising
+
+    def __call__(self, title, message, subtitle=None):
+        if self.raising:
+            raise RuntimeError("notification backend exploded")
+        self.calls.append((title, message, subtitle))
+        return True
 
 
-def runner_with(auth=None, version="1.0.66\n"):
-    r = FakeRunner(profile=PROFILE)
-    if auth is not None:
-        r.on_prefix(["auth", "status"], lambda a, c: auth)
-    r.on_prefix(["--version"], lambda a, c: FakeRunResult(0, version))
-    return r
+class _Auth:
+    """可变 auth.test 应答:`.data` 可改(漂移)、`.res` 非空则直接返回该 CallResult(失败态)。"""
+    def __init__(self, data=None, res=None):
+        self.data = dict(AUTH_OK if data is None else data)
+        self.res = res
+        self.n = 0
+
+    def __call__(self, method, params):
+        self.n += 1
+        if self.res is not None:
+            return self.res
+        return ok(self.data)
 
 
-class TestVerifyFingerprint:
-    def test_match_ok(self, cfg):
-        assert fingerprint.verify_identity(runner_with(auth_resp()), cfg) == "ok"
-
-    def test_missing_app_id_not_ok(self, cfg):
-        r = fingerprint.verify_identity(runner_with(auth_resp(app_id=None)), cfg)
-        assert r == "unknown"  # 缺字段绝不算 ok(fail-closed)
-
-    def test_missing_owner_not_ok(self, cfg):
-        assert fingerprint.verify_identity(
-            runner_with(auth_resp(owner=None)), cfg) == "unknown"
-
-    def test_mismatch(self, cfg):
-        assert fingerprint.verify_identity(
-            runner_with(auth_resp(app_id="cli_evil")), cfg) == "mismatch"
-        assert fingerprint.verify_identity(
-            runner_with(auth_resp(owner="ou_evil")), cfg) == "mismatch"
-
-    def test_probe_failure_unknown(self, cfg):
-        assert fingerprint.verify_identity(
-            runner_with(FakeRunResult(1, "boom")), cfg) == "unknown"
-
-    def test_version_match_mismatch_unknown(self, cfg):
-        assert fingerprint.verify_cli_version(runner_with(auth_resp()), cfg) == "ok"
-        assert fingerprint.verify_cli_version(
-            runner_with(auth_resp(), version="1.0.99\n"), cfg) == "mismatch"
-        r = FakeRunner(profile=PROFILE)
-        r.on_prefix(["--version"], lambda a, c: FakeRunResult(1, ""))
-        assert fingerprint.verify_cli_version(r, cfg) == "unknown"
+def _client(clock, auth, version="v1"):
+    c = FakeSlackClient(clock=clock, tokens_version=version)
+    c.on("auth.test", auth)
+    return c
 
 
-class TestGate:
-    def _turn_job(self, env):
-        bid = env.make_binding(status="active")
-        jobs.create_job(env.conn, kind="session_turn", chat_id=CHAT, binding_id=bid,
-                        idempotency_key="turn:g:0", turn_group="g", chunk_index=0,
-                        body="x", now=env.clock.wall_ms())
+def _gate(env, client, notes=None):
+    return fingerprint.FingerprintGate(env.conn, env.cfg, client, env.clock, notifier=notes)
 
-    def test_unknown_identity_degrades_and_blocks_outbound(self, env):
-        gate = fingerprint.FingerprintGate(
-            env.conn, env.cfg, runner_with(FakeRunResult(1, "")), env.clock)
-        assert gate.startup() == "degraded"
-        assert dbmod.get_state(env.conn, "outbound_gate").startswith("degraded:identity")
-        self._turn_job(env)
-        assert env.outbound.tick() == 0  # 出站停摆
-        assert env.conn.execute(
-            "SELECT state FROM outbound_jobs WHERE idempotency_key='turn:g:0'"
-        ).fetchone()[0] == "pending"
-        assert env.runner.calls == []
 
-    def test_reprobe_with_backoff_then_clears(self, env):
-        flaky = {"fail": True}
-        r = FakeRunner(profile=PROFILE)
-        r.on_prefix(["auth", "status"],
-                    lambda a, c: FakeRunResult(1, "") if flaky["fail"] else auth_resp())
-        r.on_prefix(["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
-        gate = fingerprint.FingerprintGate(env.conn, env.cfg, r, env.clock)
-        assert gate.startup() == "degraded"
-        n_probes = len(r.calls_matching("auth", "status"))
-        gate.tick()  # 退避期内不重探
-        assert len(r.calls_matching("auth", "status")) == n_probes
-        flaky["fail"] = False
+def _rewrite_tokens(tokens_ns, bot="xoxb-new", app="xapp-test-app-token"):
+    """换 tokens.json 内容 + 保证 mtime_ns 前进(FingerprintGate 的廉价探针看 mtime)。→ 新版本。"""
+    old = os.stat(tokens_ns.path).st_mtime_ns
+    v = configmod.save_tokens({"bot_token": bot, "app_token": app}, overwrite=True)
+    st = os.stat(tokens_ns.path)
+    if st.st_mtime_ns <= old:
+        os.utime(tokens_ns.path, ns=(st.st_atime_ns, old + 1_000_000))
+        v = configmod.load_tokens(allow_env=False)[1]
+    return v
+
+
+# ---------------------------------------------------------------- 构造签名冻结(contracts §8)
+def test_constructor_signature_frozen():
+    params = list(inspect.signature(fingerprint.FingerprintGate.__init__).parameters)
+    assert params == ["self", "conn", "cfg", "client", "clock", "notifier"]
+    for name in ("startup", "tick", "app_token_changed"):
+        assert callable(getattr(fingerprint.FingerprintGate, name))
+    assert not hasattr(fingerprint, "verify_cli_version") and not hasattr(fingerprint, "probe_cli_version")
+
+
+# ---------------------------------------------------------------- verify_identity
+class TestVerifyIdentity:
+    def test_match_ok(self, cfg, clock):
+        assert fingerprint.verify_identity(_client(clock, _Auth()), cfg) == "ok"
+
+    @pytest.mark.parametrize("field", ["team_id", "user_id", "bot_id"])
+    def test_missing_field_unknown_not_ok(self, cfg, clock, field):
+        d = dict(AUTH_OK)
+        d.pop(field)
+        assert fingerprint.verify_identity(_client(clock, _Auth(d)), cfg) == "unknown"
+
+    @pytest.mark.parametrize("field,value", [("team_id", "T_EVIL"), ("user_id", "U_EVIL"), ("bot_id", "B_EVIL")])
+    def test_mismatch(self, cfg, clock, field, value):
+        d = dict(AUTH_OK)
+        d[field] = value
+        assert fingerprint.verify_identity(_client(clock, _Auth(d)), cfg) == "mismatch"
+
+    @pytest.mark.parametrize("res", [err("invalid_auth"), not_sent("dns"), timeout(), err("http_5xx", http_status=503)])
+    def test_call_failure_unknown(self, cfg, clock, res):
+        assert fingerprint.verify_identity(_client(clock, _Auth(res=res)), cfg) == "unknown"
+
+
+# ---------------------------------------------------------------- startup
+class TestStartup:
+    def test_ok_writes_gate_and_versions_no_notification(self, env, tokens):
+        notes = _Notes()
+        c = _client(env.clock, _Auth(), version=tokens.version)
+        g = _gate(env, c, notes)
+        assert g.startup() == "ok"
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == tokens.version
+        assert dbmod.get_state(env.conn, constants.TOKENS_VERSION_SEEN_KEY) == tokens.version
+        assert notes.calls == []          # 健康启动不发声
+        assert g.app_token_changed() is False
+
+    def test_unknown_degrades_auth_error_and_notifies_once(self, env, tokens):
+        notes = _Notes()
+        g = _gate(env, _client(env.clock, _Auth(res=not_sent("dns")), tokens.version), notes)
+        assert g.startup() == "degraded"
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "degraded:auth_error"
+        assert len(notes.calls) == 1 and "停摆" in " ".join(str(x) for x in notes.calls[0])
+
+    def test_mismatch_closes_gate_with_mismatch_value(self, env, tokens):
+        notes = _Notes()
+        d = dict(AUTH_OK, bot_id="B_EVIL")
+        g = _gate(env, _client(env.clock, _Auth(d), tokens.version), notes)
+        assert g.startup() == "mismatch"          # daemon 据此拒启
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "mismatch"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == tokens.version
+        assert len(notes.calls) == 1 and "身份不符" in notes.calls[0][1]
+
+    def test_notifier_exception_does_not_break_gate(self, env, tokens):
+        g = _gate(env, _client(env.clock, _Auth(res=timeout()), tokens.version), _Notes(raising=True))
+        assert g.startup() == "degraded"
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "degraded:auth_error"
+
+
+# ---------------------------------------------------------------- 退避重探 / 周期复检
+class TestBackoffAndReverify:
+    def test_degraded_reprobes_with_backoff_then_recovers_notifies_once(self, env, tokens):
+        notes = _Notes()
+        auth = _Auth(res=timeout())
+        c = _client(env.clock, auth, tokens.version)
+        g = _gate(env, c, notes)
+        assert g.startup() == "degraded"
+        n = auth.n
+        g.tick()                                       # 退避期内不重探
+        assert auth.n == n
         env.clock.tick(fingerprint.PROBE_BACKOFF_START_MS + 1)
-        gate.tick()
-        assert dbmod.get_state(env.conn, "outbound_gate") == "ok"
-        self._turn_job(env)
-        env.runner.on_prefix(["im", "+messages-send"],
-                             lambda a, c: ok_envelope({"message_id": "om_1"}))
-        assert env.outbound.tick() == 1  # 门开,恢复发送
-
-    def test_identity_mismatch_reported(self, env):
-        gate = fingerprint.FingerprintGate(
-            env.conn, env.cfg, runner_with(auth_resp(app_id="cli_evil")), env.clock)
-        assert gate.startup() == "mismatch"
-
-    def test_version_mismatch_degrades_with_hint(self, env):
-        gate = fingerprint.FingerprintGate(
-            env.conn, env.cfg, runner_with(auth_resp(), version="9.9.9\n"), env.clock)
-        assert gate.startup() == "degraded"
-        assert dbmod.get_state(env.conn, "outbound_gate") == "degraded:version_mismatch"
-        from lib import ctl
-        rep = ctl.status_report(env.conn, env.cfg, env.clock)
-        assert rep["outbound_gate"] == "degraded:version_mismatch"
-        assert "doctor" in (rep.get("gate_hint") or "")
-
-    def test_gate_reads_repinned_config_from_disk(self, env):
-        gate = fingerprint.FingerprintGate(
-            env.conn, env.cfg, runner_with(auth_resp(), version="1.0.67\n"), env.clock)
-        assert gate.startup() == "degraded"
-        # doctor 重钉后(写盘),gate 重探应读到新版本 → 放行
-        cfg2 = dict(env.cfg)
-        cfg2["cli_version"] = "1.0.67"
-        configmod.save_config(cfg2)
+        g.tick()                                       # 仍失败 → 退避翻倍
+        assert auth.n == n + 1 and g._backoff == fingerprint.PROBE_BACKOFF_START_MS * 4   # startup 已翻一次
         env.clock.tick(fingerprint.PROBE_BACKOFF_START_MS + 1)
-        gate.tick()
-        assert dbmod.get_state(env.conn, "outbound_gate") == "ok"
-
-
-class TestCliVersionRequired:
-    def test_require_config_demands_cli_version(self, data_dir):
-        from lib import paths
-        paths.ensure_data_dir()
-        import json as _json
-        from lib import util
-        util.atomic_write(paths.config_path(), _json.dumps({
-            "profile": "main", "app_id": "cli_x", "bot_open_id": "ou_b",
-            "owner_open_id": "ou_o"}))
-        with pytest.raises(configmod.ConfigError):
-            configmod.require_config()
-
-    def test_bootstrap_fails_without_version(self, data_dir):
-        from tests.test_bridgectl import auth_status_runner
-        from lib.clock import SystemClock
-        from lib import ctl
-        r = auth_status_runner()
-        r.responders = [x for x in r.responders
-                        if not x[0](["--version"])]  # 去掉 version responder
-        r.on_prefix(["--version"], lambda a, c: FakeRunResult(1, ""))
-        with pytest.raises(configmod.ConfigError):
-            ctl.bootstrap(r, PROFILE, SystemClock())
-
-
-class TestDoctorRepin:
-    def test_doctor_repins_version_after_pass(self, env):
-        env.runner.on_prefix(["im", "+messages-send"],
-                             lambda a, c: ok_envelope({"message_id": "om_doc"}))
-        env.runner.on_prefix(["api", "DELETE"], lambda a, c: ok_envelope({}))
-        env.runner.on_prefix(["--version"], lambda a, c: FakeRunResult(0, "1.0.67\n"))
-        from lib import ctl
-        res = ctl.doctor(env.runner, CHAT, env.clock, cfg=env.cfg)
-        assert res["ok"] and res.get("repinned_cli_version") == "1.0.67"
-        assert configmod.load_config()["cli_version"] == "1.0.67"
-
-    def test_doctor_no_repin_when_same(self, env):
-        env.runner.on_prefix(["im", "+messages-send"],
-                             lambda a, c: ok_envelope({"message_id": "om_doc"}))
-        env.runner.on_prefix(["api", "DELETE"], lambda a, c: ok_envelope({}))
-        env.runner.on_prefix(["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
-        from lib import ctl
-        res = ctl.doctor(env.runner, CHAT, env.clock, cfg=env.cfg)
-        assert res["ok"] and "repinned_cli_version" not in res
-
-
-class TestReverify:
-    """r2-M2:ok 后也周期复检;漂移 → 下一循环发送前关门。"""
-
-    def _ok_gate(self, env, mutable):
-        r = FakeRunner(profile=PROFILE)
-
-        def auth(a, c):
-            return auth_resp(app_id=mutable["app_id"])
-
-        r.on_prefix(["auth", "status"], auth)
-        r.on(lambda a: a[:1] == ["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
-        gate = fingerprint.FingerprintGate(env.conn, env.cfg, r, env.clock)
-        assert gate.startup() == "ok"
-        return gate, r
-
-    def test_ok_state_no_probe_before_interval(self, env):
-        mutable = {"app_id": "cli_testapp"}
-        gate, r = self._ok_gate(env, mutable)
-        n = len(r.calls_matching("auth", "status"))
-        gate.tick()
-        assert len(r.calls_matching("auth", "status")) == n  # 10min 内不复检
-
-    def test_ok_reverifies_and_closes_on_drift(self, env):
-        mutable = {"app_id": "cli_testapp"}
-        gate, r = self._ok_gate(env, mutable)
-        mutable["app_id"] = "cli_evil"  # 身份漂移
+        g.tick()                                       # 2×退避未到
+        assert auth.n == n + 1
+        auth.res = None                                # 网络恢复
+        env.clock.tick(fingerprint.PROBE_BACKOFF_START_MS * 2 + 1)
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == tokens.version
+        texts = [" ".join(str(x) for x in call) for call in notes.calls]
+        assert len(texts) == 2 and "停摆" in texts[0] and "恢复" in texts[1]
         env.clock.tick(fingerprint.REVERIFY_INTERVAL_MS + 1)
-        gate.tick()
-        g = dbmod.get_state(env.conn, "outbound_gate")
-        assert g.startswith("degraded")
+        g.tick()                                       # ok → ok 不再发声
+        assert len(notes.calls) == 2
 
-    def test_loop_closes_gate_before_send_on_drift(self, env):
-        """DaemonCore 循环序:gate.tick 先于 outbound.tick → 漂移后零发送。"""
-        from lib.daemon_core import DaemonCore
-        mutable = {"app_id": "cli_testapp"}
-        gate, r = self._ok_gate(env, mutable)
-        core = DaemonCore(env.conn, env.cfg, env.clock, env.inbound, env.approval,
-                          env.outbound, env.recovery, gate=gate)
-        bid = env.make_binding(status="active")
-        jobs.create_job(env.conn, kind="session_turn", chat_id=CHAT, binding_id=bid,
-                        idempotency_key="turn:g:0", turn_group="g", chunk_index=0,
-                        body="秘密", now=env.clock.wall_ms())
-        mutable["app_id"] = "cli_evil"
+    def test_backoff_capped(self, env, tokens):
+        auth = _Auth(res=timeout())
+        g = _gate(env, _client(env.clock, auth, tokens.version))
+        g.startup()
+        for _ in range(12):
+            env.clock.tick(fingerprint.PROBE_BACKOFF_MAX_MS + 1)
+            g.tick()
+        assert g._backoff == fingerprint.PROBE_BACKOFF_MAX_MS
+
+    def test_ok_no_probe_before_interval_then_reverifies_and_closes_on_drift(self, env, tokens):
+        notes = _Notes()
+        auth = _Auth()
+        g = _gate(env, _client(env.clock, auth, tokens.version), notes)
+        assert g.startup() == "ok"
+        n = auth.n
+        g.tick()
+        assert auth.n == n                             # 10min 内不复检
+        auth.data["user_id"] = "U_EVIL"                # 身份漂移
         env.clock.tick(fingerprint.REVERIFY_INTERVAL_MS + 1)
-        core.loop_iteration()
-        row = env.conn.execute(
-            "SELECT state FROM outbound_jobs WHERE idempotency_key='turn:g:0'").fetchone()
-        assert row[0] == "pending"  # 未发送(门先关)
-        assert env.runner.calls_matching("im", "+messages-send") == []
+        g.tick()
+        assert auth.n == n + 1
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "mismatch"
+        assert len(notes.calls) == 1 and "身份不符" in notes.calls[0][1]
+
+    def test_reverify_uses_monotonic_clock(self, env, tokens):
+        auth = _Auth()
+        g = _gate(env, _client(env.clock, auth, tokens.version))
+        g.startup()
+        env.clock.rewind_wall(3_600_000)
+        auth.data["team_id"] = "T_EVIL"
+        env.clock.mono += fingerprint.REVERIFY_INTERVAL_MS + 1
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "mismatch"
 
 
-class TestVersionProbeArgv:
-    """E1(真机实锤):`--version` 不吃全局 --profile;拖尾会 rc=2。"""
 
-    def test_build_argv_no_profile(self):
-        from lib.runner import LarkRunner
-        r = LarkRunner("main")
-        assert r.build_argv(["--version"], no_profile=True) == ["lark-cli", "--version"]
-        assert r.build_argv(["im", "+chat-list", "--as", "bot"]) == \
-               ["lark-cli", "im", "+chat-list", "--as", "bot", "--profile", "main"]
+# ---------------------------------------------------------------- tokens.json 版本变化(contracts §7)
+class _TxSpy:
+    """conn 代理:记录 execute 的 SQL 序列(证明"同一事务")。"""
+    def __init__(self, conn):
+        self._c = conn
+        self.sql = []
 
-    def test_probe_version_true_shape(self, cfg):
-        """fake 对 --version+--profile 组合返回 rc=2,逼实现走裸 --version。"""
-        r = FakeRunner(profile=PROFILE)
-        r.on(lambda a: "--version" in a and "--profile" in a,
-             lambda a, c: FakeRunResult(2, "", "unknown command"))
-        r.on(lambda a: a == ["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
-        assert fingerprint.probe_cli_version(r) == "1.0.66"
+    def execute(self, sql, *a, **k):
+        self.sql.append(sql.strip())
+        return self._c.execute(sql, *a, **k)
 
-    def test_bootstrap_version_probe_true_shape(self, data_dir):
-        from tests.test_bridgectl import auth_status_runner
-        from lib.clock import SystemClock
-        from lib import ctl
-        r = auth_status_runner()
-        # 移除宽松 version responder,换成真形状
-        r.responders = [x for x in r.responders if not x[0](["--version"])]
-        r.on(lambda a: "--version" in a and "--profile" in a,
-             lambda a, c: FakeRunResult(2, "", "unknown command"))
-        r.on(lambda a: a == ["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
-        cfg = ctl.bootstrap(r, PROFILE, SystemClock())
-        assert cfg["cli_version"] == "1.0.66"
+    def __getattr__(self, name):
+        return getattr(self._c, name)
 
 
-class TestReverifyClockRewind:
-    def test_reverify_survives_wall_clock_rewind(self, env):
-        """r3-4:复检调度用单调钟 —— 墙钟回拨后漂移仍能按期关门。"""
-        from tests.test_fingerprint import TestReverify
-        mutable = {"app_id": "cli_testapp"}
-        gate, r = TestReverify()._ok_gate(env, mutable)
-        env.clock.rewind_wall(3_600_000)  # 墙钟回拨 1h
-        mutable["app_id"] = "cli_evil"
-        env.clock.mono += fingerprint.REVERIFY_INTERVAL_MS + 1  # 单调钟正常前进
-        gate.tick()
-        assert dbmod.get_state(env.conn, "outbound_gate").startswith("degraded")
+class TestTokensVersionChange:
+    def _ok_gate(self, env, tokens, notes=None, conn=None):
+        auth = _Auth()
+        c = _client(env.clock, auth, tokens.version)
+        g = fingerprint.FingerprintGate(conn or env.conn, env.cfg, c, env.clock, notifier=notes)
+        assert g.startup() == "ok"
+        return g, c, auth
+
+    def test_version_change_reloads_verifies_immediately_writes_versions_and_resets_capability(self, env, tokens):
+        notes = _Notes()
+        g, c, auth = self._ok_gate(env, tokens, notes)
+        # probe 曾对**旧**版本确证过
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_KEY, "ok")
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_VERSION_KEY, tokens.version)
+        n = auth.n
+        new_ver = _rewrite_tokens(tokens)
+        assert new_ver != tokens.version
+        g.tick()                                       # 复检周期未到,但版本变了 → 立即重验
+        assert c.reloads == [new_ver] and c.tokens_version == new_ver
+        assert auth.n == n + 1
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == new_ver
+        assert dbmod.get_state(env.conn, constants.TOKENS_VERSION_SEEN_KEY) == new_ver
+        assert dbmod.get_state(env.conn, constants.VERIFY_CAPABILITY_KEY) == constants.VERIFY_CAP_UNVERIFIED
+        assert g.tokens_version == new_ver
+        assert notes.calls == []                       # ok → ok 无跃迁不发声
+        g.tick()                                       # 文件没再变 → 不再 reload、不再 auth.test
+        assert c.reloads == [new_ver] and auth.n == n + 1
+
+    def test_capability_preserved_when_probe_version_equals_new_version(self, env, tokens):
+        g, c, auth = self._ok_gate(env, tokens)
+        new_ver = _rewrite_tokens(tokens)
+        # probe 已针对**新**版本确证(probe 在 daemon 看到之前先跑)
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_KEY, "ok")
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_VERSION_KEY, new_ver)
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == new_ver
+        assert dbmod.get_state(env.conn, constants.VERIFY_CAPABILITY_KEY) == "ok"
+
+    def test_gate_and_versions_and_capability_written_in_one_transaction(self, env, tokens):
+        spy = _TxSpy(env.conn)
+        g, c, auth = self._ok_gate(env, tokens, conn=spy)
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_KEY, "ok")
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_VERSION_KEY, tokens.version)
+        _rewrite_tokens(tokens)
+        spy.sql.clear()
+        g.tick()
+        begins = [i for i, s in enumerate(spy.sql) if s.startswith("BEGIN")]
+        commits = [i for i, s in enumerate(spy.sql) if s.startswith("COMMIT")]
+        assert len(begins) == 1 and len(commits) == 1
+        b, e = begins[0], commits[0]
+        inside = "\n".join(spy.sql[b:e])
+        assert inside.count("INSERT INTO daemon_state") == 4   # gate + gate 版本 + seen + verify_capability
+        assert not any(s.startswith("INSERT INTO daemon_state") for s in spy.sql[:b] + spy.sql[e:])
+        assert dbmod.get_state(env.conn, constants.VERIFY_CAPABILITY_KEY) == constants.VERIFY_CAP_UNVERIFIED
+
+    def test_swapped_token_with_foreign_identity_closes_gate_mismatch(self, env, tokens):
+        notes = _Notes()
+        g, c, auth = self._ok_gate(env, tokens, notes)
+        auth.data["bot_id"] = "B_OTHER_APP"            # 新 token 属于别的 app
+        new_ver = _rewrite_tokens(tokens)
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "mismatch"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == new_ver
+        assert len(notes.calls) == 1 and "身份不符" in notes.calls[0][1]
+        # 换回正确 token → 重验放行 + 恢复通知
+        auth.data["bot_id"] = BOT_ID
+        v3 = _rewrite_tokens(tokens, bot="xoxb-back")
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == v3
+        assert len(notes.calls) == 2 and "恢复" in notes.calls[1][1]
+
+    def test_unreadable_tokens_file_degrades_then_recovers(self, env, tokens):
+        notes = _Notes()
+        g, c, auth = self._ok_gate(env, tokens, notes)
+        os.chmod(tokens.path, 0o644)                   # 权限错 → load_tokens ConfigError
+        st = os.stat(tokens.path)
+        os.utime(tokens.path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "degraded:tokens_error"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == tokens.version  # 版本不动
+        assert len(notes.calls) == 1
+        os.chmod(tokens.path, 0o600)
+        env.clock.tick(fingerprint.PROBE_BACKOFF_START_MS + 1)
+        g.tick()                                       # 待重试 → 读成功 → 版本变(mtime 变了)→ 重验
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == configmod.load_tokens(allow_env=False)[1]
+        assert "恢复" in notes.calls[-1][1]
+
+    def test_app_token_change_signal_once(self, env, tokens):
+        g, c, auth = self._ok_gate(env, tokens)
+        assert g.app_token_changed() is False
+        _rewrite_tokens(tokens, bot="xoxb-new", app="xapp-test-app-token")   # 只换 bot token
+        g.tick()
+        assert g.app_token_changed() is False
+        _rewrite_tokens(tokens, bot="xoxb-new", app="xapp-ROTATED")           # 换 app token
+        g.tick()
+        assert g.app_token_changed() is True
+        assert g.app_token_changed() is False          # 一次性
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok"
+
+    def test_env_tokens_never_consulted(self, env, tokens, monkeypatch):
+        """文件是真相:env SLACK_BOT_TOKEN 不影响 gate 看到的版本。"""
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-env")
+        g, c, auth = self._ok_gate(env, tokens)
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == tokens.version
+        assert c.reloads == []
