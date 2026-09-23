@@ -131,6 +131,68 @@ class TestStartup:
         assert g.startup() == "degraded"
         assert dbmod.get_state(env.conn, constants.GATE_KEY) == "degraded:auth_error"
 
+    def test_startup_unreadable_tokens_degrades_without_caching_signature(self, env, tokens):
+        """R2-M8:SlackClient 已成功读入凭据 → 文件 chmod 644 → startup()。旧实现保存新签名、吞掉
+        ConfigError、仍用内存旧凭据 auth.test 并写 ok,之后 tick 因签名相同再也不读文件(坏签名成缓存基线)。
+        现在 startup 走与版本变化相同的完整 load 路径:读失败 → degraded:tokens_error(版本键 = client
+        内存版本),不 auth.test、不写 ok,签名不作缓存基线(reload_pending → 下一 tick 重读)。"""
+        notes = _Notes()
+        auth = _Auth()
+        c = _client(env.clock, auth, version=tokens.version)
+        os.chmod(tokens.path, 0o644)                    # 不动 mtime:内容/版本没变,只是读不得
+        g = _gate(env, c, notes)
+        assert g.startup() == "degraded"
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "degraded:tokens_error"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == tokens.version
+        assert auth.n == 0 and c.reloads == []          # 读不到文件就不用内存凭据去 auth.test
+        assert len(notes.calls) == 1 and "停摆" in notes.calls[0][2]
+        g.tick()                                        # 文件仍坏:重读仍失败,门不开、不探
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "degraded:tokens_error" and auth.n == 0
+        os.chmod(tokens.path, 0o600)
+        g.tick()                                        # 下一 tick 重读成功(版本同 client)→ 等退避点重验
+        assert c.reloads == [tokens.version]
+        env.clock.tick(fingerprint.PROBE_BACKOFF_START_MS + 1)
+        g.tick()
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok" and auth.n == 1
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == tokens.version
+        assert "恢复" in notes.calls[-1][1]
+
+    def test_startup_reloads_client_when_file_rotated_after_construction(self, env, tokens):
+        """R2-M8:SlackClient 构造与 startup() 之间 tokens.json 轮换 → startup 必须先把 client reload
+        到文件版本再 auth.test,gate 版本 = 文件版本 = client.tokens_version;旧版本的 probe 结论失效。
+        绝不为「内存版本 ≠ 文件版本」的 client 写 ok。"""
+        auth = _Auth()
+        c = _client(env.clock, auth, version=tokens.version)       # 已按旧文件读入
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_KEY, "ok")
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_VERSION_KEY, tokens.version)   # probe 只确证过旧版本
+        new_ver = _rewrite_tokens(tokens)                           # 构造之后、startup 之前轮换
+        g = _gate(env, c)
+        assert g.startup() == "ok"
+        assert c.reloads == [new_ver] and c.tokens_version == new_ver   # 先 reload 到文件版本再 auth.test
+        assert auth.n == 1
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "ok"
+        assert dbmod.get_state(env.conn, constants.GATE_VERSION_KEY) == new_ver
+        assert dbmod.get_state(env.conn, constants.TOKENS_VERSION_SEEN_KEY) == new_ver
+        assert g.tokens_version == new_ver
+        assert dbmod.get_state(env.conn, constants.VERIFY_CAPABILITY_KEY) == constants.VERIFY_CAP_UNVERIFIED
+        g.tick()                                                    # 签名已是新文件:不再 reload / auth.test
+        assert c.reloads == [new_ver] and auth.n == 1
+
+    def test_startup_never_ok_when_client_cannot_follow_file_version(self, env, tokens):
+        """R2-M8:client.reload_tokens 之后内存版本仍 ≠ 刚读到的文件版本(client 不跟文件)→ fail-closed:
+        degraded:tokens_error、不 auth.test,下一 tick 重读核对。"""
+        class Stuck(FakeSlackClient):
+            def reload_tokens(self, version=None):
+                self.reloads.append(version)
+                return self._tokens_version                         # 版本卡住不动
+        auth = _Auth()
+        c = Stuck(clock=env.clock, tokens_version="stale-v0")
+        c.on("auth.test", auth)
+        g = _gate(env, c)
+        assert g.startup() == "degraded" and auth.n == 0
+        assert c.reloads == [tokens.version]
+        assert dbmod.get_state(env.conn, constants.GATE_KEY) == "degraded:tokens_error"
+
 
 # ---------------------------------------------------------------- 退避重探 / 周期复检
 class TestBackoffAndReverify:

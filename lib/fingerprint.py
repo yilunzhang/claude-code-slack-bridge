@@ -10,6 +10,8 @@
   置回 `unverified`(除非 `verify_capability_tokens_version == 新版本`,即 probe 已对这一版凭据确证过)。
 - 身份漂移 → `outbound_gate='mismatch'`(关门;daemon 启动时 `startup()=='mismatch'` 拒启);
   `auth.test` 失败 → `degraded:auth_error` 带退避重探;ok 状态每 REVERIFY_INTERVAL 周期复检。
+- `startup()` 走**同一条**完整 load/reload 路径(R2-M8):读失败 → `degraded:tokens_error` 且不缓存签名、
+  不用内存旧凭据 auth.test;文件版本 ≠ client 内存版本(构造与启动之间轮换)→ 先 reload 再 auth.test。
 - xapp(app_token)变化 → `app_token_changed()` 返回 True 一次,daemon 据此 SIGTERM consumer 由
   ConsumerManager 重拉(consumer 自读 tokens.json)。
 - 状态**跃迁**时弹本机桌面通知(`notifyos`,fail-open —— 出站门关着时 Slack 那条线正是被堵的)。
@@ -203,19 +205,51 @@ class FingerprintGate:
             return "changed", new_ver
         return "same", None
 
+    def _sync_client(self, ver):
+        """client 内存凭据版本 ≠ 刚读到的文件版本 `ver` → `client.reload_tokens(ver)`。→ 本次判定绑定的版本
+        (= client **实际持有**的版本),或 None(client 版本仍与文件不符:fail-closed,绝不为这样的 client 写 ok)。
+        reload 与本次读文件之间文件再次轮换(真 SlackClient 以自己那次读取为准)→ 再读一次文件核对;
+        两种异常情形都把 reload_pending 置位,下一 tick 重读收敛。"""
+        if self.client.tokens_version == ver:
+            return ver
+        self.client.reload_tokens(ver)
+        cur = self.client.tokens_version
+        if cur == ver:
+            return ver
+        self._reload_pending = True
+        try:
+            _tokens, ver2 = self._read_tokens_file()
+        except configmod.ConfigError:
+            return None
+        return cur if cur == ver2 else None
+
     # ------------------------------------------------------------------ 入口
     def startup(self):
-        """只检测(一次 auth.test),绝不发消息。→ 'ok' | 'degraded' | 'mismatch'。
+        """启动判定 = 与版本变化相同的完整 load/reload 路径(R2-M8):**先** stat 签名 **再** load_tokens
+        (0600 检查)→ 文件版本 ≠ client 内存版本 → `client.reload_tokens` → auth.test → `_apply`
+        (绑定 client 实际持有的版本;发生过 reload 则旧版本的 probe 结论失效,同 tick 的版本变化)。
+        - 读失败(ConfigError)→ `degraded:tokens_error`(版本键 = client 内存版本),**不**用内存里的旧凭据去
+          auth.test、绝不写 ok;签名不作缓存基线(reload_pending → 下一 tick 重读);
+        - 绝不为「内存版本 ≠ 刚读到的文件版本」的 client 写 ok;
+        - 只检测(至多一次 auth.test),绝不发消息。→ 'ok' | 'degraded' | 'mismatch'。
         健康启动不通知(否则每次重启都弹"已恢复");degraded/mismatch 通知。"""
-        self._last_sig = configmod.tokens_stat_signature(self._tokens_path)
+        self._last_sig = configmod.tokens_stat_signature(self._tokens_path)  # 先 stat 后读:读后再变 → 下 tick 察觉
+        self._reload_pending = False
+        before = self.client.tokens_version
         try:
-            tokens, _ver = self._read_tokens_file()
-            self._app_token_digest = _app_token_digest(tokens)
+            tokens, ver = self._read_tokens_file()
+            version = self._sync_client(ver)
         except configmod.ConfigError:
+            tokens, version = None, None
+        if version is None:
             self._app_token_digest = None
-        version = self.client.tokens_version
+            self._reload_pending = True
+            self._apply("degraded", REASON_TOKENS_ERROR, before, version_changed=False)
+            self._notify_transition("degraded", REASON_TOKENS_ERROR)
+            return "degraded"
+        self._app_token_digest = _app_token_digest(tokens)
         state, reason = self._evaluate()
-        self._apply(state, reason, version, version_changed=False)
+        self._apply(state, reason, version, version_changed=(version != before))
         if state == "ok":
             self._last_notified_state = ("ok", None)   # 记状态但不发声
         else:
