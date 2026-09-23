@@ -113,6 +113,43 @@ def test_chunk_text_with_footer_drops_footer_when_impossible():
     assert [len(c) for c in chunks] == [12000, 12000, 12000] and chunks[-1] == "F" * 12000
 
 
+@pytest.mark.parametrize("n,footer_len,limit,expect_lens", [
+    (10, 8, 10, [8, 10]),          # R1-m2 原报告用例:此前得到 [2, 16](末块 16 > limit)
+    (10, 9, 10, [9, 10]),          # 页脚只差 1 装不下:尾部只能留 1 字符
+    (10, 5, 10, [5, 10]),          # 页脚恰好 limit/2:两种切法重合
+    (10, 4, 10, [6, 8]),           # 页脚 < limit/2:沿用「前段留 limit-len(footer)」的契约切法
+    (25, 8, 10, [10, 10, 3, 10]),  # 多块 + 末块 5 字符:5+8 > 10 → 尾部限 2 字符,前段 3
+    (12000, 8000, 12000, [8000, 12000]),
+    (24000, 11999, 12000, [12000, 11999, 12000]),
+])
+def test_chunk_text_with_footer_large_footer_never_exceeds_limit(n, footer_len, limit, expect_lens):
+    """R1-m2:页脚超过 limit/2 时旧实现把整段尾部 + 页脚塞进末块,末块 > limit。
+    不变量:len(footer) <= limit ⇒ 每块 ≤ limit;正文完整;页脚恰在末块末尾一次。"""
+    body = "".join(chr(0x4E00 + i % 500) for i in range(n))   # 非重复字符:能验证顺序不乱
+    footer = "F" * footer_len
+    chunks = util.chunk_text_with_footer(body, footer, limit)
+    assert [len(c) for c in chunks] == expect_lens
+    assert all(len(c) <= limit for c in chunks)
+    assert "".join(chunks) == body + footer
+    assert chunks[-1].endswith(footer) and chunks[-1].count(footer) == 1
+
+
+def test_chunk_text_with_footer_invariant_sweep():
+    """网格扫:limit ∈ 1..24、body 0..3·limit、footer 0..limit —— 每块 ≤ limit、正文不丢、页脚恰一次。"""
+    for limit in range(1, 25):
+        for n in range(0, 3 * limit + 1):
+            body = "".join(chr(0x61 + i % 26) for i in range(n))
+            for fl in range(0, limit + 1):
+                footer = "F" * fl
+                chunks = util.chunk_text_with_footer(body, footer, limit)
+                if not body:
+                    assert chunks == []
+                    continue
+                assert all(len(c) <= limit for c in chunks), (limit, n, fl, [len(c) for c in chunks])
+                assert "".join(chunks) == body + footer, (limit, n, fl)
+                assert all(c for c in chunks), (limit, n, fl)   # 不产生空块
+
+
 def test_message_id_helpers():
     assert util.message_id_of("C1", "1.2") == "C1:1.2"
     assert util.split_message_id("C1:1.2") == ("C1", "1.2")

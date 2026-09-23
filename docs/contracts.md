@@ -417,3 +417,4 @@ ListenerCore(...) / InstanceFollower(...)                          # 不变
 | WP4 | `outbound_gate` 多一个值 `mismatch`(§4.5 已列)—— 身份漂移与 `degraded:*` 区分 | mismatch 不退避重探(换回 token 或重新 bootstrap 才会变),daemon 启动遇到即拒启(rc 3) |
 | WP4 | `ctl.bind_prepare` 对**任何** `D…` chat 都要求 `cfg.owner_dm_id` 已钉住且相等,否则 `foreign_dm` 拒绝(plan 只写「拒绝非 owner_dm_id 的 D…」) | 没跑过 `open-dm` 时 `owner_dm_id` 为空,此时任何 DM 都拒(fail-closed),而不是放行 |
 | WP5 | daemon 的 xapp 变化探测只保留 `FingerprintGate.app_token_changed()` 一处(WP1 的 `AppTokenWatch` 已删) | 一个 stat、一个真相;主循环在 `core.loop_iteration()`(内含 gate.tick)之后读一次性信号并 `mgr.restart(SOCKET_KEY, "app_token_changed")` |
+| R1-m2 | `util.chunk_text_with_footer`:末块装不下时,§2.1 写的「前 `limit-len(footer)` 字符留原位」只在 `len(footer) ≤ limit/2` 时能保证新末块 ≤ limit;页脚更长时(body=10 / footer=8 / limit=10 曾得 `[2,16]`)改为把**尾部**限制在 `limit-len(footer)` 字符、前段随之变长 | 「每块(含页脚的末块)≤ limit」是主不变量;页脚 ≤ limit/2 时行为与契约文本完全一致,守卫 `tests/test_contracts.py::test_chunk_text_with_footer_invariant_sweep` |

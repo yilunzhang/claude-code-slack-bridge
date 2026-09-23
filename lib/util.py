@@ -32,9 +32,13 @@ def chunk_text_with_footer(body, footer, limit=constants.CHUNK_LIMIT):
     - body 空 → `[]`(页脚不单独成消息)。
     - 页脚为空 → 等价 chunk_text。
     - 先按 limit 平切;末块 + 页脚仍 ≤ limit → 直接拼。
-    - 否则把末块再切一刀:前段 `limit-len(footer)` 字符留在原位,余下的尾部 + 页脚成为新末块
-      (≤ limit)。**正文一个字符都不丢**;页脚整体不可分。
+    - 否则把末块再切一刀:前段留在原位,余下的尾部 + 页脚成为新末块(≤ limit)。
+      前段缺省取 `limit-len(footer)` 字符;若这样切出的尾部与页脚同块仍 > limit(页脚超过
+      limit/2 时会发生,R1-m2:body=10 / footer=8 / limit=10 曾切出 [2,16]),则改为把尾部
+      **限制**在 `limit-len(footer)` 字符(前段随之变长,但前段 ≤ 末块原长 ≤ limit)。
+      **正文一个字符都不丢**;页脚整体不可分。
     - 页脚本身 > limit(不可能装下)→ 丢页脚,正文照常平切;绝不丢正文。
+    不变量:`len(footer) <= limit` 时,返回的**每一块**(含页脚的末块)都 ≤ limit。
     """
     if not body:
         return []
@@ -48,11 +52,15 @@ def chunk_text_with_footer(body, footer, limit=constants.CHUNK_LIMIT):
     if len(last) + len(footer) <= limit:
         chunks[-1] = last + footer
         return chunks
-    keep = limit - len(footer)  # 末块只能保留这么多正文与页脚同处一块
+    keep = limit - len(footer)  # 与页脚同块的正文最多只能有这么多
     if keep <= 0:
         chunks.append(footer)  # 页脚恰好占满一块
         return chunks
-    head, tail = last[:keep], last[keep:]  # 前段留原位(≤limit),尾部 + 页脚成新末块(≤limit)
+    # 前段缺省 keep 字符(契约文本);但尾部同样不得超过 keep,否则 tail+footer > limit。
+    # 到这里 len(last) > keep(否则上面已直接拼上),所以 head_len < len(last),尾部非空。
+    head_len = max(keep, len(last) - keep)
+    head, tail = last[:head_len], last[head_len:]
+    assert len(tail) + len(footer) <= limit and len(head) <= limit
     chunks[-1] = head
     chunks.append(tail + footer)
     return chunks
