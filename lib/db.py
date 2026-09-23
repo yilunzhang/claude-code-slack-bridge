@@ -81,6 +81,20 @@ def get_state(conn, key, default=None):
     return row[0] if row else default
 
 
+def get_states(conn, keys):
+    """一条 SELECT 读多个 daemon_state 键 → {key: value}(缺行的键不在 dict 里)。
+    单条语句 = 同一读快照(WAL 下语句执行期间看到的是一致的快照):调用方要**联合判定**的几个键
+    (如 outbound_gate + outbound_gate_tokens_version,R1-M4)必须用它,不能分两次 get_state
+    ——两次自动提交读之间 daemon 可能原子写入了新版本的 (gate, version),拼出一个从未存在过的组合。"""
+    keys = tuple(keys)
+    if not keys:
+        return {}
+    rows = conn.execute(
+        "SELECT key, value FROM daemon_state WHERE key IN (%s)" % ",".join("?" for _ in keys),
+        keys).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 def set_state(conn, key, value):
     conn.execute(
         "INSERT INTO daemon_state(key,value) VALUES(?,?) "

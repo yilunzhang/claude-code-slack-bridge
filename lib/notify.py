@@ -8,7 +8,8 @@ agent/hook 主动给「本 session 绑定的 Slack 会话」发一条 @owner 的
 (主动出站,不经审批门)。**不是 fail-open 装饰**:发送失败/未知**如实返回、不吞**;只有前置条件
 (空消息 / 无绑定)才 exit 0 + ok:false。直发(非 daemon 队列),但发前尊重同款门
 (contracts §0 I2 / §7):allowlist + `outbound_gate=="ok"` + **凭据版本**(tokens.json 当前版本必须
-== `outbound_gate_tokens_version`,否则 `credentials-unverified`)+ session 三元组 + owner/chat_id 校验;
+== `outbound_gate_tokens_version`,否则 `credentials-unverified`;先取 tokens 快照,再用**一条 SELECT**
+联合读 gate 与版本,R1-M4)+ session 三元组 + owner/chat_id 校验;
 方法级冷却由 `SlackClient.call` 统一处理 → `cooldown`。
 
 run_notify 全依赖注入(stdin_text/environ/prober/start_pid/make_client)→ 纯逻辑、零真实网络/进程
@@ -167,20 +168,27 @@ def run_notify(*, stdin_text, environ, prober, start_pid, make_client):
                 return ({"ok": False, "sent": False, "reason": "chat-not-allowed",
                          "detail": "绑定会话不在 chat_allowlist 内"}, 3)
 
-            # 8. 身份门(fail-closed,**不给默认值**——缺行=None 也拒)。
-            gate = db.get_state(conn, constants.GATE_KEY)
-            if gate != "ok":
-                return ({"ok": False, "sent": False, "reason": "gate-degraded",
-                         "detail": "出站身份门非 ok(%r);身份未验证,拒绝直发" % (gate,)}, 3)
-
-            # 8a. 凭据版本门(contracts §7):tokens.json **当前**版本必须 == 门通过时的版本。
-            #     文件是真相(allow_env=False);换过 token 而 daemon 尚未重验 → credentials-unverified。
+            # 8. 凭据快照(contracts §7):**先**读 tokens.json(文件是真相,allow_env=False)——
+            #    之后要发送就用这份快照,门的判定也针对这份快照的版本。
             try:
                 tokens, file_version = configmod.load_tokens(allow_env=False)
             except configmod.ConfigError as e:
                 return ({"ok": False, "sent": False, "reason": "credentials-unverified",
                          "detail": "tokens.json 不可用:%s" % e}, 3)
-            gate_version = db.get_state(conn, constants.GATE_VERSION_KEY)
+
+            # 8a. 身份门 + 凭据版本门,**一条 SELECT 同一读快照**联合判定(R1-M4)。
+            #     分两次读会有跨版本拼接竞态:先读到旧版本的 `ok`,随后 token 轮换、daemon 原子写入
+            #     新版本的 `mismatch`,再读到新版本号恰好等于文件版本 → 放行。联合读取后 (gate, version)
+            #     要么同属旧版本(版本 ≠ 文件 → 拒),要么同属新版本(gate 非 ok → 拒)。
+            #     fail-closed,**不给默认值**——缺行也拒。
+            st = db.get_states(conn, (constants.GATE_KEY, constants.GATE_VERSION_KEY,
+                                      constants.TOKENS_VERSION_SEEN_KEY))
+            gate = st.get(constants.GATE_KEY)
+            gate_version = st.get(constants.GATE_VERSION_KEY)
+            if gate != "ok":
+                return ({"ok": False, "sent": False, "reason": "gate-degraded",
+                         "detail": "出站身份门非 ok(%r,绑定版本 %r);身份未验证,拒绝直发"
+                                   % (gate, gate_version)}, 3)
             if not gate_version or gate_version != file_version:
                 return ({"ok": False, "sent": False, "reason": "credentials-unverified",
                          "detail": ("tokens.json 版本与 daemon 已验证版本不一致"

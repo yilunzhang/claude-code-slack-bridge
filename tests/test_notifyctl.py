@@ -402,6 +402,113 @@ class TestGateAndCredentials:
         assert code == 0 and obj["sent"] is True
         assert cap[0][0]["bot_token"] == "xoxb-rotated" and cap[0][1] == new_ver
 
+    def _rotate_and_daemon_writes(self, conn, gate, bot="xoxb-rotated"):
+        """「世界在 notify 的两次检查之间前进」:tokens.json 轮换到新版本,daemon 在**同一事务**里
+        把 (outbound_gate, outbound_gate_tokens_version, tokens_version_seen) 原子写成新版本的判定。"""
+        new_ver = configmod.save_tokens({"bot_token": bot, "app_token": "xapp-x"}, overwrite=True)
+        with dbmod.tx(conn):
+            dbmod.set_state(conn, constants.GATE_KEY, gate)
+            dbmod.set_state(conn, constants.GATE_VERSION_KEY, new_ver)
+            dbmod.set_state(conn, constants.TOKENS_VERSION_SEEN_KEY, new_ver)
+        return new_ver
+
+    def test_interleaved_rotation_and_gate_update_fails_closed(self, cfg, tokens, conn, monkeypatch):
+        """R1-M4 原报告竞态:旧实现 = get_state(gate) → load_tokens → get_state(version) 三次自动提交读。
+        时序:读到旧版本的 `ok` → token 轮换 → daemon 原子写入新版本的 `mismatch` → 读到新版本号 == 文件
+        版本 → **放行**(用一份 daemon 已判定为身份不符的凭据直发)。
+        修复后:先取 tokens 快照,再一条 SELECT 联合读 (gate, version):同属新版本 → gate=mismatch → 拒。"""
+        _setup_bound(conn)                                   # (ok, 旧版本)
+        real_load = notifymod.configmod.load_tokens
+        fired = []
+
+        def racing_load(*a, **kw):
+            if not fired:                                    # 只在 notify 的那次读取前触发一次
+                fired.append(1)
+                self._rotate_and_daemon_writes(conn, "mismatch")
+            return real_load(*a, **kw)
+
+        monkeypatch.setattr(notifymod.configmod, "load_tokens", racing_load)
+        client = _ok_client()
+        cap = []
+        obj, code = _call(client=client, captured=cap)
+        assert client.calls == [] and cap == []              # 绝不能发、连 client 都不建
+        assert code == 3 and obj["sent"] is False
+        assert obj["reason"] == "gate-degraded" and "mismatch" in obj["detail"]
+
+    @pytest.mark.parametrize("gate", ["degraded:auth_error", "degraded:tokens_error"])
+    def test_interleaved_rotation_with_degraded_gate_fails_closed(self, cfg, tokens, conn, monkeypatch, gate):
+        _setup_bound(conn)
+        real_load = notifymod.configmod.load_tokens
+        fired = []
+
+        def racing_load(*a, **kw):
+            if not fired:
+                fired.append(1)
+                self._rotate_and_daemon_writes(conn, gate)
+            return real_load(*a, **kw)
+
+        monkeypatch.setattr(notifymod.configmod, "load_tokens", racing_load)
+        client = _ok_client()
+        obj, code = _call(client=client)
+        assert client.calls == [] and code == 3 and obj["reason"] == "gate-degraded"
+
+    def test_rotation_after_token_snapshot_is_credentials_unverified(self, cfg, tokens, conn, monkeypatch):
+        """快照之后世界前进:notify 读到旧 tokens(v1)→ 轮换 + daemon 写 (ok, v2) → 联合读 (ok, v2) ≠ v1
+        → credentials-unverified(手里的凭据不是 daemon 验证过的那份),绝不用 v1 发。"""
+        _setup_bound(conn)
+        real_load = notifymod.configmod.load_tokens
+        fired = []
+
+        def racing_load(*a, **kw):
+            res = real_load(*a, **kw)
+            if not fired:
+                fired.append(1)
+                self._rotate_and_daemon_writes(conn, "ok")
+            return res
+
+        monkeypatch.setattr(notifymod.configmod, "load_tokens", racing_load)
+        client = _ok_client()
+        cap = []
+        obj, code = _call(client=client, captured=cap)
+        assert client.calls == [] and cap == []
+        assert code == 3 and obj["reason"] == "credentials-unverified"
+        assert tokens.version in obj["detail"]
+
+    def test_gate_and_version_read_in_one_statement_after_token_snapshot(self, bound, monkeypatch):
+        """结构守卫:gate 与版本必须来自**同一条** SELECT(同一读快照),且在 tokens 快照**之后**;
+        绝不能再出现单独读 outbound_gate 或单独读 outbound_gate_tokens_version 的语句。"""
+        events = []
+        real_connect = notifymod.db.connect
+
+        class Spy:
+            def __init__(self, c):
+                self._c = c
+
+            def execute(self, sql, params=()):
+                if "daemon_state" in sql and "SELECT" in sql.upper():
+                    keys = {p for p in (params or ()) if isinstance(p, str)}
+                    if constants.GATE_KEY in keys or constants.GATE_VERSION_KEY in keys:
+                        events.append(("gate_read", frozenset(keys)))
+                return self._c.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+
+        monkeypatch.setattr(notifymod.db, "connect", lambda *a, **kw: Spy(real_connect(*a, **kw)))
+        real_load = notifymod.configmod.load_tokens
+
+        def load_spy(*a, **kw):
+            events.append(("tokens", None))
+            return real_load(*a, **kw)
+
+        monkeypatch.setattr(notifymod.configmod, "load_tokens", load_spy)
+        obj, code = _call(client=_ok_client())
+        assert code == 0 and obj["sent"] is True
+        gate_reads = [e for e in events if e[0] == "gate_read"]
+        assert len(gate_reads) == 1, events                          # 恰一条语句
+        assert {constants.GATE_KEY, constants.GATE_VERSION_KEY} <= gate_reads[0][1]   # 两键同语句
+        assert [e[0] for e in events].index("tokens") < [e[0] for e in events].index("gate_read")
+
     def test_gate_version_stale_vs_file_rejected(self, cfg, tokens, conn):
         _setup_bound(conn, gate="ok", gate_version="123:deadbeefdeadbeef")
         client = FakeSlackClient()
