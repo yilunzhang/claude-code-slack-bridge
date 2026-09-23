@@ -149,7 +149,7 @@ def file_plan(files, max_bytes=None, quota_bytes=None):
             dest_name = dest_name_for(f, i, seen)
             seen.add(dest_name)
         plan.append({"file": f, "id": _s(f.get("id")), "name": f.get("name") or f.get("title"),
-                     "url": file_url(f), "skip": reason, "dest_name": dest_name})
+                     "url": file_url(f), "skip": reason, "dest_name": dest_name, "index": i})
     return plan
 
 
@@ -158,22 +158,40 @@ def skipped_of(plan):
             for e in plan if e["skip"] is not None]
 
 
+def _lookup_published(entry, by_name, claimed):
+    """按 dest_name 反查已发布路径;新名缺席时回落旧命名(R2-m1,R1-M7 之前发布的目录):
+    净化后的原名、再是旧去重形态 `<n>-原名`(n ≥ 2)。每个路径只认领一次(同名文件不会都指向同一路径)。"""
+    legacy = _safe_name(entry["name"], entry["index"])
+    cands = [entry["dest_name"], legacy]
+    cands.extend("%d-%s" % (n, legacy) for n in range(2, len(by_name) + 2))
+    for c in cands:
+        p = by_name.get(c)
+        if p is not None and p not in claimed:
+            claimed.add(p)
+            return p
+    return None
+
+
 def describe_files(files, paths):
-    """payload `files[]`(contracts §4.3):可下载条目 → local_path(按 dest_name 反查 paths),
-    其余 → skipped_reason。paths 里找不到对应文件(不应发生)→ 按 no_url 记为 skipped。"""
+    """payload `files[]`(contracts §4.3):可下载条目 → local_path(按 dest_name 反查 paths;新名缺席时
+    回落旧命名,见 `_lookup_published`),其余 → skipped_reason。paths 里找不到对应文件 → 保守按 no_url
+    记为 skipped(payload 只引用确实存在于发布目录里的路径)。"""
     by_name = {}
     for p in paths or []:
         by_name[os.path.basename(p)] = p
+    claimed = set()
     out = []
     for e in file_plan(files):
         f = e["file"]
         item = {"id": e["id"], "name": e["name"], "mimetype": f.get("mimetype"), "size": f.get("size")}
         if e["skip"] is not None:
             item["skipped_reason"] = e["skip"]
-        elif e["dest_name"] in by_name:
-            item["local_path"] = by_name[e["dest_name"]]
         else:
-            item["skipped_reason"] = "no_url"
+            p = _lookup_published(e, by_name, claimed)
+            if p is not None:
+                item["local_path"] = p
+            else:
+                item["skipped_reason"] = "no_url"
         out.append(item)
     return out
 
