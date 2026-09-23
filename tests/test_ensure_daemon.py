@@ -1,4 +1,4 @@
-"""修复项5:ensure_daemon 挂死恢复(锁被持有但心跳陈旧→pid+start 精确匹配 SIGTERM→接管);
+"""ensure_daemon 挂死恢复(自 feishu-bridge 原样移植;阈值改按 DOWNLOAD_DEADLINE_S)(锁被持有但心跳陈旧→pid+start 精确匹配 SIGTERM→接管);
 listener 探活升级为 锁+心跳新鲜;新拉起要求 last_loop_at 晚于 spawn。"""
 import signal
 
@@ -157,13 +157,14 @@ class FakeSingleflight:
 
 
 def test_long_download_not_taken_over_under_threshold():
-    """r7-3:阈值收窄到 DOWNLOAD_TIMEOUT_S+60(=180s);单次 120s 合法下载(daemon 单线程,
-    下载期间主循环阻塞不刷心跳)仍 < 阈值 → 不误判挂死。确认阈值 ≥ 单次最长同步网络操作。"""
+    """阈值 = DOWNLOAD_DEADLINE_S+60(=150s):单次 90s 合法下载(父进程 proc.wait 到绝对截止,
+    主循环阻塞不刷心跳)仍 < 阈值 → 不误判挂死。确认阈值 ≥ 单次最长同步网络操作(含 SEND_TIMEOUT_S)。"""
     from lib import constants
     clock = FakeClock()
-    assert HUNG_THRESHOLD_MS >= constants.DOWNLOAD_TIMEOUT_S * 1000  # 覆盖最长同步下载
-    assert HUNG_THRESHOLD_MS < 300_000  # 从 r2 的 300s 收窄
-    w = World(clock, held=True, last_loop=clock.wall_ms() - constants.DOWNLOAD_TIMEOUT_S * 1000)
+    assert HUNG_THRESHOLD_MS >= constants.DOWNLOAD_DEADLINE_S * 1000  # 覆盖最长同步下载
+    assert HUNG_THRESHOLD_MS >= constants.SEND_TIMEOUT_S * 1000
+    assert HUNG_THRESHOLD_MS < 300_000
+    w = World(clock, held=True, last_loop=clock.wall_ms() - constants.DOWNLOAD_DEADLINE_S * 1000)
     assert w.supervisor().ensure() == "running"
     assert w.kills == [] and w.spawns == 0
 

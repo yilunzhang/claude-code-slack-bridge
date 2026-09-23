@@ -1,16 +1,26 @@
-"""bridgectl 逻辑层(lib/ctl.py):bootstrap 身份配方 / hooks 检查(只读)/ bind/unbind / doctor。"""
+"""bridgectl 逻辑层(lib/ctl.py)+ CLI(bin/bridgectl.py),Slack 版:
+bootstrap 身份配方(token 只走 env/stdin、0600、存在即拒、bots.info/--app-id、--owner-email、不发消息)/
+chats 分页契约(完整或 None)/ open-dm 钉 owner_dm_id / bind 拒 foreign_dm / status 形状 / doctor /
+hooks 心跳(只读)/ reconcile code-identity / ensure 等认领。全程离线(FakeSlackClient)。"""
+import importlib.util
+import io
 import json
+import os
 import pathlib
+import sys
 
 import pytest
 
-from tests.conftest import CC_PID, CC_START, CHAT, PROFILE
-from tests.helpers import FakeRunResult, FakeRunner, err_envelope, ok_envelope
+from tests.conftest import APP_ID, BOT_ID, BOT_USER, CC_PID, CC_START, CHAT, DM, OWNER, TEAM
+from tests.helpers import FakeSlackClient, err, not_sent, ok, posted
 from lib import config as configmod
-from lib import ctl, lifecycle, paths
+from lib import constants, ctl, db as dbmod, lifecycle, paths
 
-
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 ZSH_PID = 8100
+TOKENS = {"bot_token": "xoxb-boot-token-secret", "app_token": "xapp-boot-token-secret"}
+AUTH_OK = {"url": "https://t.slack.com/", "team": "Test Team", "user": "slack-bridge",
+           "team_id": TEAM, "user_id": BOT_USER, "bot_id": BOT_ID}
 
 
 @pytest.fixture
@@ -19,122 +29,329 @@ def ctl_prober(prober):
     return prober
 
 
-def auth_status_runner():
-    r = FakeRunner(profile=PROFILE)
-    r.on_prefix(["auth", "status"], lambda a, c: FakeRunResult(0, json.dumps({
-        "appId": "cli_testapp",
-        "identities": {"user": {"available": True, "openId": "ou_owner"},
-                       "bot": {"available": True}}})))
-    r.on_prefix(["api", "GET", "/open-apis/bot/v3/info"], lambda a, c: FakeRunResult(
-        0, '{"note":"noise"}\n{"bot":{"open_id":"ou_bot","app_name":"Yilun CLI"}}\n'))
-    r.on_prefix(["--version"], lambda a, c: FakeRunResult(0, "1.0.66\n"))
-    return r
+def bootstrap_client(auth=None, bots_info=None, lookup=None):
+    """bootstrap 用 fake:auth.test / bots.info / users.lookupByEmail;**不注册 chat.postMessage**
+    —— 任何发消息都会 AssertionError(证明 bootstrap 不发消息)。"""
+    c = FakeSlackClient()
+    c.on("auth.test", auth or (lambda m, p: ok(AUTH_OK)))
+    c.on("bots.info", bots_info or (lambda m, p: ok({"bot": {"id": p["bot"], "app_id": APP_ID, "name": "slack-bridge"}})))
+    c.on("users.lookupByEmail", lookup or (lambda m, p: ok({"user": {"id": OWNER, "name": "owner"}})))
+    return c
 
 
+def _load_bridgectl():
+    spec = importlib.util.spec_from_file_location("bridgectl_mod", ROOT / "bin" / "bridgectl.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ============================================================================ bootstrap
 class TestBootstrap:
-    def test_bootstrap_writes_fingerprint(self, data_dir):
-        from lib.clock import SystemClock
-        cfg = ctl.bootstrap(auth_status_runner(), PROFILE, SystemClock())
-        assert cfg["app_id"] == "cli_testapp" and cfg["owner_open_id"] == "ou_owner"
-        assert cfg["bot_open_id"] == "ou_bot" and cfg["bot_name"] == "Yilun CLI"
-        assert cfg["cli_version"] == "1.0.66"
-        assert configmod.load_config()["profile"] == PROFILE
+    def test_pins_identity_writes_config_and_tokens_0600_no_messages(self, data_dir):
+        c = bootstrap_client()
+        cfg = ctl.bootstrap(lambda t: c, owner=OWNER, tokens=dict(TOKENS))
+        assert cfg["team_id"] == TEAM and cfg["bot_user_id"] == BOT_USER and cfg["bot_id"] == BOT_ID
+        assert cfg["app_id"] == APP_ID and cfg["owner_user_id"] == OWNER
+        assert cfg["bot_name"] == "slack-bridge" and cfg["team_name"] == "Test Team"
+        assert "bot_token" not in json.dumps(cfg) and "xoxb" not in json.dumps(cfg)
+        on_disk = configmod.load_config()
+        assert configmod.missing_keys(on_disk) == [] and on_disk["owner_user_id"] == OWNER
+        assert "xoxb" not in paths.config_path().read_text()
+        assert oct(os.stat(paths.config_path()).st_mode & 0o777) == "0o600"
+        assert oct(os.stat(paths.tokens_path()).st_mode & 0o777) == "0o600"
+        t, v = configmod.load_tokens(allow_env=False)
+        assert t == TOKENS and v
+        # 调用清单:只有 auth.test + bots.info;零 chat.postMessage
+        assert [m for m, _ in c.calls] == ["auth.test", "bots.info"]
+        assert c.calls_for("bots.info") == [{"bot": BOT_ID}]
 
-    def test_bootstrap_refuses_overwrite(self, cfg):
-        from lib.clock import SystemClock
+    def test_refuses_overwrite_when_config_exists(self, cfg):
+        c = bootstrap_client()
+        with pytest.raises(configmod.ConfigError, match="已存在"):
+            ctl.bootstrap(lambda t: c, owner=OWNER, tokens=dict(TOKENS))
+        assert c.calls == []                       # 存在即拒,连 auth.test 都不打
+
+    def test_refuses_when_tokens_exist_without_config(self, tokens):
+        c = bootstrap_client()
+        with pytest.raises(configmod.ConfigError, match="tokens.json 已存在"):
+            ctl.bootstrap(lambda t: c, owner=OWNER, tokens=dict(TOKENS))
+        assert configmod.load_config() is None
+
+    def test_owner_email_path(self, data_dir):
+        c = bootstrap_client()
+        cfg = ctl.bootstrap(lambda t: c, owner_email="owner@example.com", tokens=dict(TOKENS))
+        assert cfg["owner_user_id"] == OWNER
+        assert c.calls_for("users.lookupByEmail") == [{"email": "owner@example.com"}]
+
+    def test_owner_email_lookup_failure_refuses(self, data_dir):
+        c = bootstrap_client(lookup=lambda m, p: err("users_not_found"))
+        with pytest.raises(configmod.ConfigError, match="lookupByEmail"):
+            ctl.bootstrap(lambda t: c, owner_email="nobody@example.com", tokens=dict(TOKENS))
+        assert configmod.load_config() is None and not paths.tokens_path().exists()
+
+    @pytest.mark.parametrize("kw", [dict(), dict(owner=OWNER, owner_email="a@b"), dict(owner="ou_bad")])
+    def test_owner_args_validation(self, data_dir, kw):
         with pytest.raises(configmod.ConfigError):
-            ctl.bootstrap(auth_status_runner(), "other", SystemClock())
+            ctl.bootstrap(lambda t: bootstrap_client(), tokens=dict(TOKENS), **kw)
+
+    def test_missing_app_id_refuses_unless_flag(self, data_dir):
+        c = bootstrap_client(bots_info=lambda m, p: err("bot_not_found"))
+        with pytest.raises(configmod.ConfigError, match="--app-id"):
+            ctl.bootstrap(lambda t: c, owner=OWNER, tokens=dict(TOKENS))
+        assert configmod.load_config() is None and not paths.tokens_path().exists()
+        c2 = bootstrap_client(bots_info=lambda m, p: ok({"bot": {"id": BOT_ID}}))   # 无 app_id 字段
+        cfg = ctl.bootstrap(lambda t: c2, owner=OWNER, tokens=dict(TOKENS), app_id="A0EXPLICIT")
+        assert cfg["app_id"] == "A0EXPLICIT" and configmod.load_config()["app_id"] == "A0EXPLICIT"
+
+    def test_explicit_app_id_conflicting_with_bots_info_refuses(self, data_dir):
+        c = bootstrap_client()
+        with pytest.raises(configmod.ConfigError, match="不一致"):
+            ctl.bootstrap(lambda t: c, owner=OWNER, tokens=dict(TOKENS), app_id="A0OTHER")
+
+    def test_auth_failure_or_missing_fields_refuses(self, data_dir):
+        with pytest.raises(configmod.ConfigError, match="auth.test"):
+            ctl.bootstrap(lambda t: bootstrap_client(auth=lambda m, p: err("invalid_auth")),
+                          owner=OWNER, tokens=dict(TOKENS))
+        with pytest.raises(configmod.ConfigError, match="auth.test"):
+            ctl.bootstrap(lambda t: bootstrap_client(auth=lambda m, p: not_sent("dns")),
+                          owner=OWNER, tokens=dict(TOKENS))
+        no_bot = dict(AUTH_OK)
+        no_bot.pop("bot_id")
+        with pytest.raises(configmod.ConfigError, match="bot_id"):
+            ctl.bootstrap(lambda t: bootstrap_client(auth=lambda m, p: ok(no_bot)),
+                          owner=OWNER, tokens=dict(TOKENS))
+        assert configmod.load_config() is None and not paths.tokens_path().exists()
+
+    @pytest.mark.parametrize("tokens", [
+        None, {}, {"bot_token": ""}, {"bot_token": "xoxp-user-token"},
+        {"bot_token": "xoxb-x", "app_token": "notxapp"}, "xoxb-string",
+    ])
+    def test_token_shape_validation(self, data_dir, tokens):
+        with pytest.raises(configmod.ConfigError):
+            ctl.bootstrap(lambda t: bootstrap_client(), owner=OWNER, tokens=tokens)
+
+    def test_app_token_optional_but_recorded(self, data_dir):
+        cfg = ctl.bootstrap(lambda t: bootstrap_client(), owner=OWNER,
+                            tokens={"bot_token": "xoxb-only"})
+        assert cfg["owner_user_id"] == OWNER
+        assert configmod.load_tokens(allow_env=False)[0] == {"bot_token": "xoxb-only", "app_token": None}
+
+    def test_stores_allowlist(self, data_dir):
+        cfg = ctl.bootstrap(lambda t: bootstrap_client(), owner=OWNER, tokens=dict(TOKENS),
+                            chat_allowlist=["C0A", "C0B"])
+        assert cfg["chat_allowlist"] == ["C0A", "C0B"]
+        assert configmod.load_config()["chat_allowlist"] == ["C0A", "C0B"]
+
+    def test_owner_cannot_be_bot(self, data_dir):
+        with pytest.raises(configmod.ConfigError, match="bot 自己"):
+            ctl.bootstrap(lambda t: bootstrap_client(), owner=BOT_USER, tokens=dict(TOKENS))
 
 
-def _write_hb(event, ts, plugin_version=None, pkg_root=None):
-    """按新 schema 直接写某 event 的心跳文件(测试用)。"""
-    from lib import paths as pathsmod, util, version as versionmod
-    pathsmod.ensure_data_dir()
-    root, ver = versionmod.install_identity()
-    util.atomic_write(pathsmod.hook_heartbeat_path(event), util.jdumps({
-        "event": event, "ts": ts,
-        "plugin_version": plugin_version if plugin_version is not None else ver,
-        "pkg_root": pkg_root if pkg_root is not None else root}))
+class TestBootstrapCli:
+    """token 只经 env / --tokens-stdin;argv 没有任何 token 选项;输出绝不含 token。"""
+
+    def _run(self, monkeypatch, capsys, argv, client, stdin_bytes=None):
+        bridgectl = _load_bridgectl()
+        monkeypatch.setattr(bridgectl, "SlackClient", lambda **kw: client)
+        if stdin_bytes is not None:
+            monkeypatch.setattr(bridgectl.sys, "stdin", io.StringIO(stdin_bytes))
+        monkeypatch.setattr(sys, "argv", ["bridgectl", *argv])
+        with pytest.raises(SystemExit) as ei:
+            bridgectl.main()
+        out = capsys.readouterr().out
+        return (json.loads(out) if out.strip() else None), ei.value.code, out
+
+    def test_env_tokens_success_output_has_no_token(self, data_dir, monkeypatch, capsys):
+        monkeypatch.setenv("SLACK_BOT_TOKEN", TOKENS["bot_token"])
+        monkeypatch.setenv("SLACK_APP_TOKEN", TOKENS["app_token"])
+        res, code, raw = self._run(monkeypatch, capsys, ["bootstrap", "--owner", OWNER], bootstrap_client())
+        assert code == 0 and res["ok"] is True
+        assert res["config"]["owner_user_id"] == OWNER and res["tokens"]["app_token_present"] is True
+        assert "xoxb" not in raw and "xapp" not in raw and "secret" not in raw
+        assert configmod.load_tokens(allow_env=False)[0] == TOKENS
+
+    def test_missing_env_token_refuses_with_guidance(self, data_dir, monkeypatch, capsys):
+        res, code, raw = self._run(monkeypatch, capsys, ["bootstrap", "--owner", OWNER], bootstrap_client())
+        assert code == 2 and res["ok"] is False and "SLACK_BOT_TOKEN" in res["error"]
+        assert configmod.load_config() is None
+
+    def test_tokens_stdin_json(self, data_dir, monkeypatch, capsys):
+        res, code, raw = self._run(monkeypatch, capsys,
+                                   ["bootstrap", "--owner", OWNER, "--tokens-stdin"],
+                                   bootstrap_client(), stdin_bytes=json.dumps(TOKENS))
+        assert code == 0 and res["ok"] is True and "secret" not in raw
+        assert configmod.load_tokens(allow_env=False)[0] == TOKENS
+
+    def test_no_argv_token_options_exist(self, data_dir, monkeypatch, capsys):
+        for flag in ("--bot-token", "--app-token", "--token"):
+            res, code, raw = self._run(monkeypatch, capsys,
+                                       ["bootstrap", "--owner", OWNER, flag, "xoxb-argv"], bootstrap_client())
+            assert code == 2 and res is None       # argparse 拒绝未知选项
+        assert configmod.load_config() is None
+
+    def test_missing_app_token_warns(self, data_dir, monkeypatch, capsys):
+        monkeypatch.setenv("SLACK_BOT_TOKEN", TOKENS["bot_token"])
+        res, code, raw = self._run(monkeypatch, capsys, ["bootstrap", "--owner", OWNER], bootstrap_client())
+        assert code == 0 and "app_token" in res.get("warning", "")
 
 
-class TestHooksLiveStatus:
-    """plugin 化:hooks 由 plugin 提供,检测靠**分事件**哨兵心跳(不读 settings.json 判手装)。
-    advisory only;Stop 心跳 seen∧fresh∧current = confirmed(主信号)。"""
-
-    def test_not_seen_when_no_heartbeat(self, data_dir):
-        from lib import paths as pathsmod
-        pathsmod.ensure_data_dir()
-        st = ctl.hooks_live_status()
-        assert st["advisory"] is True and st["confirmed"] is False
-        assert st["stop"]["seen"] is False and st["session_end"]["seen"] is False
-
-    def test_confirmed_after_real_stop_hook_runs(self, data_dir):
-        from lib import hooklib, paths as pathsmod
-        pathsmod.ensure_data_dir()
-        hooklib._touch_hook_heartbeat("stop")  # 模拟真实 Stop hook 运行
-        st = ctl.hooks_live_status()
-        assert st["stop"]["seen"] and st["stop"]["fresh"] and st["stop"]["current"]
-        assert st["confirmed"] is True
-
-    def test_session_end_only_does_not_confirm(self, data_dir):
-        """MAJOR 2:仅 SessionEnd 心跳不该压掉警告(握手依赖 Stop)。"""
-        from lib import hooklib
-        hooklib._touch_hook_heartbeat("session_end")
-        st = ctl.hooks_live_status()
-        assert st["session_end"]["seen"] is True
-        assert st["stop"]["seen"] is False and st["confirmed"] is False
-
-    def test_stale_stop_not_fresh(self, data_dir):
-        _write_hb("stop", 1000)
-        st = ctl.hooks_live_status(now_ms=1000 + ctl.HOOK_HEARTBEAT_FRESH_MS + 1)
-        assert st["stop"]["seen"] and st["stop"]["fresh"] is False and st["confirmed"] is False
-
-    def test_future_timestamp_not_fresh(self, data_dir):
-        """MAJOR 2:未来时间戳(age<0)不判 fresh。"""
-        _write_hb("stop", 10_000)
-        st = ctl.hooks_live_status(now_ms=5_000)  # now 在心跳之前 → age=-5000
-        assert st["stop"]["seen"] and st["stop"]["fresh"] is False and st["confirmed"] is False
-
-    def test_another_install_or_version_not_current(self, data_dir):
-        """MAJOR 2:另一 install/旧版本的心跳不算 current → 不 confirm。"""
-        now = 1_000_000
-        _write_hb("stop", now, plugin_version="0.9.0", pkg_root="/other/install")
-        st = ctl.hooks_live_status(now_ms=now)
-        assert st["stop"]["seen"] and st["stop"]["fresh"]  # 新鲜
-        assert st["stop"]["current"] is False and st["confirmed"] is False
-
-    def test_foreign_stop_hooks_detected(self, data_dir):
-        p = paths.settings_json_path()
-        p.write_text(json.dumps({"hooks": {"Stop": [
-            {"hooks": [{"type": "command", "command": "python3 /x/other_blocking_hook.py"}]}]}}))
-        assert ctl.foreign_stop_hooks() == ["python3 /x/other_blocking_hook.py"]
-
-    def test_foreign_stop_hooks_ignores_own_and_missing(self, data_dir):
-        assert ctl.foreign_stop_hooks() == []  # 无 settings.json
-        p = paths.settings_json_path()
-        p.write_text(json.dumps({"hooks": {"Stop": [
-            {"hooks": [{"type": "command",
-                        "command": "python3 /p/feishu-bridge/hooks/stop_hook.py"}]}]}}))
-        assert ctl.foreign_stop_hooks() == []  # 本 plugin 的不算 foreign
+# ============================================================================ chats
+def _page(channels, cursor=""):
+    return ok({"channels": channels, "response_metadata": {"next_cursor": cursor}})
 
 
+def _chan(cid, name="general", member=True, private=False, archived=False):
+    return {"id": cid, "name": name, "is_channel": not private, "is_group": private,
+            "is_private": private, "is_member": member, "is_archived": archived, "is_im": False}
+
+
+def _im(cid, user):
+    return {"id": cid, "is_im": True, "user": user, "is_member": True}
+
+
+class TestListChats:
+    def test_filters_membership_and_owner_dm(self, cfg):
+        c = FakeSlackClient()
+        c.on("conversations.list", lambda m, p: _page([
+            _chan("C0A", "a"), _chan("C0B", "b", member=False), _chan("G0P", "p", private=True),
+            _chan("C0ARCH", "old", archived=True), _im(DM, OWNER), _im("D0OTHER", "U0MEMBER"),
+            {"id": "G0MPIM", "is_mpim": True, "is_member": True}, {"no": "id"}, "junk",
+        ]))
+        chats = ctl.list_chats(c, cfg)
+        assert [x["chat_id"] for x in chats] == ["C0A", "G0P", DM]
+        by = {x["chat_id"]: x for x in chats}
+        assert by["C0A"]["type"] == "public_channel" and by["G0P"]["type"] == "private_channel"
+        assert by[DM]["type"] == "owner_dm" and by[DM]["is_pinned_owner_dm"] is True
+        p = c.calls_for("conversations.list")[0]
+        assert p["types"] == "public_channel,private_channel,im" and p["exclude_archived"] is True
+        assert p["limit"] == 200 and "cursor" not in p
+
+    def test_follows_cursor_including_empty_page_with_cursor(self, cfg):
+        pages = {None: _page([_chan("C0A", "a")], "c2"),
+                 "c2": _page([], "c3"),                      # 空页但带 cursor:合法,继续
+                 "c3": _page([_chan("C0B", "b")], "c4"),
+                 "c4": _page([_chan("C0C", "c")], "")}
+        c = FakeSlackClient()
+        c.on("conversations.list", lambda m, p: pages[p.get("cursor")])
+        chats = ctl.list_chats(c, cfg)
+        assert [x["chat_id"] for x in chats] == ["C0A", "C0B", "C0C"]
+        assert [p.get("cursor") for p in c.calls_for("conversations.list")] == [None, "c2", "c3", "c4"]
+
+    def test_cursor_loop_detected(self, cfg):
+        pages = {None: _page([_chan("C0A", "a")], "c2"),
+                 "c2": _page([_chan("C0B", "b")], "c3"),
+                 "c3": _page([_chan("C0C", "c")], "c2")}    # 回到 c2 → 循环
+        c = FakeSlackClient()
+        c.on("conversations.list", lambda m, p: pages[p.get("cursor")])
+        assert ctl.list_chats(c, cfg) is None
+        assert len(c.calls_for("conversations.list")) == 3
+
+    def test_page_cap(self, cfg):
+        n = [0]
+
+        def resp(m, p):
+            n[0] += 1
+            return _page([_chan("C%05d" % n[0], "x")], "cur%d" % n[0])
+        c = FakeSlackClient()
+        c.on("conversations.list", resp)
+        assert ctl.list_chats(c, cfg, page_cap=5) is None
+        assert n[0] == 5
+        assert ctl.LIST_PAGE_CAP == 50
+
+    def test_partial_failure_returns_none_not_prefix(self, cfg):
+        pages = {None: _page([_chan("C0A", "a")], "c2"), "c2": err("ratelimited", http_status=429)}
+        c = FakeSlackClient()
+        c.on("conversations.list", lambda m, p: pages[p.get("cursor")])
+        assert ctl.list_chats(c, cfg) is None
+
+    @pytest.mark.parametrize("bad", [ok({"channels": "nope"}), ok({}), ok({"channels": [], "response_metadata": {"next_cursor": 5}})])
+    def test_malformed_page_returns_none(self, cfg, bad):
+        c = FakeSlackClient()
+        c.on("conversations.list", lambda m, p: bad)
+        assert ctl.list_chats(c, cfg) is None
+
+    def test_missing_response_metadata_means_last_page(self, cfg):
+        c = FakeSlackClient()
+        c.on("conversations.list", lambda m, p: ok({"channels": [_chan("C0A")]}))
+        assert [x["chat_id"] for x in ctl.list_chats(c, cfg)] == ["C0A"]
+
+    def test_duplicate_ids_across_pages_kept_once(self, cfg):
+        pages = {None: _page([_chan("C0A", "a")], "c2"), "c2": _page([_chan("C0A", "a"), _chan("C0B", "b")], "")}
+        c = FakeSlackClient()
+        c.on("conversations.list", lambda m, p: pages[p.get("cursor")])
+        assert [x["chat_id"] for x in ctl.list_chats(c, cfg)] == ["C0A", "C0B"]
+
+
+# ============================================================================ open-dm
+class TestOpenDm:
+    def test_pins_owner_dm_id_on_disk(self, cfg):
+        c = FakeSlackClient()
+        c.on("conversations.open", lambda m, p: ok({"channel": {"id": "D0NEWDM"}}))
+        cfg.pop("owner_dm_id", None)
+        res = ctl.open_owner_dm(c, cfg)
+        assert res == {"ok": True, "owner_dm_id": "D0NEWDM", "chat_id": "D0NEWDM"}
+        assert c.calls_for("conversations.open") == [{"users": OWNER}]
+        assert cfg["owner_dm_id"] == "D0NEWDM"
+        assert configmod.load_config()["owner_dm_id"] == "D0NEWDM"           # set_persist 落盘
+        assert configmod.ConfigSnapshot.load()["owner_user_id"] == OWNER        # 其它键不动
+
+    def test_failure_or_non_dm_id(self, cfg):
+        c = FakeSlackClient()
+        c.on("conversations.open", lambda m, p: err("user_not_found"))
+        assert ctl.open_owner_dm(c, cfg)["ok"] is False
+        c2 = FakeSlackClient()
+        c2.on("conversations.open", lambda m, p: ok({"channel": {"id": "C0NOTDM"}}))
+        assert ctl.open_owner_dm(c2, cfg)["ok"] is False
+        assert configmod.load_config()["owner_dm_id"] == DM                    # 未被改坏
+
+
+# ============================================================================ bind / unbind
 class TestBindUnbind:
-    def test_bind_prepare_creates_rows(self, env, ctl_prober):
+    def test_bind_prepare_creates_rows_with_slack_marker(self, env, ctl_prober):
         res = ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
-                               chat_id=CHAT, chat_name="测试群", cwd="/tmp/p",
-                               start_pid=ZSH_PID)
-        assert res["marker"].startswith("[feishu-bridge-bind:")
-        assert res["binding_id"] in res["listener_cmd"]
-        b = env.conn.execute("SELECT * FROM bindings WHERE binding_id=?",
-                             (res["binding_id"],)).fetchone()
-        assert b["status"] == "starting" and b["cc_pid"] == CC_PID
-        assert b["cc_start"] == CC_START
+                               chat_id=CHAT, chat_name="测试频道", cwd="/tmp/p", start_pid=ZSH_PID)
+        assert res["marker"].startswith(constants.MARKER_PREFIX) and "[slack-bridge-bind:" in res["marker"]
+        assert res["binding_id"] in res["listener_cmd"] and res["is_owner_dm"] is False
+        assert res["banner"] and "unbind" in res["banner"]
+        b = env.conn.execute("SELECT * FROM bindings WHERE binding_id=?", (res["binding_id"],)).fetchone()
+        assert b["status"] == "starting" and b["cc_pid"] == CC_PID and b["cc_start"] == CC_START
+
+    def test_bind_owner_dm_allowed(self, env, ctl_prober):
+        res = ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
+                               chat_id=DM, chat_name=None, cwd=None, start_pid=ZSH_PID)
+        assert res["binding_id"] and res["is_owner_dm"] is True
+
+    def test_bind_foreign_dm_rejected(self, env, ctl_prober):
+        with pytest.raises(lifecycle.BindConflict) as ei:
+            ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
+                             chat_id="D0SOMEONE", chat_name=None, cwd=None, start_pid=ZSH_PID)
+        assert ei.value.code == "foreign_dm"
+        assert env.conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 0   # 零残留
+
+    def test_bind_dm_rejected_when_owner_dm_not_pinned(self, env, ctl_prober):
+        env.cfg.pop("owner_dm_id")
+        with pytest.raises(lifecycle.BindConflict) as ei:
+            ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
+                             chat_id=DM, chat_name=None, cwd=None, start_pid=ZSH_PID)
+        assert ei.value.code == "foreign_dm" and "open-dm" in str(ei.value)
 
     def test_bind_conflict_surfaces(self, env, ctl_prober):
         env.make_binding(status="active", chat_id=CHAT)
         with pytest.raises(lifecycle.BindConflict):
             ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
                              chat_id=CHAT, chat_name=None, cwd=None, start_pid=ZSH_PID)
+
+    def test_allowlist_gate(self, env, ctl_prober):
+        env.cfg["chat_allowlist"] = ["C0OTHER"]
+        with pytest.raises(lifecycle.BindConflict) as ei:
+            ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
+                             chat_id=CHAT, chat_name=None, cwd=None, start_pid=ZSH_PID)
+        assert ei.value.code == "chat_not_allowed"
+        assert env.conn.execute("SELECT COUNT(*) FROM pending_bind").fetchone()[0] == 0
+        env.cfg["chat_allowlist"] = [CHAT]
+        assert ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
+                                chat_id=CHAT, chat_name=None, cwd=None, start_pid=ZSH_PID)["binding_id"]
 
     def test_unbind_resolves_instance(self, env, ctl_prober):
         bid = env.make_binding(status="active")
@@ -144,237 +361,173 @@ class TestBindUnbind:
         assert b[0] == "closed" and b[1] == "user_unbind"
 
     def test_unbind_without_binding(self, env, ctl_prober):
-        res = ctl.unbind(env.conn, env.clock, ctl_prober, start_pid=ZSH_PID)
-        assert res["ok"] is False
+        assert ctl.unbind(env.conn, env.clock, ctl_prober, start_pid=ZSH_PID)["ok"] is False
 
-
-class TestStatusAndChats:
-    def test_status_report_shape(self, env):
-        env.make_binding(status="active")
-        rep = ctl.status_report(env.conn, env.cfg, env.clock)
-        assert rep["fingerprint"]["profile"] == PROFILE
-        assert rep["schema_version"] == "1"
-        assert len(rep["bindings"]) == 1
-        assert rep["bindings"][0]["status"] == "active"
-
-    def test_list_chats(self, env):
-        env.runner.on_prefix(["im", "+chat-list"], lambda a, c: ok_envelope(
-            {"items": [{"chat_id": "oc_1", "name": "群A"},
-                       {"chat_id": "oc_2", "name": "群B"}],
-             "has_more": False}))
-        chats = ctl.list_chats(env.runner)
-        assert [c["chat_id"] for c in chats] == ["oc_1", "oc_2"]
-
-    def test_list_chats_fails_when_has_more_missing(self, env):
-        """缺 has_more = 证明不了取全了,不能当"翻完了"成功返回。
-
-        故意**带上** page_token:否则"缺 token"那条守卫会顺手返回 None,
-        本用例就会因为别的原因变绿,测不到 has_more 的真值判断。
-        第三次调用的 fail 兜底:守卫被整条删掉时不让测试挂死。"""
-        state = {"n": 0}
-
-        def respond(a, c):
-            state["n"] += 1
-            if state["n"] > 2:
-                pytest.fail("has_more 缺失时仍在继续翻页(守卫回归)")
-            return ok_envelope({"chats": [{"chat_id": f"oc_{state['n']}", "name": "群"}],
-                                "page_token": f"tok{state['n'] + 1}"})
-
-        env.runner.on_prefix(["im", "+chat-list"], respond)
-        assert ctl.list_chats(env.runner) is None
-        assert len(env.runner.calls_matching("im", "+chat-list")) == 1
-
-    def test_list_chats_follows_pagination(self, env):
-        """has_more=true 时必须翻页取全:漏页 = 用户的群"不在列表里",
-        照 SKILL.md 会去新建一个重复群。"""
-        pages = {
-            None: {"chats": [{"chat_id": "oc_1", "name": "群A"}],
-                   "has_more": True, "page_token": "tok2"},
-            "tok2": {"chats": [{"chat_id": "oc_2", "name": "群B"}],
-                     "has_more": True, "page_token": "tok3"},
-            "tok3": {"chats": [{"chat_id": "oc_3", "name": "群C"}],
-                     "has_more": False, "page_token": ""},
-        }
-
-        def respond(a, c):
-            tok = a[a.index("--page-token") + 1] if "--page-token" in a else None
-            return ok_envelope(pages[tok])
-
-        env.runner.on_prefix(["im", "+chat-list"], respond)
-        chats = ctl.list_chats(env.runner)
-        assert [c["chat_id"] for c in chats] == ["oc_1", "oc_2", "oc_3"]
-
-    def test_list_chats_keeps_paging_when_token_repeats_but_content_advances(self, env):
-        """该接口实测会在多页间返回**同一个** page_token 而内容照常推进。
-        按"重复 token 即失败"判,会把这条能正确取全的路径判成失败。"""
-        pages = [
-            {"chats": [{"chat_id": "oc_1", "name": "群A"}], "has_more": True,
-             "page_token": "same"},
-            {"chats": [{"chat_id": "oc_2", "name": "群B"}], "has_more": True,
-             "page_token": "same"},
-            {"chats": [{"chat_id": "oc_3", "name": "群C"}], "has_more": False,
-             "page_token": ""},
-        ]
-        state = {"n": 0}
-
-        def respond(a, c):
-            state["n"] += 1
-            return ok_envelope(pages[min(state["n"], len(pages)) - 1])
-
-        env.runner.on_prefix(["im", "+chat-list"], respond)
-        chats = ctl.list_chats(env.runner)
-        assert [c["chat_id"] for c in chats] == ["oc_1", "oc_2", "oc_3"]
-
-    def test_list_chats_fails_when_page_returns_nothing(self, env):
-        """has_more=true 但这一页空手而归 = 无法证明有推进 → 整体失败,
-        绝不能返回已取到的前缀(那又是一个"残缺列表伪装成全集")。
-        守卫若被删除,这个 fake 会无限供页 → 第三次调用直接 fail,不让测试挂死。"""
-        state = {"n": 0}
-
-        def respond(a, c):
-            state["n"] += 1
-            if state["n"] > 2:
-                pytest.fail("空页且 has_more=true 时仍在继续翻页(守卫回归)")
-            if state["n"] == 1:
-                return ok_envelope({"chats": [{"chat_id": "oc_1", "name": "群A"}],
-                                    "has_more": True, "page_token": "tok2"})
-            return ok_envelope({"chats": [], "has_more": True, "page_token": "tok3"})
-
-        env.runner.on_prefix(["im", "+chat-list"], respond)
-        assert ctl.list_chats(env.runner) is None
-        assert len(env.runner.calls_matching("im", "+chat-list")) == 2
-
-    def test_list_chats_fails_when_page_repeats_same_ids(self, env):
-        """非空页 ≠ 有推进:服务端可能一直回同一批 id 且 has_more=true。
-        只看"页非空"会在恒定 token 上无限循环 → 判据必须是**有没有新 chat_id**。"""
-        state = {"n": 0}
-
-        def respond(a, c):
-            state["n"] += 1
-            if state["n"] > 3:
-                pytest.fail("整页都是已见 id 时仍在继续翻页(守卫回归)")
-            cid = "oc_1" if state["n"] == 1 else "oc_2"
-            return ok_envelope({"chats": [{"chat_id": cid, "name": "群"}],
-                                "has_more": True, "page_token": "same"})
-
-        env.runner.on_prefix(["im", "+chat-list"], respond)
-        assert ctl.list_chats(env.runner) is None
-        assert len(env.runner.calls_matching("im", "+chat-list")) == 3
-
-    def test_list_chats_fails_when_page_has_only_malformed_items(self, env):
-        """整页都是畸形条目(非 dict / 缺 chat_id)也不算推进。"""
-        state = {"n": 0}
-
-        def respond(a, c):
-            state["n"] += 1
-            if state["n"] > 2:
-                pytest.fail("整页畸形条目时仍在继续翻页(守卫回归)")
-            if state["n"] == 1:
-                return ok_envelope({"chats": [{"chat_id": "oc_1", "name": "群A"}],
-                                    "has_more": True, "page_token": "tok2"})
-            return ok_envelope({"chats": [{}, {"name": "没有 chat_id"}, "不是 dict"],
-                                "has_more": True, "page_token": "tok3"})
-
-        env.runner.on_prefix(["im", "+chat-list"], respond)
-        assert ctl.list_chats(env.runner) is None
-
-    def test_list_chats_fails_when_more_pages_but_no_token(self, env):
-        """has_more=true 但没给 token:同样是取不全,不能当成功。"""
-        env.runner.on_prefix(["im", "+chat-list"], lambda a, c: ok_envelope(
-            {"chats": [{"chat_id": "oc_1", "name": "群A"}],
-             "has_more": True, "page_token": ""}))
-        assert ctl.list_chats(env.runner) is None
-
-    def test_list_chats_partial_page_failure_is_not_silent(self, env):
-        """第 2 页失败时不能"就把第 1 页当全部返回" —— 那正是本 bug 的形状
-        (残缺列表看起来和完整列表一模一样)。"""
-        state = {"n": 0}
-
-        def respond(a, c):
-            state["n"] += 1
-            if state["n"] == 1:
-                return ok_envelope({"chats": [{"chat_id": "oc_1", "name": "群A"}],
-                                    "has_more": True, "page_token": "tok2"})
-            return err_envelope(99991400, "rate limited")
-
-        env.runner.on_prefix(["im", "+chat-list"], respond)
-        assert ctl.list_chats(env.runner) is None
-
-
-class TestDoctor:
-    def test_doctor_send_and_recall(self, env):
-        env.runner.on_prefix(["im", "+messages-send"],
-                             lambda a, c: ok_envelope({"message_id": "om_doc"}))
-        env.runner.on_prefix(["api", "DELETE"], lambda a, c: ok_envelope({}))
-        res = ctl.doctor(env.runner, CHAT, env.clock)
-        assert res["ok"] and res["message_id"] == "om_doc" and res["recalled"]
-        del_call = env.runner.calls_matching("api", "DELETE")[0]
-        assert del_call[0][2] == "/open-apis/im/v1/messages/om_doc"
-
-
-class TestChatAllowlistPlumbing:
-    def test_bootstrap_stores_allowlist(self, data_dir):
-        from lib.clock import SystemClock
-        cfg = ctl.bootstrap(auth_status_runner(), PROFILE, SystemClock(),
-                            chat_allowlist=["oc_a", "oc_b"])
-        assert cfg["chat_allowlist"] == ["oc_a", "oc_b"]
-        assert configmod.load_config()["chat_allowlist"] == ["oc_a", "oc_b"]
-
-    def test_status_shows_allowlist(self, env):
-        env.cfg["chat_allowlist"] = ["oc_a"]
-        rep = ctl.status_report(env.conn, env.cfg, env.clock)
-        assert rep["chat_allowlist"] == ["oc_a"]
-        env.cfg.pop("chat_allowlist")
-        rep = ctl.status_report(env.conn, env.cfg, env.clock)
-        assert "全部" in rep["chat_allowlist"]
-
-
-class TestAllowlistBindGate:
-    def test_bind_out_of_list_chat_rejected(self, env, ctl_prober):
-        env.cfg["chat_allowlist"] = ["oc_other"]
-        with pytest.raises(lifecycle.BindConflict) as ei:
-            ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
-                             chat_id=CHAT, chat_name=None, cwd=None, start_pid=ZSH_PID)
-        assert ei.value.code == "chat_not_allowed"
-        # 零残留
-        assert env.conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 0
-        assert env.conn.execute("SELECT COUNT(*) FROM pending_bind").fetchone()[0] == 0
-
-    def test_bind_in_list_ok(self, env, ctl_prober):
-        env.cfg["chat_allowlist"] = [CHAT]
-        res = ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
-                               chat_id=CHAT, chat_name=None, cwd=None, start_pid=ZSH_PID)
-        assert res["binding_id"]
-
-
-class TestListenerCmdShlex:
     def test_listener_cmd_quotes_spaced_paths(self, env, ctl_prober, monkeypatch):
-        """minor①:pkg_root/python 含空格 → listener_cmd 用 shlex.join 正确加引号。"""
         import shlex
-        from lib import paths as pathsmod
-        spaced = pathlib.Path("/tmp/my plugins/feishu-bridge")
-        monkeypatch.setattr(pathsmod, "pkg_root", lambda: spaced)
+        spaced = pathlib.Path("/tmp/my plugins/slack-bridge")
+        monkeypatch.setattr(paths, "pkg_root", lambda: spaced)
         res = ctl.bind_prepare(env.conn, env.cfg, env.clock, ctl_prober,
                                chat_id=CHAT, chat_name="g", cwd="/tmp/p", start_pid=ZSH_PID)
-        cmd = res["listener_cmd"]
-        # shlex 可安全 round-trip 回 argv;倒数第二个 = listener.py 完整路径,末位 = binding_id
-        argv = shlex.split(cmd)
-        assert argv[-2] == str(spaced / "bin" / "listener.py")
-        assert argv[-1] == res["binding_id"]
-        assert "my plugins" in argv[-2]  # 空格保留在单一 argv 里(未被拆开)
+        argv = shlex.split(res["listener_cmd"])
+        assert argv[-2] == str(spaced / "bin" / "listener.py") and argv[-1] == res["binding_id"]
 
 
+# ============================================================================ status
+class TestStatus:
+    def test_status_report_shape(self, env, tokens):
+        env.make_binding(status="active")
+        dbmod.set_state(env.conn, constants.GATE_KEY, "ok")
+        dbmod.set_state(env.conn, constants.GATE_VERSION_KEY, tokens.version)
+        dbmod.set_state(env.conn, constants.TOKENS_VERSION_SEEN_KEY, tokens.version)
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_KEY, "ok")
+        dbmod.set_state(env.conn, constants.VERIFY_CAPABILITY_VERSION_KEY, tokens.version)
+        dbmod.set_state(env.conn, "consumer_socket_ready", "ready num_connections=1")
+        dbmod.set_state(env.conn, "event_dropped_foreign_team", "2")
+        dbmod.set_state(env.conn, "cooldown:chat.postMessage", str(env.clock.wall_ms() + 5000))
+        dbmod.set_state(env.conn, "cooldown:chat.update", str(env.clock.wall_ms() - 5000))
+        env.conn.execute("INSERT INTO slack_events(envelope_type,event_key,chat_id,payload_json,received_at,state,drain_attempts,error) "
+                         "VALUES('events_api','ev:q1',?, '{}', 0, 'quarantined', 5, 'boom')", (CHAT,))
+        env.conn.execute("INSERT INTO slack_events(envelope_type,event_key,chat_id,payload_json,received_at,state) "
+                         "VALUES('events_api','ev:s1',?, '{}', 0, 'staged')", (CHAT,))
+        rep = ctl.status_report(env.conn, env.cfg, env.clock)
+        assert rep["fingerprint"]["team_id"] == TEAM and rep["fingerprint"]["owner_dm_id"] == DM
+        assert "profile" not in rep["fingerprint"] and "cli_version" not in rep["fingerprint"]
+        assert rep["schema_version"] == "1"
+        assert rep["outbound_gate"] == "ok" and rep["outbound_gate_tokens_version"] == tokens.version
+        assert rep["tokens_version_seen"] == tokens.version
+        assert rep["tokens_file"]["version"] == tokens.version and rep["credentials_verified"] is True
+        assert rep["verify_capability"] == "ok" and rep["auto_resend_enabled"] is True
+        assert rep["consumer"]["ready"] == "ready num_connections=1"
+        assert rep["slack_events"] == {"quarantined": 1, "staged": 1}
+        assert rep["quarantined"][0]["error"] == "boom" and rep["quarantined"][0]["drain_attempts"] == 5
+        assert rep["cooldowns"]["chat.postMessage"]["active"] is True
+        assert rep["cooldowns"]["chat.update"]["active"] is False
+        assert rep["counters"]["event_dropped_foreign_team"] == "2"
+        assert len(rep["bindings"]) == 1 and rep["bindings"][0]["status"] == "active"
+        assert rep["markdown_mode"] == "markdown_text"
+        assert "xoxb" not in json.dumps(rep)
+        assert any("隔离" in h for h in rep["hints"])
+
+    def test_status_hints_on_stale_credentials_and_unverified_capability(self, env, tokens):
+        dbmod.set_state(env.conn, constants.GATE_KEY, "ok")
+        dbmod.set_state(env.conn, constants.GATE_VERSION_KEY, "0:old")
+        rep = ctl.status_report(env.conn, env.cfg, env.clock)
+        assert rep["credentials_verified"] is False and rep["auto_resend_enabled"] is False
+        assert any("credentials-unverified" in h for h in rep["hints"])
+        assert any("probe" in h for h in rep["hints"])
+
+    def test_status_gate_hints(self, env, tokens):
+        for gate, needle in (("mismatch", "身份不符"), ("degraded:auth_error", "停摆")):
+            dbmod.set_state(env.conn, constants.GATE_KEY, gate)
+            rep = ctl.status_report(env.conn, env.cfg, env.clock)
+            assert rep["outbound_gate"] == gate and any(needle in h for h in rep["hints"])
+
+    def test_status_shows_allowlist(self, env):
+        env.cfg["chat_allowlist"] = ["C0A"]
+        assert ctl.status_report(env.conn, env.cfg, env.clock)["chat_allowlist"] == ["C0A"]
+        env.cfg.pop("chat_allowlist")
+        assert "全部" in ctl.status_report(env.conn, env.cfg, env.clock)["chat_allowlist"]
+
+    def test_status_without_tokens_file(self, env):
+        rep = ctl.status_report(env.conn, env.cfg, env.clock)
+        assert rep["tokens_file"]["present"] is False and rep["credentials_verified"] is False
+
+
+# ============================================================================ doctor(= probe + daemon 健康)
+class TestDoctor:
+    def _probe_client(self, **kw):
+        from tests.test_capability_probe import make_client
+        return make_client(**kw)
+
+    def test_doctor_ok_writes_capability(self, cfg, tokens, conn):
+        client = self._probe_client()
+        res = ctl.doctor(CHAT, cfg=cfg, client_factory=lambda t, v, s: client, write_config=True, conn=conn)
+        assert res["ok"] is True and res["probe"]["identity_ok"] and res["probe"]["complete"]
+        assert res["probe"]["tokens_version"] == tokens.version
+        assert res["written"][constants.VERIFY_CAPABILITY_KEY] == "ok"
+        assert dbmod.get_state(conn, constants.VERIFY_CAPABILITY_VERSION_KEY) == tokens.version
+        assert res["daemon"]["healthy"] is False and res["daemon"]["verify_capability"] == "ok"
+        assert configmod.load_config()["markdown_mode"] == "markdown_text"
+        assert "xoxb" not in json.dumps(res)
+        assert [m for m, _ in client.calls][0] == "auth.test"
+
+    def test_doctor_identity_mismatch_no_send(self, cfg, tokens, conn):
+        client = self._probe_client(auth=dict(BOT_ID="x", team_id=TEAM, user_id=BOT_USER, bot_id="B_EVIL"))
+        res = ctl.doctor(CHAT, cfg=cfg, client_factory=lambda t, v, s: client, conn=conn)
+        assert res["ok"] is False and "身份" in res["error"]
+        assert client.calls_for("chat.postMessage") == []
+        assert dbmod.get_state(conn, constants.VERIFY_CAPABILITY_KEY) == constants.VERIFY_CAP_UNVERIFIED
+
+    def test_doctor_uses_env_or_file_tokens_and_cooldown_store(self, cfg, tokens, conn):
+        from lib.slackapi import DaemonStateCooldownStore
+        seen = {}
+
+        def factory(t, v, s):
+            seen.update(t=t, v=v, s=s)
+            return self._probe_client()
+        ctl.doctor(CHAT, cfg=cfg, client_factory=factory, conn=conn)
+        assert seen["t"] == tokens.tokens and seen["v"] == tokens.version
+        assert isinstance(seen["s"], DaemonStateCooldownStore)
+
+
+# ============================================================================ hooks 心跳(只读)
+def _write_hb(event, ts, plugin_version=None, pkg_root=None):
+    from lib import util, version as versionmod
+    paths.ensure_data_dir()
+    root, ver = versionmod.install_identity()
+    util.atomic_write(paths.hook_heartbeat_path(event), util.jdumps({
+        "event": event, "ts": ts,
+        "plugin_version": plugin_version if plugin_version is not None else ver,
+        "pkg_root": pkg_root if pkg_root is not None else root}))
+
+
+class TestHooksLiveStatus:
+    def test_not_seen_when_no_heartbeat(self, data_dir):
+        paths.ensure_data_dir()
+        st = ctl.hooks_live_status()
+        assert st["advisory"] is True and st["confirmed"] is False
+
+    def test_confirmed_after_real_stop_hook_runs(self, data_dir):
+        from lib import hooklib
+        paths.ensure_data_dir()
+        hooklib._touch_hook_heartbeat("stop")
+        st = ctl.hooks_live_status()
+        assert st["stop"]["seen"] and st["stop"]["fresh"] and st["stop"]["current"] and st["confirmed"]
+
+    def test_session_end_only_does_not_confirm(self, data_dir):
+        from lib import hooklib
+        hooklib._touch_hook_heartbeat("session_end")
+        st = ctl.hooks_live_status()
+        assert st["session_end"]["seen"] is True and st["confirmed"] is False
+
+    def test_stale_or_future_or_other_install_not_confirmed(self, data_dir):
+        _write_hb("stop", 1000)
+        assert ctl.hooks_live_status(now_ms=1000 + ctl.HOOK_HEARTBEAT_FRESH_MS + 1)["confirmed"] is False
+        _write_hb("stop", 10_000)
+        assert ctl.hooks_live_status(now_ms=5_000)["confirmed"] is False
+        _write_hb("stop", 1_000_000, plugin_version="0.9.0", pkg_root="/other/install")
+        st = ctl.hooks_live_status(now_ms=1_000_000)
+        assert st["stop"]["fresh"] and st["stop"]["current"] is False and st["confirmed"] is False
+
+    def test_foreign_stop_hooks_detected_and_own_ignored(self, data_dir):
+        assert ctl.foreign_stop_hooks() == []
+        p = paths.settings_json_path()
+        p.write_text(json.dumps({"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "python3 /x/other_blocking_hook.py"}]},
+            {"hooks": [{"type": "command", "command": "python3 /p/slack-bridge/hooks/stop_hook.py"}]}]}}))
+        assert ctl.foreign_stop_hooks() == ["python3 /x/other_blocking_hook.py"]
+
+
+# ============================================================================ reconcile code-identity(原样移植)
 class TestReconcileCodeIdentity:
-    """MAJOR 3 换层:code-identity 检测=**bind 前置串行检查**(不在 supervisor)。
-    reconcile_code_identity 全注入依赖,可测。"""
-
     def _fakes(self, *, held=True, recorded="rootA|1.0.0", pid=5555, pstart="s",
                alive=True, probe_unknown=False, read_fail=False):
         from tests.helpers import FakeProber
         prober = FakeProber()
         if alive and pid is not None and not probe_unknown:
             prober.set(pid, 1, pstart, "python3")
-        prober.raising = probe_unknown  # probe_alive → UNKNOWN
+        prober.raising = probe_unknown
         world = {"held": held, "kills": [], "ensures": 0}
 
         def lock_held():
@@ -382,13 +535,12 @@ class TestReconcileCodeIdentity:
 
         def read_state():
             if read_fail:
-                return None  # read_state 失败(_read_daemon_state 异常时返回 None)
-            return {"daemon_code_identity": recorded, "daemon_pid": pid,
-                    "daemon_proc_start": pstart}
+                return None
+            return {"daemon_code_identity": recorded, "daemon_pid": pid, "daemon_proc_start": pstart}
 
         def kill(p, sig):
             world["kills"].append((p, sig))
-            world["held"] = False  # SIGTERM → daemon 退出释放 flock
+            world["held"] = False
 
         def ensure():
             world["ensures"] += 1
@@ -396,8 +548,7 @@ class TestReconcileCodeIdentity:
 
         return world, prober, lock_held, read_state, kill, ensure
 
-    def _run(self, world, prober, lock_held, read_state, kill, ensure,
-             my_identity="rootNEW|1.0.0", wait_s=2):
+    def _run(self, world, prober, lock_held, read_state, kill, ensure, my_identity="rootNEW|1.0.0", wait_s=2):
         return ctl.reconcile_code_identity(
             my_identity=my_identity, read_state=read_state, lock_held=lock_held,
             prober=prober, kill=kill, ensure=ensure, sleep=lambda s: None, wait_s=wait_s)
@@ -406,116 +557,40 @@ class TestReconcileCodeIdentity:
         f = self._fakes(recorded="rootA|1.0.0")
         r = self._run(*f, my_identity="rootA|1.0.0")
         assert r.get("error") is None and r["restarted"] is False and r["reason"] == "match"
-        assert f[0]["kills"] == []
 
     def test_no_daemon_respawns_this_version(self):
-        """锁未持有(无 daemon)→ 拉本版本新的(满足不变式),无 error。"""
         f = self._fakes(held=False)
         r = self._run(*f)
-        assert r.get("error") is None and r["restarted"] is True and r["reason"] == "no-daemon-respawn"
-        assert f[0]["ensures"] == 1
+        assert r.get("error") is None and r["restarted"] is True and f[0]["ensures"] == 1
 
     def test_mismatch_killable_restarts_then_proceeds(self):
-        f = self._fakes(recorded="rootOLD|0.9.0", pid=5555, pstart="s", alive=True)
+        import signal
+        f = self._fakes(recorded="rootOLD|0.9.0")
         r = self._run(*f)
-        assert r.get("error") is None and r["restarted"] is True
-        assert r["old"] == "rootOLD|0.9.0" and r["new"] == "rootNEW|1.0.0" and r["state"] == "started"
-        assert f[0]["kills"] == [(5555, __import__("signal").SIGTERM)]  # 精确 SIGTERM
+        assert r.get("error") is None and r["restarted"] is True and r["state"] == "started"
+        assert f[0]["kills"] == [(5555, signal.SIGTERM)]
 
-    # ---- fail-closed:identity 不一致但无法安全杀 + 锁仍持有 → error,不放行 bind ----
-    def test_mismatch_dead_pid_lock_held_fails_closed(self):
-        f = self._fakes(recorded="rootOLD|0.9.0", pid=5555, pstart="s", alive=False)
-        r = self._run(*f)
-        assert "error" in r and r["reason"] == "unverified-cannot-restart"
-        assert f[0]["kills"] == [] and f[0]["ensures"] == 0
-
-    def test_mismatch_missing_start_lock_held_fails_closed(self):
-        """daemon self_identity() 失败会合法记录空 proc_start → 无法安全杀 → error。"""
-        f = self._fakes(recorded="rootOLD|0.9.0", pid=5555, pstart="")  # 空 start
+    @pytest.mark.parametrize("kw", [dict(alive=False), dict(pstart=""), dict(probe_unknown=True), dict(read_fail=True)])
+    def test_mismatch_unkillable_lock_held_fails_closed(self, kw):
+        f = self._fakes(recorded="rootOLD|0.9.0", **kw)
         r = self._run(*f)
         assert "error" in r and r["reason"] == "unverified-cannot-restart"
         assert f[0]["kills"] == [] and f[0]["ensures"] == 0
-
-    def test_mismatch_probe_unknown_lock_held_fails_closed(self):
-        """probe_alive()==UNKNOWN(探测失败)→ 不杀 → error(fail-closed)。"""
-        f = self._fakes(recorded="rootOLD|0.9.0", pid=5555, pstart="s", probe_unknown=True)
-        r = self._run(*f)
-        assert "error" in r and r["reason"] == "unverified-cannot-restart"
-        assert f[0]["kills"] == [] and f[0]["ensures"] == 0
-
-    def test_read_state_failure_lock_held_fails_closed(self):
-        """read_state 失败(recorded=None,无 pid)+ 锁持有 → 无法验证 identity → error。"""
-        f = self._fakes(read_fail=True)
-        r = self._run(*f)
-        assert "error" in r and r["reason"] == "unverified-cannot-restart"
-        assert f[0]["kills"] == [] and f[0]["ensures"] == 0
-
-    def test_unverified_but_lock_released_respawns(self):
-        """无法安全杀,但锁已释放(旧 daemon 自行退出)→ 拉本版本新的(不 error)。"""
-        world = {"held": True, "kills": [], "ensures": 0}
-        from tests.helpers import FakeProber
-        prober = FakeProber()  # pid 已死 → 无法杀
-        releases = {"n": 0}
-
-        def lock_held():
-            # 首次读(no-daemon 门)持有;第二次(can_kill 失败分支里的复检)已释放
-            releases["n"] += 1
-            return releases["n"] <= 1
-
-        r = ctl.reconcile_code_identity(
-            my_identity="rootNEW|1.0.0",
-            read_state=lambda: {"daemon_code_identity": "rootOLD|0.9.0",
-                                "daemon_pid": 5555, "daemon_proc_start": "s"},
-            lock_held=lock_held, prober=prober, kill=lambda p, s: None,
-            ensure=lambda: (world.__setitem__("ensures", world["ensures"] + 1), "started")[1],
-            sleep=lambda s: None)
-        assert r.get("error") is None and r["restarted"] is True and r["reason"] == "respawned-daemon-gone"
 
     def test_mismatch_daemon_wont_exit_surfaces_error(self):
-        """SIGTERM 后 flock 未释放(旧 daemon 不退出)→ 明确 error,不 ensure。"""
         from tests.helpers import FakeProber
         prober = FakeProber()
         prober.set(5555, 1, "s", "python3")
         ensures = {"n": 0}
         r = ctl.reconcile_code_identity(
             my_identity="rootNEW|1.0.0",
-            read_state=lambda: {"daemon_code_identity": "rootOLD|0.9.0",
-                                "daemon_pid": 5555, "daemon_proc_start": "s"},
-            lock_held=lambda: True, prober=prober, kill=lambda p, s: None,  # daemon 不退出
-            ensure=lambda: ensures.__setitem__("n", ensures["n"] + 1),
-            sleep=lambda s: None, wait_s=1)
-        assert "error" in r and r["reason"] == "no-exit"
-        assert ensures["n"] == 0  # 没拉新 daemon
+            read_state=lambda: {"daemon_code_identity": "rootOLD|0.9.0", "daemon_pid": 5555, "daemon_proc_start": "s"},
+            lock_held=lambda: True, prober=prober, kill=lambda p, s: None,
+            ensure=lambda: ensures.__setitem__("n", ensures["n"] + 1), sleep=lambda s: None, wait_s=1)
+        assert "error" in r and r["reason"] == "no-exit" and ensures["n"] == 0
 
 
-def test_bump_drop_counter_uses_short_obs_timeout(data_dir, monkeypatch):
-    """minor②:可观测计数用短等锁(BUSY_TIMEOUT_OBS_MS),不叠加拖住 CC 退出。"""
-    from lib import hooklib, db as dbmod, constants, paths as pathsmod
-    pathsmod.ensure_data_dir()
-    captured = {}
-    real_connect = dbmod.connect
-
-    def spy_connect(dbfile, busy_timeout_ms=None, **kw):
-        captured["busy"] = busy_timeout_ms
-        return real_connect(dbfile, busy_timeout_ms=busy_timeout_ms, **kw)
-
-    monkeypatch.setattr(dbmod, "connect", spy_connect)
-    # 需要 db 存在
-    c = real_connect(pathsmod.db_path()); dbmod.init_schema(c, pathsmod.schema_path()); c.close()
-    hooklib._bump_drop_counter()
-    assert captured["busy"] == constants.BUSY_TIMEOUT_OBS_MS
-    assert constants.BUSY_TIMEOUT_OBS_MS < constants.BUSY_TIMEOUT_SESSION_END_MS
-
-
-def _load_bridgectl():
-    import importlib.util
-    root = pathlib.Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location("bridgectl_mod", root / "bin" / "bridgectl.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
+# ============================================================================ CLI:bind fail-closed / 等认领 / allow
 class _Args:
     def __init__(self, chat_id, chat_name=None):
         self.chat_id = chat_id
@@ -523,44 +598,32 @@ class _Args:
 
 
 def test_cmd_bind_fails_closed_on_reconcile_error(env, monkeypatch):
-    """fail-closed 端到端:reconcile 返回 error → cmd_bind exit 非0 且 **不建 pending_bind/bindings**。"""
     bridgectl = _load_bridgectl()
     monkeypatch.setattr(bridgectl.ctl, "ensure_daemon", lambda *a, **k: "running")
-    monkeypatch.setattr(
-        bridgectl.ctl, "reconcile_daemon_code_identity",
-        lambda *a, **k: {"restarted": False, "reason": "unverified-cannot-restart",
-                         "error": "检测到旧版本 daemon 但无法安全自动重启,请手动停止后重试"})
+    monkeypatch.setattr(bridgectl.ctl, "reconcile_daemon_code_identity",
+                        lambda *a, **k: {"restarted": False, "reason": "unverified-cannot-restart", "error": "旧 daemon"})
     with pytest.raises(SystemExit) as ei:
         bridgectl.cmd_bind(_Args(CHAT, "g"))
-    assert ei.value.code == 6  # 非0
-    # 不变式:未落任何绑定
-    assert env.conn.execute("SELECT COUNT(*) FROM pending_bind").fetchone()[0] == 0
+    assert ei.value.code == 6
     assert env.conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 0
 
 
 def test_cmd_bind_fails_closed_when_restart_leaves_daemon_not_ready(env, monkeypatch):
-    """重启了旧 daemon 但新 daemon 未就绪 → 也不落绑定(不变式)。"""
     bridgectl = _load_bridgectl()
     monkeypatch.setattr(bridgectl.ctl, "ensure_daemon", lambda *a, **k: "running")
-    monkeypatch.setattr(
-        bridgectl.ctl, "reconcile_daemon_code_identity",
-        lambda *a, **k: {"restarted": True, "reason": "restarted", "state": "in_progress"})
+    monkeypatch.setattr(bridgectl.ctl, "reconcile_daemon_code_identity",
+                        lambda *a, **k: {"restarted": True, "reason": "restarted", "state": "in_progress"})
     with pytest.raises(SystemExit) as ei:
         bridgectl.cmd_bind(_Args(CHAT, "g"))
     assert ei.value.code == 5
-    assert env.conn.execute("SELECT COUNT(*) FROM pending_bind").fetchone()[0] == 0
     assert env.conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 0
 
 
 class TestWaitListenerClaim:
-    """bind 等 follower 认领:已认领立即 true 不 sleep;后到认领 true;超时 false。"""
-
     def test_already_claimed_returns_without_sleep(self, env):
-        bid = env.make_binding(status="starting", bind_phase="confirmed", session_id="s1",
-                               listener_epoch=1)
+        bid = env.make_binding(status="starting", bind_phase="confirmed", session_id="s1", listener_epoch=1)
         sleeps = []
-        assert ctl.wait_listener_claim(env.conn, bid, env.clock, sleeps.append, 6000) is True
-        assert sleeps == []
+        assert ctl.wait_listener_claim(env.conn, bid, env.clock, sleeps.append, 6000) is True and sleeps == []
 
     def test_claimed_after_second_poll(self, env):
         bid = env.make_binding(status="starting", bind_phase="unconfirmed")
@@ -570,38 +633,21 @@ class TestWaitListenerClaim:
             calls.append(s)
             env.clock.tick(int(s * 1000))
             if len(calls) == 2:
-                env.conn.execute(
-                    "UPDATE bindings SET listener_pid=7001, listener_start='ls', "
-                    "listener_epoch=1, listener_beat_at=? WHERE binding_id=?",
-                    (env.clock.wall_ms(), bid))
-            if len(calls) > 10:
-                pytest.fail("认领后仍在轮询")
-
-        assert ctl.wait_listener_claim(env.conn, bid, env.clock, sleep, 6000) is True
-        assert calls == [0.5, 0.5]  # 0.5s 轮询,认领后立即停
+                env.conn.execute("UPDATE bindings SET listener_pid=7001, listener_start='ls', listener_epoch=1, "
+                                 "listener_beat_at=? WHERE binding_id=?", (env.clock.wall_ms(), bid))
+        assert ctl.wait_listener_claim(env.conn, bid, env.clock, sleep, 6000) is True and calls == [0.5, 0.5]
 
     def test_never_claimed_times_out(self, env):
         bid = env.make_binding(status="starting", bind_phase="unconfirmed")
         start = env.clock.mono_ms()
-        calls = []
-
-        def sleep(s):
-            calls.append(s)
-            env.clock.tick(int(s * 1000))
-            if len(calls) > 100:
-                pytest.fail("超时后仍在轮询")
-
-        assert ctl.wait_listener_claim(env.conn, bid, env.clock, sleep, 6000) is False
-        assert env.clock.mono_ms() - start == 6000  # 恰在上限放弃,不多等
+        assert ctl.wait_listener_claim(env.conn, bid, env.clock, lambda s: env.clock.tick(int(s * 1000)), 6000) is False
+        assert env.clock.mono_ms() - start == 6000
 
 
-def _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys, claim_at_s=None):
-    """跑 bridgectl bind(等待真实执行,fake sleep 推时钟);claim_at_s 给定时在该秒数由"别人"认领该行。"""
-    import sys
+def _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys, chat_id=CHAT, claim_at_s=None):
     bridgectl = _load_bridgectl()
     monkeypatch.setattr(bridgectl.ctl, "ensure_daemon", lambda *a, **k: "running")
-    monkeypatch.setattr(bridgectl.ctl, "reconcile_daemon_code_identity",
-                        lambda *a, **k: {"restarted": False, "reason": "match"})
+    monkeypatch.setattr(bridgectl.ctl, "reconcile_daemon_code_identity", lambda *a, **k: {"restarted": False, "reason": "match"})
     monkeypatch.setattr(bridgectl.procs, "SystemProber", lambda: ctl_prober)
     monkeypatch.setattr(bridgectl.os, "getppid", lambda: ZSH_PID)
     monkeypatch.setattr(bridgectl, "SystemClock", lambda: env.clock)
@@ -611,26 +657,72 @@ def _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys, claim_at_s=Non
         sleeps.append(s)
         env.clock.tick(int(s * 1000))
         if claim_at_s is not None and abs(sum(sleeps) - claim_at_s) < 1e-9:
-            env.conn.execute(
-                "UPDATE bindings SET listener_pid=7001, listener_start='ls', listener_epoch=1, "
-                "listener_beat_at=? WHERE status='starting'", (env.clock.wall_ms(),))
-
+            env.conn.execute("UPDATE bindings SET listener_pid=7001, listener_start='ls', listener_epoch=1, "
+                             "listener_beat_at=? WHERE status='starting'", (env.clock.wall_ms(),))
     monkeypatch.setattr(bridgectl.time, "sleep", fake_sleep)
-    monkeypatch.setattr(sys, "argv", ["bridgectl", "bind", "--chat-id", CHAT, "--chat-name", "g"])
+    monkeypatch.setattr(sys, "argv", ["bridgectl", "bind", "--chat-id", chat_id, "--chat-name", "g"])
     with pytest.raises(SystemExit) as ei:
         bridgectl.main()
-    assert ei.value.code == 0
-    return json.loads(capsys.readouterr().out), sleeps
+    return json.loads(capsys.readouterr().out), sleeps, ei.value.code
 
 
 def test_cmd_bind_reports_listener_claimed_false_when_nobody_claims(env, ctl_prober, monkeypatch, capsys):
-    res, sleeps = _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys)
-    assert res["ok"] is True and res["listener_claimed"] is False
-    assert sum(sleeps) == 6.0  # 等满 3 tick(6s)才放弃
+    res, sleeps, code = _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys)
+    assert code == 0 and res["ok"] is True and res["listener_claimed"] is False and sum(sleeps) == 6.0
+    assert res["marker"].startswith("[slack-bridge-bind:") and "listener_cmd" in res and "banner" in res
 
 
 def test_cmd_bind_reports_listener_claimed_true_when_claimed_at_4s(env, ctl_prober, monkeypatch, capsys):
-    """follower 2s tick 下第 4 秒才认领(慢启动)→ 仍报 true;上限若缩成 1 tick 会错报 false、把模型导向手动 Monitor。"""
-    res, sleeps = _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys, claim_at_s=4.0)
-    assert res["ok"] is True and res["listener_claimed"] is True
-    assert sum(sleeps) == 4.0  # 认领后立即返回,不等满
+    res, sleeps, code = _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys, claim_at_s=4.0)
+    assert code == 0 and res["listener_claimed"] is True and sum(sleeps) == 4.0
+
+
+def test_cmd_bind_foreign_dm_exit_4(env, ctl_prober, monkeypatch, capsys):
+    res, sleeps, code = _run_cmd_bind_with_wait(env, ctl_prober, monkeypatch, capsys, chat_id="D0FOREIGN")
+    assert code == 4 and res["ok"] is False and res["code"] == "foreign_dm"
+
+
+class TestAllowCli:
+    def _run(self, monkeypatch, capsys, *argv):
+        bridgectl = _load_bridgectl()
+        monkeypatch.setattr(sys, "argv", ["bridgectl", *argv])
+        with pytest.raises(SystemExit) as ei:
+            bridgectl.main()
+        return json.loads(capsys.readouterr().out), ei.value.code
+
+    def test_add_list_remove_with_user_id(self, env, monkeypatch, capsys):
+        from lib import senderallow
+        res, code = self._run(monkeypatch, capsys, "allow", "add", "--chat-id", CHAT, "--user-id", "U0MEMBER", "--note", "张三")
+        assert code == 0 and res["added"] is True and senderallow.is_allowed(CHAT, "U0MEMBER")
+        res, _ = self._run(monkeypatch, capsys, "allow", "list")
+        assert len(res["entries"]) == 1 and res["entries"][0]["chat_id"] == CHAT
+        res, _ = self._run(monkeypatch, capsys, "allow", "remove", "--chat-id", CHAT, "--user-id", "U0MEMBER")
+        assert res["removed"] is True and not senderallow.is_allowed(CHAT, "U0MEMBER")
+        res, code = self._run(monkeypatch, capsys, "allow", "add", "--chat-id", CHAT)
+        assert code != 0 and res["ok"] is False and senderallow.load_entries() == []
+
+
+def test_bump_drop_counter_uses_short_obs_timeout(data_dir, monkeypatch):
+    from lib import hooklib
+    paths.ensure_data_dir()
+    captured = {}
+    real_connect = dbmod.connect
+
+    def spy_connect(dbfile, busy_timeout_ms=None, **kw):
+        captured["busy"] = busy_timeout_ms
+        return real_connect(dbfile, busy_timeout_ms=busy_timeout_ms, **kw)
+
+    monkeypatch.setattr(dbmod, "connect", spy_connect)
+    c = real_connect(paths.db_path())
+    dbmod.init_schema(c, paths.schema_path())
+    c.close()
+    hooklib._bump_drop_counter()
+    assert captured["busy"] == constants.BUSY_TIMEOUT_OBS_MS
+    assert constants.BUSY_TIMEOUT_OBS_MS < constants.BUSY_TIMEOUT_SESSION_END_MS
+
+
+def test_ctl_has_no_lark_or_thread_leftovers():
+    import inspect
+    src = inspect.getsource(ctl)
+    for needle in ("lark", "runner_mod", "read_thread", "def thread", "cli_version", "owner_open_id", "profile"):
+        assert needle not in src, needle

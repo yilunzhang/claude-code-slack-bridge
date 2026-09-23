@@ -1,8 +1,11 @@
 """bridgectl 逻辑层(bin/bridgectl.py 的可测核心)。
-I4 例外声明:bootstrap/chats 的读操作是 skill 交互期例外。"""
+I4 例外声明:bootstrap / chats / open-dm / probe(doctor)的读操作与探测是 skill 交互期例外(I2)。
+token 只从 env / stdin 进入(绝不上 argv),只落 0600 的 tokens.json,绝不进返回值/日志。"""
 import fcntl
+import importlib.util
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -10,59 +13,120 @@ import sys
 import time
 
 from . import config as configmod
-from . import constants, db, jobs, lifecycle, paths, procs, texts, util
-from . import runner as runner_mod
+from . import constants, db, lifecycle, paths, procs, texts
+from .slackapi import DaemonStateCooldownStore, InMemoryCooldownStore, SlackClient
+
+USER_ID_RE = re.compile(r"[UW][A-Z0-9]{2,32}")
+LIST_PAGE_CAP = 50           # conversations.list 最多翻 50 页(200/页)
+LIST_PAGE_LIMIT = 200
 
 
-# ---------------------------------------------------------------- bootstrap(S5 身份配方)
-def bootstrap(runner, profile, clock, chat_allowlist=None):
-    auth = runner.run(["auth", "status"], timeout_s=30)
-    auth_obj = runner_mod.parse_envelope(auth.stdout)
-    if auth.rc != 0 or not isinstance(auth_obj, dict):
-        raise configmod.ConfigError("auth status 失败:先 lark-cli auth login")
-    app_id = auth_obj.get("appId")
-    owner = ((auth_obj.get("identities") or {}).get("user") or {}).get("openId")
-    if not app_id or not owner:
-        raise configmod.ConfigError("auth status 缺 appId / identities.user.openId")
-    bot = runner.run(["api", "GET", "/open-apis/bot/v3/info", "--as", "bot",
-                      "--format", "ndjson"], timeout_s=30)
-    bot_open_id, bot_name = None, None
-    for line in (bot.stdout or "").splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
-        b = obj.get("bot") if isinstance(obj, dict) else None
-        if isinstance(b, dict) and b.get("open_id"):
-            bot_open_id = b["open_id"]
-            bot_name = b.get("app_name")
-            break
-    if not bot_open_id:
-        raise configmod.ConfigError("bot/v3/info 未取到 .bot.open_id(--format ndjson)")
-    from . import fingerprint as fp
-    cli_version = fp.probe_cli_version(runner)  # E1:裸 --version(不拖 --profile)
-    if not cli_version:
-        raise configmod.ConfigError("lark-cli --version 探测失败:cli_version 必填(版本门基准)")
+# ---------------------------------------------------------------- bootstrap(身份配方)
+def _validate_bootstrap_tokens(tokens):
+    if not isinstance(tokens, dict):
+        raise configmod.ConfigError("tokens 必须是 {bot_token, app_token} 对象(env 或 --tokens-stdin)")
+    bot = tokens.get("bot_token")
+    app = tokens.get("app_token")
+    if not isinstance(bot, str) or not bot.strip():
+        raise configmod.ConfigError("缺 bot_token(env SLACK_BOT_TOKEN 或 --tokens-stdin)")
+    bot = bot.strip()
+    if not bot.startswith("xoxb-"):
+        raise configmod.ConfigError("bot_token 应为 bot token(xoxb-…);拒绝 user/其它类型 token")
+    if app is not None:
+        if not isinstance(app, str):
+            raise configmod.ConfigError("app_token 须为字符串")
+        app = app.strip() or None
+        if app and not app.startswith("xapp-"):
+            raise configmod.ConfigError("app_token 应为 app-level token(xapp-…,scope connections:write)")
+    return {"bot_token": bot, "app_token": app}
+
+
+def bootstrap(client_factory, owner=None, owner_email=None, app_id=None, tokens=None,
+              chat_allowlist=None, clock=None):
+    """身份配方(plan「控制面」):
+    - tokens 只来自 env / stdin(调用方负责;本函数绝不看 argv);
+    - `auth.test` → team_id / bot_user_id(=user_id)/ bot_id;
+    - app_id:`bots.info(bot=bot_id)` 取 `.bot.app_id`;取不到必须显式 `app_id`;两者都有且不同 → 拒绝;
+    - owner:`owner`(U…/W…)或 `owner_email`(`users.lookupByEmail`),二选一必给;
+    - 写 tokens.json(0600,存在即拒)与 config.json(0600,存在即拒;bootstrap 锁下);
+    - **不发任何消息**。→ cfg dict(不含 token)。"""
+    tokens = _validate_bootstrap_tokens(tokens)
+    if bool(owner) == bool(owner_email):
+        raise configmod.ConfigError("--owner U… 与 --owner-email 二选一(且只能给一个)")
+    if owner is not None and not USER_ID_RE.fullmatch(str(owner)):
+        raise configmod.ConfigError("--owner 须为 Slack user id(U…/W…)")
+    # 存在即拒(先查再联网,少一次无谓的 auth.test)
+    if configmod.load_config() is not None:
+        raise configmod.ConfigError(
+            "config.json 已存在(指纹钉死,不隐式变);如确要重来,先 unbind 所有绑定并手动删除 "
+            f"{paths.config_path()} 与 {paths.tokens_path()}")
+    if os.path.exists(str(paths.tokens_path())):
+        raise configmod.ConfigError(
+            f"tokens.json 已存在({paths.tokens_path()});如确要换 token,先手动删除它再 bootstrap")
+
+    client = client_factory(tokens)
+    res = client.call("auth.test", {})
+    if not res.ok or not isinstance(res.data, dict):
+        raise configmod.ConfigError("auth.test 失败:%s(检查 bot token 是否有效)" % (res.error,))
+    team_id = res.data.get("team_id")
+    bot_user_id = res.data.get("user_id")
+    bot_id = res.data.get("bot_id")
+    if not (team_id and bot_user_id and bot_id):
+        raise configmod.ConfigError("auth.test 缺 team_id / user_id / bot_id(须为 bot token)")
+    bot_name = res.data.get("user")
+    team_name = res.data.get("team")
+
+    # app_id:bots.info(bot=bot_id) 优先;失败/缺失 → 必须 --app-id;两者冲突 → 拒
+    probed_app_id = None
+    bi = client.call("bots.info", {"bot": bot_id})
+    if bi.ok and isinstance(bi.data, dict):
+        b = bi.data.get("bot")
+        if isinstance(b, dict) and b.get("app_id"):
+            probed_app_id = b["app_id"]
+            bot_name = b.get("name") or bot_name
+    if app_id:
+        if probed_app_id and probed_app_id != app_id:
+            raise configmod.ConfigError(
+                "--app-id(%s)与 bots.info 返回的 app_id(%s)不一致,拒绝写入" % (app_id, probed_app_id))
+        final_app_id = app_id
+    elif probed_app_id:
+        final_app_id = probed_app_id
+    else:
+        raise configmod.ConfigError(
+            "bots.info 未取到 app_id(%s);请从 api.slack.com/apps 复制 App ID 后加 --app-id A…"
+            % (bi.error or "no app_id in response",))
+
+    if owner_email:
+        lu = client.call("users.lookupByEmail", {"email": owner_email})
+        if not lu.ok or not isinstance(lu.data, dict):
+            raise configmod.ConfigError(
+                "users.lookupByEmail 失败:%s(需 users:read.email scope;或改用 --owner U…)"
+                % (lu.error,))
+        u = lu.data.get("user")
+        owner = u.get("id") if isinstance(u, dict) else None
+        if not owner or not USER_ID_RE.fullmatch(str(owner)):
+            raise configmod.ConfigError("users.lookupByEmail 未返回合法 user.id")
+    if owner == bot_user_id:
+        raise configmod.ConfigError("owner 不能是 bot 自己")
+
+    now = clock.wall_ms() if clock is not None else int(time.time() * 1000)
     cfg = {
-        "profile": profile,
-        "app_id": app_id,
-        "bot_open_id": bot_open_id,
+        "team_id": team_id,
+        "bot_user_id": bot_user_id,
+        "bot_id": bot_id,
+        "app_id": final_app_id,
+        "owner_user_id": owner,
         "bot_name": bot_name,
-        "owner_open_id": owner,
-        "cli_version": cli_version,
-        "created_at": clock.wall_ms(),
+        "team_name": team_name,
+        "created_at": now,
     }
     if chat_allowlist:
-        cfg["chat_allowlist"] = list(chat_allowlist)  # E2:灰度/测试隔离;缺省/空=全部
+        cfg["chat_allowlist"] = list(chat_allowlist)
     with configmod.bootstrap_lock():
         if configmod.load_config() is not None:
-            raise configmod.ConfigError(
-                "config.json 已存在(指纹钉死,不隐式变);如确要换 profile,先手动删除 "
-                f"{paths.config_path()} 并 unbind 所有绑定")
-        configmod.save_config(cfg)
+            raise configmod.ConfigError("config.json 已存在(并发 bootstrap?),拒绝覆盖")
+        configmod.save_tokens(tokens)           # 0600;存在即拒
+        configmod.save_config(cfg)              # 0600(atomic_write 缺省 mode)
     return cfg
 
 
@@ -70,10 +134,6 @@ def bootstrap(runner, profile, clock, chat_allowlist=None):
 # plugin 化后 hooks 由 plugin 的 hooks/hooks.json 提供,**不再**手贴进 settings.json。
 # 无法在 bind 的同一 turn 内直接读"CC 是否已加载 plugin hooks";用**哨兵心跳**做正向检测:
 # Stop/SessionEnd hook 每次运行都写 hook_heartbeat(见 hooklib._touch_hook_heartbeat)。
-# 见过近期心跳 = plugin hooks 确已在本机某个 CC 会话里跑过 = 已生效(强信号);
-# 没见过 = 不确定(全新安装/尚未完成一轮对话是正常的)→ 不硬阻断,提示重启 CC。
-
-# "近期"窗口:一次对话轮结束就会刷新;给足冷启动/低频使用余量。
 HOOK_HEARTBEAT_FRESH_MS = 7 * 24 * 3600 * 1000  # 7 天
 
 
@@ -88,20 +148,16 @@ def _read_heartbeat(event, now_ms, cur_root, cur_ver):
     age = now_ms - ts
     ev["seen"] = True
     ev["age_s"] = round(age / 1000, 1)
-    # fresh 要求 0<=age<=window(MAJOR 2:挡未来时间戳误判 fresh)
-    ev["fresh"] = 0 <= age <= HOOK_HEARTBEAT_FRESH_MS
+    ev["fresh"] = 0 <= age <= HOOK_HEARTBEAT_FRESH_MS   # 挡未来时间戳
     ev["plugin_version"] = data.get("plugin_version")
     ev["pkg_root"] = data.get("pkg_root")
-    # current = 心跳来自**本 install/版本**(MAJOR 2:另一 root/旧版本的心跳不算「我的 hooks 已生效」)
     ev["current"] = (ev["pkg_root"] == cur_root and ev["plugin_version"] == cur_ver)
     return ev
 
 
 def hooks_live_status(now_ms=None):
     """plugin hooks 生效信号(哨兵心跳)。**advisory only** —— 权威证明只有「本次 Stop 握手成功
-    + 群内 ✅ 已绑定」;心跳只是软提示,不做安全判定。不读 settings.json、不要求手装。
-    Stop 与 SessionEnd 分开;记录 plugin version/pkg_root 以剔除「另一 install/旧版本/仅 SessionEnd」假阳性。
-    顶层 `confirmed` = Stop 心跳 seen ∧ fresh ∧ current(bind/preflight 的主信号)。"""
+    + 会话内 ✅ 已绑定」。顶层 `confirmed` = Stop 心跳 seen ∧ fresh ∧ current。"""
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     from . import version as versionmod
     cur_root, cur_ver = versionmod.install_identity()
@@ -118,8 +174,7 @@ def hooks_live_status(now_ms=None):
 
 
 def foreign_stop_hooks():
-    """best-effort:扫 settings.json 里**非本 plugin** 的 Stop hook(D2 阻断型共存告警,信息性)。
-    读不到/无 = 空;绝不影响就绪判定。plugin 化后本 plugin 的 hooks 不在 settings.json。"""
+    """best-effort:扫 settings.json 里**非本 plugin** 的 Stop hook(阻断型共存告警,信息性)。"""
     try:
         obj = json.loads(paths.settings_json_path().read_text())
     except (OSError, ValueError):
@@ -128,71 +183,115 @@ def foreign_stop_hooks():
     for entry in (obj.get("hooks") or {}).get("Stop") or []:
         for h in (entry or {}).get("hooks") or []:
             cmd = (h or {}).get("command", "")
-            if cmd and "feishu-bridge/hooks/stop_hook.py" not in cmd:
+            if cmd and "slack-bridge/hooks/stop_hook.py" not in cmd:
                 out.append(cmd)
     return out
 
 
-# ---------------------------------------------------------------- chats
-def list_chats(runner):
-    """列出 bot 所在的**全部**群:跟着 has_more 翻页,取不全就整体失败(返回 None)。
+# ---------------------------------------------------------------- chats / open-dm
+def _chat_entry(c, owner):
+    """conversations.list 单项 → 条目或 None(过滤:归档、非成员频道、非 owner 的 IM、mpim)。"""
+    if not isinstance(c, dict) or not c.get("id"):
+        return None
+    cid = c["id"]
+    if c.get("is_archived"):
+        return None
+    if c.get("is_im"):
+        if owner and c.get("user") == owner:
+            return {"chat_id": cid, "name": "owner DM", "type": "owner_dm", "is_member": True}
+        return None
+    if c.get("is_mpim"):
+        return None
+    if c.get("is_member") is not True:
+        return None
+    kind = "private_channel" if (c.get("is_private") or c.get("is_group")) else "public_channel"
+    return {"chat_id": cid, "name": c.get("name"), "type": kind, "is_member": True}
 
-    `im +chat-list` 不自动翻页(默认 page-size=20)。只取首页会得到一个**和全集长得
-    一模一样**的残缺列表——没有报错、条目也都是真的——调用方会把"不在列表里"读成
-    "这个群不存在"并去新建一个重复群。所以宁可失败,也不返回取不全的前缀。
 
-    三条契约:
-    - 终止只认 `has_more is False`;缺失/非布尔一律当"证明不了取全"→ None。
-    - **`page_token` 重复不代表没前进**:该接口从第 2 页起会一直返回同一个 token,
-      内容却照常推进,按"重复即失败"判会把能正常取全的路径判死。
-    - 推进以**本页有没有带来新 chat_id** 为准(空页/全畸形/全是已见 id 都不算),
-      否则会在那个恒定 token 上无限循环。"""
-    chats, seen_ids, page_token = [], set(), None
-    while True:
-        argv = ["im", "+chat-list", "--as", "bot", "--page-size", "100"]
-        if page_token:
-            argv += ["--page-token", page_token]
-        res = runner.run(argv, timeout_s=30)
-        env = runner_mod.parse_envelope(res.stdout)
-        if res.rc != 0 or not runner_mod.envelope_ok(env):
+def list_chats(client, cfg, page_cap=LIST_PAGE_CAP):
+    """列出 bot 可绑的**全部**会话:频道按 `is_member`,IM 只留 `user==owner_user_id`(标 owner_dm)。
+    `conversations.list(types=public_channel,private_channel,im, exclude_archived=true, limit=200)`,
+    跟随 `response_metadata.next_cursor` 到空(**空页带 cursor 合法**,继续翻);cursor 重复 = 循环 → None;
+    超过 page_cap 页 → None;任何调用失败 → None。契约:**要么完整列表,要么 None**,绝不返回残缺前缀。"""
+    owner = cfg.get("owner_user_id")
+    chats, seen_ids, seen_cursors, cursor = [], set(), set(), None
+    for _ in range(page_cap):
+        params = {"types": "public_channel,private_channel,im",
+                  "exclude_archived": True, "limit": LIST_PAGE_LIMIT}
+        if cursor:
+            params["cursor"] = cursor
+        res = client.call("conversations.list", params)
+        if not res.ok or not isinstance(res.data, dict):
             return None
-        data = runner_mod.data_of(env)
-        fresh = 0
-        for i in data.get("items") or data.get("chats") or []:
-            if not isinstance(i, dict) or not i.get("chat_id"):
+        channels = res.data.get("channels")
+        if not isinstance(channels, list):
+            return None
+        for c in channels:
+            e = _chat_entry(c, owner)
+            if e is None or e["chat_id"] in seen_ids:
                 continue
-            if i["chat_id"] in seen_ids:
-                continue
-            seen_ids.add(i["chat_id"])
-            chats.append({"chat_id": i["chat_id"], "name": i.get("name")})
-            fresh += 1
-        has_more = data.get("has_more")
-        if has_more is False:
+            seen_ids.add(e["chat_id"])
+            if e["type"] == "owner_dm":
+                e["is_pinned_owner_dm"] = (cfg.get("owner_dm_id") == e["chat_id"])
+            chats.append(e)
+        meta = res.data.get("response_metadata")
+        nxt = meta.get("next_cursor") if isinstance(meta, dict) else None
+        if nxt is None:
+            nxt = ""
+        if not isinstance(nxt, str):
+            return None
+        nxt = nxt.strip()
+        if not nxt:
             return chats
-        # 缺失/非布尔 has_more:证明不了取全了,不当成功(该接口实测始终返回真布尔)。
-        if has_more is not True:
-            return None
-        # 声称还有更多,却没给 cursor、或本页没带来任何新 id:无法证明有推进。
-        if not data.get("page_token") or fresh == 0:
-            return None
-        page_token = data["page_token"]
+        if nxt in seen_cursors:
+            return None  # cursor 循环
+        seen_cursors.add(nxt)
+        cursor = nxt
+    return None  # 翻页超上限:证明不了取全
+
+
+def open_owner_dm(client, cfg):
+    """`conversations.open(users=owner_user_id)` → 钉 `owner_dm_id`(`cfg.set_persist`)。
+    → {"ok": True, "owner_dm_id": D…} | {"ok": False, "error": …}。只有 owner DM 可绑(拒他人 DM)。"""
+    owner = cfg.get("owner_user_id")
+    if not owner:
+        return {"ok": False, "error": "config 缺 owner_user_id"}
+    res = client.call("conversations.open", {"users": owner})
+    if not res.ok or not isinstance(res.data, dict):
+        return {"ok": False, "error": "conversations.open 失败:%s" % (res.error,)}
+    ch = res.data.get("channel")
+    dm = ch.get("id") if isinstance(ch, dict) else None
+    if not isinstance(dm, str) or not dm.startswith("D"):
+        return {"ok": False, "error": "conversations.open 未返回 D… 会话 id"}
+    if hasattr(cfg, "set_persist"):
+        cfg.set_persist("owner_dm_id", dm)
+    else:
+        cfg["owner_dm_id"] = dm
+    return {"ok": True, "owner_dm_id": dm, "chat_id": dm}
 
 
 # ---------------------------------------------------------------- bind / unbind
 def bind_prepare(conn, cfg, clock, prober, chat_id, chat_name, cwd, start_pid):
-    # r3-1②(E2 盖全):目标 chat 不在 allowlist → 直接报错,零残留
+    # 目标 chat 不在 allowlist → 直接报错,零残留
     allow = cfg.get("chat_allowlist")
     if allow and chat_id not in allow:
         raise lifecycle.BindConflict(
             "chat_not_allowed",
-            f"该群不在 config.json 的 chat_allowlist 内({chat_id});改 allowlist 或换群")
+            f"该会话不在 config.json 的 chat_allowlist 内({chat_id});改 allowlist 或换会话")
+    # DM 只能绑 owner 自己的(bootstrap 后经 open-dm 钉死的 owner_dm_id);其它 D… 一律拒
+    if isinstance(chat_id, str) and chat_id.startswith("D"):
+        if not cfg.get("owner_dm_id") or chat_id != cfg.get("owner_dm_id"):
+            raise lifecycle.BindConflict(
+                "foreign_dm",
+                f"DM {chat_id} 不是 owner DM(owner_dm_id={cfg.get('owner_dm_id')!r});"
+                "只有 owner 自己的 DM 可绑 —— 先 `bridgectl open-dm` 钉住 owner DM 再 bind")
     inst = procs.find_cc_instance(prober, start_pid)
     if inst is None:
         raise lifecycle.BindConflict("no_instance", "无法定位 CC 实例(ppid 链解析失败)")
     pid, lstart = inst
     res = lifecycle.create_binding(conn, chat_id=chat_id, chat_name=chat_name,
                                    cwd=cwd, cc_pid=pid, cc_start=lstart, clock=clock)
-    # minor①:shlex.join + sys.executable —— plugin 根/python 路径含空格也安全。
+    # shlex.join + sys.executable —— plugin 根/python 路径含空格也安全。
     listener_cmd = shlex.join(
         [sys.executable, str(paths.pkg_root() / "bin" / "listener.py"), res["binding_id"]])
     return {
@@ -202,14 +301,14 @@ def bind_prepare(conn, cfg, clock, prober, chat_id, chat_name, cwd, start_pid):
         "listener_cmd": listener_cmd,
         "chat_id": chat_id,
         "chat_name": chat_name,
+        "is_owner_dm": bool(chat_id and chat_id == cfg.get("owner_dm_id")),
         "ttl_minutes": constants.PENDING_BIND_TTL_MS // 60000,
     }
 
 
 def wait_listener_claim(conn, binding_id, clock, sleep, timeout_ms):
     """等常驻 listener(插件 monitor 的 follower)认领刚建的绑定:行 listener_epoch>=1 即 True,
-    每 0.5s 轮询,超 timeout_ms → False(调用方据此回退为手动起有参 listener)。已认领时不 sleep。
-    必须发生在 marker 握手之前:确认后 30s 无心跳会 listener_never_ready 关行,之后再起 listener 只会看到终态。"""
+    每 0.5s 轮询,超 timeout_ms → False(调用方据此回退为手动起有参 listener)。已认领时不 sleep。"""
     deadline = clock.mono_ms() + timeout_ms
     while True:
         row = conn.execute("SELECT listener_epoch FROM bindings WHERE binding_id=?",
@@ -243,6 +342,30 @@ def unbind(conn, clock, prober, start_pid=None, binding_id=None):
 
 
 # ---------------------------------------------------------------- status
+STATUS_COUNTERS = (
+    "staged_dup", "staged_invalid", "inbox_dup_message", "inbox_snapshot_upgraded",
+    "dm_notice_suppressed", "ratelimit_hits", "cooldown_waits", "verify_hit", "verify_absent",
+    "verify_resent", "verify_unconfirmed", "drain_quarantined", "group_cancelled_after_unconfirmed",
+    "media_budget_exhausted", "worker_unexpected_exit", "hook_drop_count",
+    "event_processing_errors", "malformed_event_lines",
+)
+
+
+def tokens_file_status():
+    """当前 tokens.json 状态(**绝不含 token**):{present, version|None, app_token_present, error|None}。"""
+    st = {"present": os.path.exists(str(paths.tokens_path())), "version": None,
+          "app_token_present": None, "error": None}
+    if not st["present"]:
+        return st
+    try:
+        tokens, version = configmod.load_tokens(allow_env=False)
+        st["version"] = version
+        st["app_token_present"] = bool(tokens.get("app_token"))
+    except configmod.ConfigError as e:
+        st["error"] = str(e)
+    return st
+
+
 def status_report(conn, cfg, clock):
     now = clock.wall_ms()
 
@@ -252,23 +375,27 @@ def status_report(conn, cfg, clock):
     daemon = {
         "pid": db.get_state(conn, "daemon_pid"),
         "started_at": db.get_state(conn, "daemon_started_at"),
+        "startup": db.get_state(conn, "startup"),
+        "generation": db.get_state(conn, "daemon_generation"),
+        "code_identity": db.get_state(conn, "daemon_code_identity"),
         "last_loop_age_s": age(db.get_state(conn, "last_loop_at")),
         "suspect_until": db.get_state(conn, "suspect_until"),
         "last_error": db.get_state(conn, "last_error"),
     }
-    consumers = {}
-    for k in ("im.message.receive_v1", "card.action.trigger"):
-        consumers[k] = {
-            "ready": db.get_state(conn, f"consumer_{k}_ready"),
-            "last_status": db.get_state(conn, f"consumer_{k}_last_status"),
-            "restarts": db.get_state(conn, f"consumer_{k}_restarts", "0"),
-        }
+    k = constants.SOCKET_KEY
+    consumer = {
+        "ready": db.get_state(conn, f"consumer_{k}_ready"),
+        "last_status": db.get_state(conn, f"consumer_{k}_last_status"),
+        "restarts": db.get_state(conn, f"consumer_{k}_restarts", "0"),
+        "last_exit_rc": db.get_state(conn, f"consumer_{k}_last_exit_rc"),
+    }
     bindings = []
     for b in conn.execute(
             "SELECT * FROM bindings ORDER BY binding_seq DESC LIMIT 20").fetchall():
         bindings.append({
             "binding_id": b["binding_id"][:8],
             "chat": b["chat_name"] or b["chat_id"],
+            "chat_id": b["chat_id"],
             "status": b["status"],
             "phase": b["bind_phase"],
             "close_reason": b["close_reason"],
@@ -283,41 +410,85 @@ def status_report(conn, cfg, clock):
         "SELECT state, COUNT(*) FROM deliveries GROUP BY state")}
     inbox_by_state = {r[0]: r[1] for r in conn.execute(
         "SELECT state, COUNT(*) FROM inbox GROUP BY state")}
+    events_by_state = {r[0]: r[1] for r in conn.execute(
+        "SELECT state, COUNT(*) FROM slack_events GROUP BY state")}
+    quarantined = [{
+        "seq": r["seq"], "envelope_type": r["envelope_type"], "chat_id": r["chat_id"],
+        "received_at": r["received_at"], "drain_attempts": r["drain_attempts"],
+        "error": (r["error"] or "")[:200],
+    } for r in conn.execute(
+        "SELECT * FROM slack_events WHERE state='quarantined' ORDER BY seq DESC LIMIT 20").fetchall()]
     counters = {}
-    for key in ("hook_drop_count", "inbox_conflict_alerts", "inbox_cap_drops",
-                "malformed_event_lines", "event_processing_errors", "media_failed",
-                "resolve_deadline_failed", "approval_card_given_up"):
+    for key in STATUS_COUNTERS:
         v = db.get_state(conn, key)
         if v is not None:
             counters[key] = v
-    gate = db.get_state(conn, "outbound_gate", "ok") or "ok"
-    given_up_cards = conn.execute(
-        "SELECT COUNT(*) FROM outbound_jobs WHERE kind='approval_card' "
-        "AND state='failed' AND error='given-up'").fetchone()[0]
+    for r in conn.execute("SELECT key, value FROM daemon_state WHERE key LIKE 'event_dropped_%'"):
+        counters[r[0]] = r[1]
+    cooldowns = {}
+    for r in conn.execute("SELECT key, value FROM daemon_state WHERE key LIKE ?",
+                          (constants.COOLDOWN_KEY_PREFIX + "%",)):
+        try:
+            until = int(r[1])
+        except (TypeError, ValueError):
+            continue
+        cooldowns[r[0][len(constants.COOLDOWN_KEY_PREFIX):]] = {
+            "until": until, "remaining_s": max(0.0, round((until - now) / 1000, 1)),
+            "active": until > now}
+    gate = db.get_state(conn, constants.GATE_KEY)
+    gate_version = db.get_state(conn, constants.GATE_VERSION_KEY)
+    tokens_st = tokens_file_status()
+    verify_cap = db.get_state(conn, constants.VERIFY_CAPABILITY_KEY)
+    verify_ver = db.get_state(conn, constants.VERIFY_CAPABILITY_VERSION_KEY)
     rep = {
-        "fingerprint": {k: cfg.get(k) for k in
-                        ("profile", "app_id", "bot_open_id", "bot_name", "owner_open_id",
-                         "cli_version")},
+        "fingerprint": {k2: cfg.get(k2) for k2 in
+                        ("team_id", "team_name", "bot_user_id", "bot_id", "bot_name", "app_id",
+                         "owner_user_id", "owner_dm_id")},
         "schema_version": db.get_state(conn, "schema_version"),
         "chat_allowlist": cfg.get("chat_allowlist") or "全部(未限制)",
+        "markdown_mode": cfg.get("markdown_mode") or constants.MARKDOWN_MODE_DEFAULT,
         "outbound_gate": gate,
+        "outbound_gate_tokens_version": gate_version,
+        "tokens_version_seen": db.get_state(conn, constants.TOKENS_VERSION_SEEN_KEY),
+        "tokens_file": tokens_st,
+        "credentials_verified": bool(gate == "ok" and gate_version
+                                     and gate_version == tokens_st.get("version")),
+        "verify_capability": verify_cap,
+        "verify_capability_tokens_version": verify_ver,
+        "auto_resend_enabled": bool(verify_cap == constants.VERIFY_CAP_OK and verify_ver
+                                    and verify_ver == tokens_st.get("version")),
+        "cooldowns": cooldowns,
         "daemon": daemon,
-        "consumers": consumers,
+        "consumer": consumer,
         "bindings": bindings,
         "outbound_jobs": jobs_by_state,
         "deliveries": deliveries_by_state,
         "inbox": inbox_by_state,
+        "slack_events": events_by_state,
+        "quarantined": quarantined,
         "counters": counters,
-        "given_up_approval_cards": given_up_cards,
     }
-    if gate == "degraded:version_mismatch":
-        rep["gate_hint"] = ("lark-cli 版本与 config.cli_version 不符,出站已停摆。"
-                            "**v1.5.0 起 daemon 会自动自检重钉**(用与真实转发同形的 --markdown "
-                            "发一条到固定测试群),通过即放行、并弹一条系统通知;"
-                            "若这里仍显示停摆,说明自检**未通过**(可能是真回归)——"
-                            "看 daemon.log,必要时人工 `bridgectl doctor --chat-id <测试群oc>`。")
+    hints = []
+    if gate is None:
+        hints.append("outbound_gate 尚未写入(daemon 未启动过?)→ 先 ensure-daemon。")
+    elif gate == "mismatch":
+        hints.append("身份不符:tokens.json 的 bot 与 config.json 指纹不一致,出站关门、daemon 拒启;"
+                     "换回原 app 的 token,或删 config.json/tokens.json 重新 bootstrap。")
     elif gate.startswith("degraded"):
-        rep["gate_hint"] = "身份指纹未验证(出站停摆),daemon 带退避重探;检查 VPN/lark-cli 登录。"
+        hints.append("出站停摆(%s):auth.test 失败或 tokens.json 不可读;daemon 带退避重探。"
+                     "检查网络 / token 是否被撤销 / 文件权限 0600。" % gate)
+    if gate == "ok" and gate_version and tokens_st.get("version") \
+            and gate_version != tokens_st["version"]:
+        hints.append("tokens.json 已变但 daemon 尚未重验(gate 版本 ≠ 文件版本):"
+                     "notify/StopFailure 直发会被 credentials-unverified 拒,等 daemon 下一 tick。")
+    if verify_cap != constants.VERIFY_CAP_OK or (verify_ver and verify_ver != tokens_st.get("version")):
+        hints.append("verify_capability 非 ok 或版本不匹配 → 自动重发关闭(unknown 只核验,"
+                     "三次未见即 unconfirmed);跑 `bridgectl probe --chat-id <测试频道> --write-config` 确证。")
+    if quarantined:
+        hints.append("有 %d 条 slack_events 被隔离(drain 反复失败);看 error 字段与 daemon.log。"
+                     % len(quarantined))
+    if hints:
+        rep["hints"] = hints
     return rep
 
 
@@ -338,14 +509,11 @@ def daemon_lock_held():
         os.close(fd)
 
 
-# 修复项5:daemon 挂死恢复。锁被持有但心跳陈旧(>HUNG_THRESHOLD)= 挂死 →
-# 按记录的 (daemon_pid, daemon_proc_start) 精确匹配后 SIGTERM → 等退出 → 接管重启;
-# 身份不匹配(pid 复用/无记录)绝不杀随机进程 → failed。
-# r7-3:阈值必须 ≥ 单次**最长同步网络操作**(daemon 单线程,一次媒体下载 DOWNLOAD_TIMEOUT_S=120s
-# 期间主循环阻塞、不刷心跳)+ 余量;多点心跳只在"处理完一个含网络条目后"刷,盖不住单次下载内部。
-# 从 r2 的 300s 收窄到 =DOWNLOAD_TIMEOUT_S+60s(=180s):覆盖 120s 长下载不误判,同时更贴合。
-# r2-M1④:接管全程持 singleflight flock,防两个 ensure 重叠 kill/spawn。
-HUNG_THRESHOLD_MS = (constants.DOWNLOAD_TIMEOUT_S + 60) * 1000  # =180_000
+# daemon 挂死恢复:锁被持有但心跳陈旧(>HUNG_THRESHOLD)= 挂死 → 按记录的 (daemon_pid, daemon_proc_start)
+# 精确匹配后 SIGTERM → 等退出 → 接管重启;身份不匹配(pid 复用/无记录)绝不杀随机进程 → failed。
+# 阈值必须 ≥ 单次**最长同步网络操作** + 余量:daemon 单线程,一次附件下载(子进程,父进程 proc.wait
+# 到 DOWNLOAD_DEADLINE_S=90s 绝对截止)期间主循环阻塞、不刷心跳 → 90s + 60s = 150s。
+HUNG_THRESHOLD_MS = (constants.DOWNLOAD_DEADLINE_S + 60) * 1000
 _POLL_STEP_S = 0.3
 
 
@@ -373,8 +541,8 @@ class _FlockSingleflight:
                 self.fd = None
 
 
-# r7-1:ensure() 的返回值语义 —— 只有 READY_RESULTS 才代表"daemon 就绪、bind 可继续";
-# in_progress/failed/down 都不就绪(bind 只在 is_ready_result()==True 时继续,别再"排除字符串 failed")。
+# ensure() 的返回值语义 —— 只有 READY_RESULTS 才代表"daemon 就绪、bind 可继续";
+# in_progress/failed/down 都不就绪。
 READY_RESULTS = frozenset({"running", "started", "recovered"})
 
 
@@ -383,9 +551,8 @@ def is_ready_result(result):
 
 
 def state_ready(st, now_ms):
-    """r4-1/r7-2:就绪 = 心跳新鲜 ∧ startup ∈ {running,degraded} ∧ 同代 generation。
-    probing/refused/**stopping** 不算就绪(heartbeat 只表活着,startup 才表就绪;
-    stopping=正在退出,天然不在 _READY_PHASES);generation 对齐防"新代心跳 + 旧代 running"误判。"""
+    """就绪 = 心跳新鲜 ∧ startup ∈ {running,degraded} ∧ 同代 generation。
+    probing/refused/stopping 不算就绪;generation 对齐防"新代心跳 + 旧代 running"误判。"""
     from .daemon_core import parse_startup, _READY_PHASES
     if not st or st.get("last_loop_at") is None:
         return False
@@ -413,18 +580,17 @@ def daemon_healthy(conn, now_ms=None):
     return state_ready(st, now)
 
 
-# r5-M2:等 probing 结论(record_identity + gate.startup,最坏探测 auth~20s + version~10s)的上限,
-# 覆盖探测最坏 + 余量;心跳新鲜的 probing 期间绝不 takeover。
+# 等 probing 结论(record_identity + gate.startup:一次 auth.test ≤ SEND_TIMEOUT_S)的上限,含余量。
 STARTUP_PROBE_WAIT_S = 40
 
 
 class DaemonSupervisor:
     """依赖全注入的 ensure 逻辑(可测):lock_held()/read_state()/spawn()/kill(pid,sig);
-    singleflight(可选,对象须有 try_acquire()/release())防重叠接管(r2-M1④)。
-    r5:liveness(心跳)与 readiness(startup+generation)分离——
+    singleflight(可选,对象须有 try_acquire()/release())防重叠接管。
+    liveness(心跳)与 readiness(startup+generation)分离——
     ① takeover(SIGTERM+重启)**只依据心跳陈旧**,绝不因'尚未就绪'而杀;
     ② 心跳新鲜的 probing → 等结论(不 kill);refused → 终态失败(不重启);
-    ③ 拉起/等待路径以 baseline generation 拒'旧代完整对齐'假成功(M1)。"""
+    ③ 拉起/等待路径以 baseline generation 拒'旧代完整对齐'假成功。"""
 
     def __init__(self, *, lock_held, read_state, spawn, kill, prober,
                  now_ms, sleep, wait_s=12, singleflight=None, probe_wait_s=None,
@@ -434,14 +600,8 @@ class DaemonSupervisor:
         self.spawn = spawn
         self.kill = kill
         self.prober = prober
-        # 注:supervisor **只判 daemon 健康在跑吗**,不掺 code-identity(换层:identity 检测
-        # 移到 bind 前置串行检查,见 reconcile_code_identity)——避免在并发 ready 状态机的多个出口
-        # 各自校验(security 三律③:别在错误的层堆东西)。
-        # codex-final:两个时钟各司其职,别混。
-        #   now_ms = **墙钟**(wall):用于心跳新鲜度/state_ready —— last_loop_at 是 DB 持久化的
-        #     墙钟时间戳,跨进程比较必须墙钟。
-        #   mono_ms = **单调钟**(monotonic):仅用于本进程内的等待 deadline —— 墙钟前跳/回拨
-        #     不得让 caller_deadline 提前结束。
+        # now_ms = 墙钟(心跳新鲜度/state_ready:last_loop_at 是 DB 持久化的墙钟时间戳);
+        # mono_ms = 单调钟(仅本进程内的等待 deadline —— 墙钟跳变不得让 deadline 提前结束)。
         self.now_ms = now_ms
         self.mono_ms = mono_ms or (lambda: int(time.monotonic() * 1000))
         self.sleep = sleep
@@ -449,12 +609,10 @@ class DaemonSupervisor:
         self.singleflight = singleflight
         self.probe_wait_s = probe_wait_s if probe_wait_s is not None else STARTUP_PROBE_WAIT_S
 
-    # ---- 判定原语:严格区分 liveness 与 readiness ----
     def _ready(self, st):
         return state_ready(st, self.now_ms())
 
     def _heartbeat_fresh(self, st):
-        """liveness:仅看心跳,不看 startup(r5-M2:takeover 只依此)。"""
         if not st or st.get("last_loop_at") is None:
             return False
         return (self.now_ms() - int(st["last_loop_at"])) <= HUNG_THRESHOLD_MS
@@ -467,13 +625,9 @@ class DaemonSupervisor:
         from .daemon_core import parse_startup
         return parse_startup((st or {}).get("startup"))[0]
 
-    # ---- 入口 ----
     def ensure(self):
-        # r5-M1④:健康态 fast-path 也必须经 singleflight,不越过正在进行的 ensure。
         if self.singleflight is not None:
             if not self.singleflight.try_acquire():
-                # r6:singleflight busy = 另一 owner 正持锁 ensure。busy 调用者唯一正确行为
-                # = 等 owner 的 handoff 结果,绝不观察 baseline 代的 DB 状态独立判定。
                 return self._await_handoff(self._gen_of(self.read_state()))
             try:
                 return self._ensure_locked()
@@ -482,55 +636,41 @@ class DaemonSupervisor:
         return self._ensure_locked()
 
     def _await_handoff(self, baseline_gen):
-        """r6:纯等待-handoff 循环(彻底重写,一次同解 M1/M2 在 busy 路径的两处未适配)。
-        为什么不能观察:signal handler 只置退出标志、当前 loop 仍会跑完刷心跳、锁到 shutdown
-        才释放——所以 owner 接管旧代时,**baseline 代退出前还能刷新鲜心跳/暂持锁/pid 暂存活**,
-        任何对 baseline 代的观察量都不可信。唯一可信信号 = handoff:
-        ① 每轮先 try_acquire —— **拿到**=owner 已结束,我成为新 owner,走权威 _ensure_locked;
-        ② 没拿到 → 只认'非空且 != baseline 的新代且该新代 state_ready(running/degraded)'为成功
-           (= owner 拉起的新 daemon 就绪);baseline 代无论 pid 死活一律**不**算成功(M1 洞);
-        ③ 短 sleep 重试。
-        r7-2:caller_deadline **覆盖 owner 最坏临界区** = 等旧锁释放(shutdown≈wait_s)
-        + spawn 等新代就绪(startup≈wait_s+probe_wait_s) = **2*wait_s + probe_wait_s**
-        (旧 wait_s+probe_wait_s 盖不住 owner 走 takeover 时先等旧锁释放那段)。
-        到期但 transition 仍有效(有 daemon 活着在忙)→ 结构化 **in_progress**(可重试,
-        **非语义 failed**;bind 靠 is_ready_result 判定,不会误当成功);无进展/死 → failed。"""
+        """busy 路径:等 owner 的 handoff。① 每轮先 try_acquire —— 拿到 = owner 已结束,走权威 _ensure_locked;
+        ② 没拿到 → 只认'非空且 != baseline 的新代且 state_ready'为成功;baseline 代一律不认;③ 短 sleep 重试。
+        caller_deadline 覆盖 owner 最坏临界区 = 2*wait_s + probe_wait_s(单调钟)。
+        到期但 daemon 活着在忙 → in_progress(可重试);无进展/死 → failed。"""
         budget_s = 2 * self.wait_s + self.probe_wait_s
-        # codex-final:deadline 用**真单调钟**(self.mono_ms),不用墙钟(now_ms)——
-        # 否则墙钟前跳/回拨会让 caller_deadline 提前结束(纯步数循环旧实现没有这个回归)。
-        deadline = self.mono_ms() + int(budget_s * 1000)  # monotonic absolute deadline
-        max_steps = int(budget_s / _POLL_STEP_S) + 2      # fail-safe(mono 不推进的测试兜底)
+        deadline = self.mono_ms() + int(budget_s * 1000)
+        max_steps = int(budget_s / _POLL_STEP_S) + 2
         steps = 0
         while self.mono_ms() < deadline and steps < max_steps:
             if self.singleflight.try_acquire():
                 try:
-                    return self._ensure_locked()  # owner 已结束 → 权威判定/接管
+                    return self._ensure_locked()
                 finally:
                     self.singleflight.release()
             st = self.read_state()
             gen = self._gen_of(st)
-            # 只认 owner 拉起的**新代**就绪;baseline 代(含旧代垂死刷心跳/pid 存活)一律不认
             if self.lock_held() and gen and gen != baseline_gen and self._ready(st):
                 return "running"
             self.sleep(_POLL_STEP_S)
             steps += 1
         st = self.read_state()
         if self.lock_held() and self._heartbeat_fresh(st):
-            return "in_progress"  # owner 临界区超时但 daemon 还在忙 → 可重试,不是失败
+            return "in_progress"
         return "failed"
 
     def _ensure_locked(self):
         st = self.read_state()
         if self.lock_held() and self._ready(st):
-            return "running"  # 稳态健康(singleflight 下无并发重启,可信)
+            return "running"
         if self.lock_held():
             if self._heartbeat_fresh(st):
-                # r5-M2:心跳新鲜 → 绝不 takeover。按 startup 相位处置:
                 phase = self._phase_of(st)
                 if phase == "refused":
-                    return self._await_lock_release_then_failed()  # 终态,不重启
-                return self._await_probing_conclusion()  # probing/未知:等结论,不 kill
-            # 心跳陈旧 = 真挂死 → 精确身份匹配 takeover(唯一 kill 路径)
+                    return self._await_lock_release_then_failed()
+                return self._await_probing_conclusion()
             return self._takeover_and_restart(st)
         return self._spawn_and_wait()
 
@@ -542,18 +682,16 @@ class DaemonSupervisor:
         return "failed"
 
     def _await_probing_conclusion(self):
-        """r5-M2:等心跳新鲜的 probing 得出结论;就绪→running;refused/退出→failed;
-        超时或中途心跳陈旧→failed(**不 kill**;下次 ensure 才依陈旧心跳接管)。"""
         for _ in range(int(self.probe_wait_s / _POLL_STEP_S) + 1):
             st = self.read_state()
             if not self.lock_held():
-                return "failed"  # daemon 退出(如 refused)
+                return "failed"
             if self._ready(st):
                 return "running"
             if self._phase_of(st) == "refused":
                 return self._await_lock_release_then_failed()
             if not self._heartbeat_fresh(st):
-                return "failed"  # 中途挂死:本次不误杀,交下次 ensure 接管
+                return "failed"
             self.sleep(_POLL_STEP_S)
         return "failed"
 
@@ -564,7 +702,7 @@ class DaemonSupervisor:
         if not pid or not pstart:
             return "failed"
         if procs.probe_alive(self.prober, int(pid), pstart) != procs.ALIVE:
-            return "failed"  # pid 复用/探测不确定:绝不杀
+            return "failed"
         try:
             self.kill(int(pid), _signal.SIGTERM)
         except OSError:
@@ -578,18 +716,15 @@ class DaemonSupervisor:
         return "recovered" if self._spawn_and_wait() == "started" else "failed"
 
     def _spawn_and_wait(self):
-        baseline = self._gen_of(self.read_state())  # r5-M1:spawn 前记 baseline generation
+        baseline = self._gen_of(self.read_state())
         self.spawn()
-        # 等待上限覆盖新 daemon 的 record_identity + gate.startup 探测最坏(probe)+ 拉起余量。
         steps = int((self.wait_s + self.probe_wait_s) / _POLL_STEP_S) + 1
         for _ in range(steps):
             self.sleep(_POLL_STEP_S)
             st = self.read_state()
             gen = self._gen_of(st)
-            # r5-M1:只承认**新代**(gen != baseline)就绪;旧代完整对齐(gen==baseline)一律不算。
             if self.lock_held() and self._ready(st) and gen != baseline:
                 return "started"
-            # 新代明确 refused → 失败(不再空等到超时;bind 不会继续)
             if self.lock_held() and gen != baseline and self._phase_of(st) == "refused":
                 return "failed"
         return "failed"
@@ -637,40 +772,30 @@ def ensure_daemon(wait_s=12, spawn=True):
     sup = DaemonSupervisor(
         lock_held=daemon_lock_held, read_state=_read_daemon_state,
         spawn=_spawn_daemon, kill=os.kill, prober=procs.SystemProber(),
-        now_ms=lambda: int(time.time() * 1000),          # 墙钟:心跳/state_ready(DB 时间戳)
-        mono_ms=lambda: int(time.monotonic() * 1000),    # 单调钟:等待 deadline(免疫墙钟跳变)
+        now_ms=lambda: int(time.time() * 1000),
+        mono_ms=lambda: int(time.monotonic() * 1000),
         sleep=time.sleep, wait_s=wait_s,
         singleflight=_FlockSingleflight(paths.ensure_lock_path()))
     return sup.ensure()
 
 
-# ---------------------------------------------------------------- bind 前置:code-identity 串行检查(MAJOR 3 换层)
+# ---------------------------------------------------------------- bind 前置:code-identity 串行检查
 def reconcile_code_identity(*, my_identity, read_state, lock_held, prober, kill,
                             ensure, sleep, wait_s=12):
-    """bind 前置**串行**检查(不在 supervisor 并发层):读 daemon_state.daemon_code_identity,
-    与本 CLI code_identity_str() 比。**fail-closed 不变式**:reconcile 成功返回(无 `error`)⟹
-    「identity 已匹配」或「本版本新 daemon 已(重新)拉起」二者之一 —— 绝不在 identity 不一致时放行
-    用旧代码 bind。cmd_bind 见 `error` → 不建 pending_bind、exit 非0。
-    返回 {restarted, reason, old?, new, state?, error?}。
-    两个不同 identity 的 CLI 并发 bind 的严格串行化 = 已知限制🅒(极罕见,不在此层处理);
-    read→SIGTERM 间的 probe→kill 微小窗口不可原子消除(同上,不加复杂度)。"""
+    """bind 前置**串行**检查:读 daemon_state.daemon_code_identity,与本 CLI code_identity_str() 比。
+    **fail-closed 不变式**:reconcile 成功返回(无 `error`)⟹「identity 已匹配」或「本版本新 daemon 已
+    (重新)拉起」二者之一 —— 绝不在 identity 不一致时放行用旧代码 bind。"""
     if not lock_held():
-        # 无 daemon(或刚退出)→ 拉本版本的 → identity 从此为本版本(满足不变式)
         return {"restarted": True, "reason": "no-daemon-respawn", "new": my_identity,
                 "state": ensure()}
     st = read_state() or {}
     recorded = st.get("daemon_code_identity")
     if recorded == my_identity:
         return {"restarted": False, "reason": "match", "new": my_identity}
-    # 不一致(含 read_state 失败使 recorded=None):尝试**安全**重启旧 daemon
     pid, pstart = st.get("daemon_pid"), st.get("daemon_proc_start")
-    # 只在 pid+start 齐全**且**探测确定存活时才杀(缺 start / 已死 / 复用 / probe UNKNOWN 都不杀)
     can_kill = bool(pid) and bool(pstart) \
         and procs.probe_alive(prober, int(pid), pstart) == procs.ALIVE
     if not can_kill:
-        # 无法安全定位/终止旧 daemon:
-        #   锁已释放(旧 daemon 自行退出)→ 拉本版本新的(满足不变式);
-        #   锁仍持有(旧代码 daemon 还在)→ **fail-closed**:返回 error,绝不放行 bind。
         if not lock_held():
             return {"restarted": True, "reason": "respawned-daemon-gone",
                     "old": recorded, "new": my_identity, "state": ensure()}
@@ -692,11 +817,10 @@ def reconcile_code_identity(*, my_identity, read_state, lock_held, prober, kill,
         return {"restarted": False, "reason": "no-exit", "old": recorded, "new": my_identity,
                 "error": "旧 daemon SIGTERM 后未退出(flock 未释放);请手动停止旧 daemon 后重试(见 README)"}
     return {"restarted": True, "reason": "restarted", "old": recorded, "new": my_identity,
-            "state": ensure()}  # 无 daemon 了 → 拉本版本的新 daemon
+            "state": ensure()}
 
 
 def reconcile_daemon_code_identity(wait_s=12):
-    """生产装配:reconcile_code_identity 注入真实依赖。"""
     from . import version as versionmod
     return reconcile_code_identity(
         my_identity=versionmod.code_identity_str(),
@@ -705,32 +829,76 @@ def reconcile_daemon_code_identity(wait_s=12):
         sleep=time.sleep, wait_s=wait_s)
 
 
-# ---------------------------------------------------------------- doctor(显式诊断例外,I2)
-def doctor(runner, chat_id, clock, cfg=None):
-    """真发送+撤回自检;独立 opt-in 工具,不在运行时路径。外发 message_id 落返回值。
-    修复项1:自检通过 = 当前 CLI 版本契约已验证 → 若与 config.cli_version 不符,重钉版本
-    (写盘;daemon 的 FingerprintGate 重探读盘后自动放行)。"""
-    key = f"doctor:{util.new_id()}"
-    res = runner.run(["im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
-                      "--text", f"feishu-bridge doctor 自检 {clock.wall_ms()}(即将撤回)",
-                      "--idempotency-key", key], timeout_s=30)
-    env = runner_mod.parse_result(res)  # E4a:stderr 信封回退
-    if not runner_mod.envelope_ok(env):
-        return {"ok": False, "step": "send", "detail": (res.stdout or res.stderr or "")[:400]}
-    mid = runner_mod.data_of(env).get("message_id")
-    if not mid:
-        return {"ok": False, "step": "send", "detail": "no message_id"}
-    rc = runner.run(["api", "DELETE", f"/open-apis/im/v1/messages/{mid}", "--as", "bot"],
-                    timeout_s=30)
-    rc_env = runner_mod.parse_result(rc)
-    recalled = runner_mod.envelope_ok(rc_env)
-    out = {"ok": recalled, "step": "recall", "message_id": mid, "recalled": recalled}
-    if recalled and cfg:
-        from . import fingerprint as fp
-        actual = fp.probe_cli_version(runner)
-        if actual and actual != cfg.get("cli_version"):
-            new_cfg = dict(cfg)
-            new_cfg["cli_version"] = actual
-            configmod.save_config(new_cfg)
-            out["repinned_cli_version"] = actual
-    return out
+# ---------------------------------------------------------------- probe / doctor(显式诊断例外,I2)
+_PROBE_MOD = None
+
+
+def load_probe_module():
+    """scripts/capability_probe.py 不是包:按路径 import 一次并缓存。"""
+    global _PROBE_MOD
+    if _PROBE_MOD is None:
+        p = paths.pkg_root() / "scripts" / "capability_probe.py"
+        spec = importlib.util.spec_from_file_location("slack_bridge_capability_probe", str(p))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PROBE_MOD = mod
+    return _PROBE_MOD
+
+
+def default_probe_client_factory(tokens, version, cooldown_store):
+    return SlackClient(token=tokens["bot_token"], cooldown_store=cooldown_store,
+                       timeout_s=constants.SEND_TIMEOUT_S, tokens_version=version)
+
+
+def doctor(chat_id, *, cfg=None, client_factory=None, write_config=False, conn=None):
+    """doctor = capability probe(scripts/capability_probe.run_probe,真发两条并删除)+ daemon 健康。
+    需要 token(文件或 env),**不需要 daemon 在跑**;不受 outbound_gate 版本门约束,但遵守方法级冷却
+    (bridge.db 存在时用 daemon_state 冷却存储)。→ {"ok", "probe", "daemon", "written"?}。
+    绝不含 token。"""
+    probe = load_probe_module()
+    if cfg is None:
+        cfg = configmod.ConfigSnapshot.load()
+    tokens, version = configmod.load_tokens()
+    own_conn = None
+    if conn is None:
+        dbf = paths.db_path()
+        if dbf.exists() or write_config:
+            paths.ensure_data_dir()
+            own_conn = db.connect(dbf)
+            db.init_schema(own_conn, paths.schema_path())
+            conn = own_conn
+    try:
+        store = DaemonStateCooldownStore(conn) if conn is not None else InMemoryCooldownStore()
+        factory = client_factory or default_probe_client_factory
+        client = factory(tokens, version, store)
+        result = probe.run_probe(client, cfg, chat_id, version)
+        written = None
+        if write_config and conn is not None:
+            written = probe.write_results(result, cfg, conn)
+        daemon = {"lock_held": daemon_lock_held(), "healthy": False,
+                  "outbound_gate": None, "outbound_gate_tokens_version": None,
+                  "verify_capability": None, "verify_capability_tokens_version": None,
+                  "tokens_version_current": version}
+        if conn is not None:
+            daemon["healthy"] = daemon_healthy(conn)
+            daemon["outbound_gate"] = db.get_state(conn, constants.GATE_KEY)
+            daemon["outbound_gate_tokens_version"] = db.get_state(conn, constants.GATE_VERSION_KEY)
+            daemon["verify_capability"] = db.get_state(conn, constants.VERIFY_CAPABILITY_KEY)
+            daemon["verify_capability_tokens_version"] = db.get_state(
+                conn, constants.VERIFY_CAPABILITY_VERSION_KEY)
+        ok = bool(result.get("identity_ok") and result.get("complete")
+                  and result.get("verify_capability") == constants.VERIFY_CAP_OK
+                  and result.get("cleanup_ok"))
+        out = {"ok": ok, "probe": result, "daemon": daemon}
+        if written is not None:
+            out["written"] = written
+        if not result.get("identity_ok"):
+            out["error"] = "身份不符或 auth.test 失败:未发送、未导入"
+        elif not result.get("complete"):
+            out["error"] = "探测未完成(API 失败/冷却):见 probe.errors"
+        elif not daemon["healthy"]:
+            out["note"] = "daemon 未在跑(probe 本身不需要它);bind 前跑 ensure-daemon"
+        return out
+    finally:
+        if own_conn is not None:
+            own_conn.close()
