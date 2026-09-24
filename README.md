@@ -57,7 +57,7 @@ Slack ──Socket Mode WS── bin/slack_consumer.py(daemon 子进程;slack_sd
 
 1. [api.slack.com/apps](https://api.slack.com/apps) → **Create New App → From an app manifest** → 选 workspace →
    粘贴 [`docs/slack-app-manifest.json`](docs/slack-app-manifest.json)(已含全部 bot scopes、事件订阅、Interactivity、
-   Socket Mode、Messages tab)。
+   Socket Mode、Messages tab)。已装过旧版 manifest 的 app 想用 `sendfilectl` 发文件,需在 OAuth & Permissions 里补 `files:write` 并 **Reinstall**(实测 bot token 不变)。
 2. **Install to Workspace** → 复制 **Bot User OAuth Token**(`xoxb-…`)。
 3. **Basic Information → App-Level Tokens → Generate**,scope `connections:write` → 复制(`xapp-…`)。
    Socket Mode 靠它连接;没有它收不到任何消息。
