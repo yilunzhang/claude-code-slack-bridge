@@ -84,6 +84,15 @@ IDEMPOTENT_CAP = 3               # chat.update / reactions.add
 
 # 传输形态分类(op_method 决定类别;decision_notice 二选一由 op_for 决定)
 POSTMESSAGE_METHODS = ("chat.postMessage",)
+# 请求体形态(真机确证 2026-09-24):Slack 读类方法(conversations.replies 等)**不接受**
+# application/json 请求体(返回 invalid_arguments:missing required field channel/ts),只认
+# application/x-www-form-urlencoded / 查询串;写类方法两者都收。SlackClient.call 只对下列方法发 JSON,
+# 其余一律表单编码(bool → "true"/"false",dict/list → JSON 字符串)。
+JSON_BODY_METHODS = frozenset({
+    "chat.postMessage", "chat.update", "chat.delete", "chat.postEphemeral",
+    "reactions.add", "reactions.remove", "conversations.open",
+    "views.open", "views.update", "views.push", "views.publish",
+})
 IDEMPOTENT_METHODS = ("chat.update", "reactions.add")
 METADATA_EVENT_TYPE = "slack_bridge"          # metadata.event_type;event_payload = {"job_id": …}
 RECEIPT_REACTION = "eyes"                     # 👀

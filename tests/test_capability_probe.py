@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import urllib.parse
 import os
 import pathlib
 import urllib.error
@@ -220,7 +221,15 @@ class _SlackSim:
 
     def __call__(self, req, timeout_s):
         method = req.full_url.rsplit("/", 1)[1]
-        params = json.loads(req.data.decode("utf-8"))
+        ctype = req.get_header("Content-type") or ""
+        if ctype.startswith("application/json"):
+            # 真机事实(2026-09-24):读类方法不接受 JSON 请求体 → invalid_arguments(缺 channel/ts)
+            if method in ("conversations.history", "conversations.replies", "conversations.list"):
+                return _Resp({"ok": False, "error": "invalid_arguments",
+                              "response_metadata": {"messages": ["[ERROR] missing required field: channel"]}})
+            params = json.loads(req.data.decode("utf-8"))
+        else:
+            params = dict(urllib.parse.parse_qsl(req.data.decode("utf-8")))
         self.requests.append((method, params, req.get_header("Authorization")))
         if method == "auth.test":
             return _Resp(dict(self.auth, ok=True))

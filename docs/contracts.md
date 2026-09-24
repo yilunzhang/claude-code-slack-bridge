@@ -401,6 +401,13 @@ ListenerCore(...) / InstanceFollower(...)                          # 不变
 
 ## 12. 实现偏差记录(WP5 汇总;正文不改,偏差只在此登记)
 
+- **2026-09-24 真机偏差(传输层)**:Slack 读类方法(`conversations.replies` 实测;`conversations.list`
+  等同类方法按官方说明同样)不接受 `application/json` 请求体,返回 `invalid_arguments`(缺 channel/ts)。
+  `SlackClient.call` 改为:仅 `constants.JSON_BODY_METHODS` 发 JSON,其余方法表单编码(`slackapi.encode_body`
+  / `form_fields`:bool → `true`/`false`,None 省略,dict/list → JSON 字符串)。对本契约的影响:§2.5 核验
+  (`conversations.history` / `conversations.replies`)语义不变,只是线路编码;fake 服务端(`tests/test_capability_probe.py`)
+  对读类方法的 JSON body 复现 `invalid_arguments`,防止回退。
+
 各工作包报告的、与上文冻结文本或 plan 原文有出入但已被守卫测试接受的实现选择。改动语义前先看这里。
 
 | WP | 偏差 | 现状 / 理由 |

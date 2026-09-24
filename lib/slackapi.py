@@ -136,6 +136,32 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect())
 
 
+def form_fields(params):
+    """表单编码字段(读类方法):bool → "true"/"false";None 省略;dict/list → JSON 字符串;其余 str()。"""
+    out = []
+    for k, v in (params or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            v = "true" if v else "false"
+        elif isinstance(v, (dict, list, tuple)):
+            v = json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+        else:
+            v = str(v)
+        out.append((str(k), v))
+    return out
+
+
+def encode_body(method, params):
+    """按方法选请求体形态(constants.JSON_BODY_METHODS 之外一律表单;真机事实见 constants 注释)。
+    返回 (bytes, content_type)。"""
+    if method in constants.JSON_BODY_METHODS:
+        return (json.dumps(params or {}, ensure_ascii=False).encode("utf-8"),
+                "application/json; charset=utf-8")
+    return (urllib.parse.urlencode(form_fields(params)).encode("utf-8"),
+            "application/x-www-form-urlencoded; charset=utf-8")
+
+
 def _open(req, timeout_s):
     """真实网络入口(测试 monkeypatch 此函数)。"""
     return _OPENER.open(req, timeout=timeout_s)
@@ -245,12 +271,12 @@ class SlackClient:
             return CallResult(ok=False, error="cooldown", cooldown_until=int(until))
         if not self._token:
             return CallResult(ok=False, error="no_token", not_sent=True)
-        body = json.dumps(params or {}, ensure_ascii=False).encode("utf-8")
+        body, content_type = encode_body(method, params)
         req = urllib.request.Request(
             urllib.parse.urljoin(self.base_url, method), data=body, method="POST",
             headers={
                 "Authorization": "Bearer " + self._token,
-                "Content-Type": "application/json; charset=utf-8",
+                "Content-Type": content_type,
                 "User-Agent": USER_AGENT,
             })
         to = self.timeout_s if timeout_s is None else timeout_s

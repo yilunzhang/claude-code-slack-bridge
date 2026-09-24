@@ -92,6 +92,38 @@ def test_request_shape_post_json_bearer(net):
     assert json.loads(req.data.decode("utf-8")) == {"channel": "C1", "text": "héllo"}
 
 
+def test_request_shape_read_methods_form_encoded(net):
+    """真机事实(2026-09-24,workspace T0EXAMPLE):`conversations.replies` 对 application/json 请求体返回
+    `invalid_arguments`(response_metadata: missing required field channel/ts),表单编码 / 查询串正常;
+    `conversations.history` 两种都收。故 JSON_BODY_METHODS 之外的方法一律表单编码,bool 写成 true/false,
+    嵌套值写成 JSON 字符串;写类方法(chat.postMessage 等)保持 JSON。"""
+    import urllib.parse
+    n = net(_Resp(200, {"ok": True, "messages": []}), _Resp(200, {"ok": True, "messages": []}),
+            _Resp(200, {"ok": True}))
+    c = mk()
+    assert c.call("conversations.replies", {"channel": "C1", "ts": "1.1", "include_all_metadata": True,
+                                            "limit": 100, "cursor": None}).ok
+    req, _ = n.requests[0]
+    assert req.get_header("Content-type").startswith("application/x-www-form-urlencoded")
+    assert dict(urllib.parse.parse_qsl(req.data.decode("utf-8"))) == {
+        "channel": "C1", "ts": "1.1", "include_all_metadata": "true", "limit": "100"}
+    assert c.call("conversations.history", {"channel": "C1", "oldest": "1.0", "inclusive": False,
+                                            "meta": {"a": 1}}).ok
+    req, _ = n.requests[1]
+    assert req.get_header("Content-type").startswith("application/x-www-form-urlencoded")
+    assert dict(urllib.parse.parse_qsl(req.data.decode("utf-8"))) == {
+        "channel": "C1", "oldest": "1.0", "inclusive": "false", "meta": '{"a":1}'}
+    assert c.call("chat.update", {"channel": "C1", "ts": "1.1", "blocks": [{"type": "divider"}]}).ok
+    req, _ = n.requests[2]
+    assert req.get_header("Content-type").startswith("application/json")
+    assert json.loads(req.data.decode("utf-8"))["blocks"] == [{"type": "divider"}]
+    for m in ("chat.postMessage", "chat.update", "chat.delete", "reactions.add", "conversations.open"):
+        assert m in constants.JSON_BODY_METHODS
+    for m in ("conversations.replies", "conversations.history", "conversations.list", "auth.test",
+              "bots.info", "users.lookupByEmail"):
+        assert m not in constants.JSON_BODY_METHODS
+
+
 def test_default_timeout_and_no_token(net):
     n = net(_Resp(200, {"ok": True}))
     c = mk(timeout_s=3)
