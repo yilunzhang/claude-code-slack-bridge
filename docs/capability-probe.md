@@ -5,7 +5,7 @@
 > 不受 `outbound_gate` 版本门约束,但**遵守方法级冷却**(`daemon_state.cooldown:<method>`)。
 > 探测会在测试频道发两条消息(顶层 + 线程)并随即 `chat.delete`;失败时可能残留,需手动清理。
 
-## 结论摘要(2026-09-24 真机确证,workspace T0EXAMPLE / app A0EXAMPLE)
+## 结论摘要(2026-09-24 真机确证;下文 id 均为占位符)
 
 | 能力 | 结果 | 依据 |
 |---|---|---|
@@ -24,7 +24,7 @@
 
 | 日期 | 运行者 | workspace | tokens_version | 原始 JSON |
 |---|---|---|---|---|
-| 2026-09-24 | Claude(用户浏览器建 app)| T0EXAMPLE,测试频道 C0EXAMPLE | `<mtime_ns>:<sha256[:16]>` | `{"identity_ok": true, "markdown_text_ok": true, "metadata_history": true, "metadata_replies": true, "cleanup_ok": true, "tokens_version": "<mtime_ns>:<sha256[:16]>", "markdown_mode": "markdown_text", "verify_capability": "ok", "chat_id": "C0EXAMPLE", "probe_id": "510b39878e40", "complete": true, "errors": [], "written": {"markdown_mode": "markdown_text", "verify_capability": "ok", "verify_capability_tokens_version": "<mtime_ns>:<sha256[:16]>"}}` |
+| 2026-09-24 | Claude(用户浏览器建 app)| 真实 workspace(id 已脱敏),测试频道 C0EXAMPLE | `<mtime_ns>:<sha256[:16]>` | `{"identity_ok": true, "markdown_text_ok": true, "metadata_history": true, "metadata_replies": true, "cleanup_ok": true, "tokens_version": "<mtime_ns>:<sha256[:16]>", "markdown_mode": "markdown_text", "verify_capability": "ok", "chat_id": "C0EXAMPLE", "probe_id": "510b39878e40", "complete": true, "errors": [], "written": {"markdown_mode": "markdown_text", "verify_capability": "ok", "verify_capability_tokens_version": "<mtime_ns>:<sha256[:16]>"}}` |
 | 2026-09-24(修复前) | 同上 | 同上 | 同上 | `metadata_replies=null, errors=["conversations.replies:failed:invalid_arguments"], complete=false` —— 见下「真机发现」 |
 
 ## 真机发现(2026-09-24)

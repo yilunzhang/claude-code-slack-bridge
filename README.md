@@ -7,7 +7,7 @@
 启动 Claude Code 不需要任何特殊参数。
 
 > **状态**:v0.1.0 —— 离线测试全绿(`python3` / `python3.9` 全量 + `.venv-test` 真实 slack_sdk 运行层契约),
-> **真机验证(2026-09-24,一个真实 Slack workspace,app `slack-bridge` A0EXAMPLE)已跑通主路径**:
+> **真机验证(2026-09-24,在一个真实 Slack workspace 上)已跑通主路径**:
 > bootstrap / probe(全部能力 CONFIRMED)/ open-dm / ensure-daemon / bind → ✅ 已绑定 / 频道 `@bot` 单次投递 + 👀
 > (`message`+`app_mention` 双投去重)/ 不 @ 不投递 / 附件下载并投递 / >12000 字分块 / notify @owner /
 > `chat_busy` / consumer 暂停后恢复恰一次投递 / consumer 被杀后 2 秒内重拉 / unbind+rebind / owner DM 无需 @ 且
