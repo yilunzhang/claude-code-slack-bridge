@@ -62,7 +62,7 @@ Slack ──Socket Mode WS── bin/slack_consumer.py(daemon 子进程;slack_sd
 3. **Basic Information → App-Level Tokens → Generate**,scope `connections:write` → 复制(`xapp-…`)。
    Socket Mode 靠它连接;没有它收不到任何消息。
 4. 同页记下 **App ID**(`A…`);`bootstrap` 一般能经 `bots.info` 自动取到,取不到时用 `--app-id` 补。
-5. 在每个要绑的频道里 `/invite @slack-bridge`(bot 不在频道 = 收不到、发不出)。DM 不用邀请。
+5. 在每个要绑的频道里 `/invite @cc`(bot 的 @名由 manifest 的 `features.bot_user.display_name` 决定,默认 `cc`;bot 不在频道 = 收不到、发不出)。DM 不用邀请。
 6. owner 的 user id(`U…`):Slack 个人资料 → ⋯ → Copy member ID;或用 `--owner-email`(manifest 已带
    `users:read.email`)。
 
@@ -109,7 +109,7 @@ python3 …/bridgectl.py probe --chat-id C0TESTCHAN --write-config
 `preflight` → `chats`(或 `open-dm`)让你选会话 → `bind --chat-id … --chat-name …` → 等 listener 认领 → 在回复里
 放 marker 触发 Stop hook 握手 → daemon 往会话发「✅ 已绑定」。之后:
 
-- 频道里 `@slack-bridge 你的指令`(DM 直接发)→ 投递进 session;bot 会先加 👀 表情作为回执。
+- 频道里 `@cc 你的指令`(DM 直接发)→ 投递进 session;bot 会先加 👀 表情作为回执。
 - session 每 turn 的最终输出自动转发回会话(超长自动分块;末块带 `🧠 上下文 · 模型 · effort` 页脚)。
 - 非 owner 的消息 → 会话里出现审批卡(线程内),owner 点「投递给 session」或「忽略」;带附件的批准会先显示
   「已批准,附件处理中」再「已投递」。owner 可让 agent 把某人加入直投白名单(`bridgectl allow add --chat-id C… --user-id U…`)。

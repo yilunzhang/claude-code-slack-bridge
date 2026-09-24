@@ -1,5 +1,5 @@
 {
-  "_comment": "slack-bridge Slack app manifest(plan R2)。在 api.slack.com/apps → Create New App → From an app manifest 粘贴。安装后:bot token(xoxb-)与 app-level token(xapp-,scope connections:write)只经 env/stdin 交给 bridgectl bootstrap,绝不进对话。",
+  "_comment": "bot 的 @名(features.bot_user.display_name)默认 cc,可按喜好改;app 名仍为 slack-bridge。slack-bridge Slack app manifest(plan R2)。在 api.slack.com/apps → Create New App → From an app manifest 粘贴。安装后:bot token(xoxb-)与 app-level token(xapp-,scope connections:write)只经 env/stdin 交给 bridgectl bootstrap,绝不进对话。",
   "display_information": {
     "name": "slack-bridge",
     "description": "Bind a local Claude Code session to a Slack channel or DM (build-in-public bridge).",
@@ -12,7 +12,7 @@
       "messages_tab_read_only_enabled": false
     },
     "bot_user": {
-      "display_name": "slack-bridge",
+      "display_name": "cc",
       "always_online": false
     }
   },

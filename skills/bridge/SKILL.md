@@ -40,7 +40,7 @@ hooks(Stop/SessionEnd/StopFailure)由 plugin 的 `hooks/hooks.json` **自带**�
    python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" chats
    ```
    `chats[]` 每项 `{chat_id, name, type∈public_channel|private_channel|owner_dm, is_member}`(owner_dm 那条另带 `is_pinned_owner_dm`)。把列表给用户选(此时可用 AskUserQuestion —— 尚未绑定)。
-   - **频道只列 bot 已是成员的**。"不在列表里"≠"频道不存在":让用户在 Slack 里 `/invite @slack-bridge` 到那个频道后重跑 `chats`。**不要自己建频道**(v1 不支持,也别用别的工具建)。
+   - **频道只列 bot 已是成员的**。"不在列表里"≠"频道不存在":让用户在 Slack 里 `/invite @cc`(bot 的 @名,见 config 的 `bot_name`)到那个频道后重跑 `chats`。**不要自己建频道**(v1 不支持,也别用别的工具建)。
    - 想绑 DM:用 **owner DM**(列表里 `type=owner_dm` 的那条)。**`chats` 只是列出来,不会钉住 `owner_dm_id`**——
      看那条的 `is_pinned_owner_dm`:`false`(或列表里根本没有 owner DM)→ **先跑**
      ```bash
