@@ -1,0 +1,55 @@
+{
+  "_source": "real Socket Mode events_api envelope payload from the owner DM, ids anonymized (2026-09-24)",
+  "_order_seen": 6,
+  "envelope_type": "events_api",
+  "event_key": "ev:Ev0REAL6",
+  "chat_id": "D0REAL",
+  "payload": {
+    "token": "FRwVvpNjvHUOj9vSXi3OO5Wa",
+    "team_id": "T0REAL",
+    "context_team_id": "T0REAL",
+    "context_enterprise_id": null,
+    "api_app_id": "A0APP",
+    "event": {
+      "type": "message",
+      "user": "U0OWNER",
+      "ts": "1790238465.821389",
+      "text": "DM test without any mention: reply with exactly DM-OK",
+      "team": "T0REAL",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "w84",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "DM test without any mention: reply with exactly DM-OK"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "channel": "D0REAL",
+      "event_ts": "1790238465.821389",
+      "channel_type": "im"
+    },
+    "type": "event_callback",
+    "event_id": "Ev0REAL6",
+    "event_time": 1790238465,
+    "authorizations": [
+      {
+        "enterprise_id": null,
+        "team_id": "T0REAL",
+        "user_id": "U0BOT",
+        "is_bot": true,
+        "is_enterprise_install": false
+      }
+    ],
+    "is_ext_shared_channel": false,
+    "event_context": "4-eyJldCI6Im1lc3NhZ2UiLCJ0aWQiOiJUMUFVOVVFVEIiLCJhaWQiOiJBMEM0ODZWQzYwNCIsImNpZCI6IkQwQzRZVVQ1TVI2In0"
+  }
+}

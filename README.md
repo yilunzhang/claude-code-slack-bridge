@@ -7,7 +7,13 @@
 启动 Claude Code 不需要任何特殊参数。
 
 > **状态**:v0.1.0 —— 离线测试全绿(`python3` / `python3.9` 全量 + `.venv-test` 真实 slack_sdk 运行层契约),
-> **真机验证清单(文末)尚未跑**,真机能力探测结果 `docs/capability-probe.md` 仍为 UNCONFIRMED。
+> **真机验证(2026-09-24,一个真实 Slack workspace,app `slack-bridge` A0EXAMPLE)已跑通主路径**:
+> bootstrap / probe(全部能力 CONFIRMED)/ open-dm / ensure-daemon / bind → ✅ 已绑定 / 频道 `@bot` 单次投递 + 👀
+> (`message`+`app_mention` 双投去重)/ 不 @ 不投递 / 附件下载并投递 / >12000 字分块 / notify @owner /
+> `chat_busy` / consumer 暂停后恢复恰一次投递 / consumer 被杀后 2 秒内重拉 / unbind+rebind / owner DM 无需 @ 且
+> bot 自身回流被丢弃。真机发现并修复:读类方法必须表单编码(见 `docs/capability-probe.md`)。
+> **未跑**(需要第二个成员账号或破坏性操作):成员审批卡 / 撤销 token / 换 xapp / 人为 429 / 第二个 session 并行绑定。
+> 脱敏真机样本在 `tests/fixtures/real/`,回放测试 `tests/test_real_fixtures.py`。
 > 跨模块语义冻结在 [`docs/contracts.md`](docs/contracts.md)(末尾附各工作包的实现偏差记录);开发/测试约定见
 > [`docs/dev.md`](docs/dev.md)。
 

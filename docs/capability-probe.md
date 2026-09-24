@@ -44,9 +44,9 @@
 
 - [x] `markdown_text` 对 bot token 可用(2026-09-24 真机)。
 - [x] `metadata.event_type` 不需要预先声明 schema:自定义 `slack_bridge` + `event_payload.job_id` 直接可发、可读回(2026-09-24)。
-- [ ] `conversations.history` 的 `include_all_metadata` 对 `im`(D…)是否同样返回 metadata。
+- [ ] `conversations.history` 的 `include_all_metadata` 对 `im`(D…)是否同样返回 metadata(DM 绑定的回复均一次 `sent`,未触发核验路径,未单独验证)。
 - [x] `conversations.replies` 返回父消息 + 回复,回复的 metadata 可读回(2026-09-24;父消息是否带 metadata 未单独核对,核验不依赖)。
 - [ ] 429 时 `Retry-After` 头的实际取值范围(影响 `cooldown:<method>` 时长)。
-- [ ] 频道 `@bot` 是否恰好双投(`message` + `app_mention`,同 `ts`),files/blocks 是否只在 `message` 上
-      → 保存脱敏样本到 `tests/fixtures/real/`。
-- [ ] DM 内 bot 自身消息是否回流为 `message`(带 `bot_id`/`app_id`)→ `is_self_event` 三组比较是否够。
+- [x] 频道 `@bot` 恰好双投(`message` 先、`app_mention` 后,同 `ts`,不同 `event_id`);带附件时**两者都带 `files[]`**;
+      样本已存 `tests/fixtures/real/`(2026-09-24)。
+- [x] DM 内 bot 自身消息回流为 `message`,带 `bot_id`、`app_id` 且 `user`=bot user id → 三组比较足够(`event_dropped_self`);owner DM 消息无需 @ 即投递(2026-09-24)。

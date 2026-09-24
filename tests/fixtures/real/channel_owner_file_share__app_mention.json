@@ -1,0 +1,95 @@
+{
+  "_source": "real Socket Mode events_api envelope payload with a file upload, ids/urls anonymized, file previews nulled (2026-09-24)",
+  "_order_seen": 5,
+  "envelope_type": "events_api",
+  "event_key": "ev:Ev0REAL5",
+  "chat_id": "C0REAL",
+  "payload": {
+    "token": "FRwVvpNjvHUOj9vSXi3OO5Wa",
+    "team_id": "T0REAL",
+    "api_app_id": "A0APP",
+    "event": {
+      "type": "app_mention",
+      "text": "<@U0BOT> here is a file; tell me the secret word inside it",
+      "files": [
+        {
+          "id": "F0REAL",
+          "created": 1790237871,
+          "timestamp": 1790237871,
+          "mimetype": "text/plain",
+          "filetype": "text",
+          "pretty_type": "Plain Text",
+          "user": "U0OWNER",
+          "user_team": "T0REAL",
+          "editable": true,
+          "size": 64,
+          "mode": "snippet",
+          "is_external": false,
+          "external_type": "",
+          "is_public": true,
+          "public_url_shared": false,
+          "display_as_bot": false,
+          "username": "",
+          "name": "bridge-test.txt",
+          "title": "bridge-test.txt",
+          "is_modified_by_ai": false,
+          "url_private": "https://files.slack.com/files-pri/T0REAL-F0REAL/bridge-test.txt",
+          "url_private_download": "https://files.slack.com/files-pri/T0REAL-F0REAL/bridge-test.txt",
+          "permalink": "https://example-team.slack.com/files/U0OWNER/F0REAL/bridge-test.txt",
+          "permalink_public": "https://slack-files.com/T0REAL-F0REAL-a374590a1c",
+          "edit_link": "https://example-team.slack.com/files/U0OWNER/F0REAL/bridge-test.txt",
+          "preview": "slack-bridge attachment test\nline2: the secret word is MANGO-42\n",
+          "preview_highlight": "<div class=\"CodeMirror cm-s-default CodeMirrorServer\">\n<div class=\"CodeMirror-code\">\n<div><pre>slack-bridge attachment test</pre></div>\n<div><pre>line2: the secret word is MANGO-42</pre></div>\n<div><pre></pre></div>\n</div>\n</div>\n",
+          "lines": 3,
+          "lines_more": 0,
+          "preview_is_truncated": false,
+          "is_starred": false,
+          "skipped_shares": true,
+          "has_rich_preview": false,
+          "file_access": "visible"
+        }
+      ],
+      "upload": true,
+      "user": "U0OWNER",
+      "display_as_bot": false,
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "89D04",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "user",
+                  "user_id": "U0BOT"
+                },
+                {
+                  "type": "text",
+                  "text": " here is a file; tell me the secret word inside it"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "ts": "1790237871.978419",
+      "channel": "C0REAL",
+      "event_ts": "1790237871.978419"
+    },
+    "type": "event_callback",
+    "event_id": "Ev0REAL5",
+    "event_time": 1790237871,
+    "authorizations": [
+      {
+        "enterprise_id": null,
+        "team_id": "T0REAL",
+        "user_id": "U0BOT",
+        "is_bot": true,
+        "is_enterprise_install": false
+      }
+    ],
+    "is_ext_shared_channel": false,
+    "event_context": "4-eyJldCI6ImFwcF9tZW50aW9uIiwidGlkIjoiVDFBVTlVRVRCIiwiYWlkIjoiQTBDNDg2VkM2MDQiLCJjaWQiOiJDMEM0MktRTEhHRSJ9"
+  }
+}

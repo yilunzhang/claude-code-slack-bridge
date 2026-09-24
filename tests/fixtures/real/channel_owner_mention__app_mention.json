@@ -1,0 +1,56 @@
+{
+  "_source": "real Socket Mode events_api envelope payload, workspace/user/channel ids anonymized (2026-09-24)",
+  "_order_seen": 3,
+  "envelope_type": "events_api",
+  "event_key": "ev:Ev0REAL3",
+  "chat_id": "C0REAL",
+  "payload": {
+    "token": "FRwVvpNjvHUOj9vSXi3OO5Wa",
+    "team_id": "T0REAL",
+    "api_app_id": "A0APP",
+    "event": {
+      "type": "app_mention",
+      "user": "U0OWNER",
+      "ts": "1790237755.948599",
+      "text": "<@U0BOT> hi from owner: please reply with exactly the word PONG-1",
+      "team": "T0REAL",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "mYo",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "user",
+                  "user_id": "U0BOT"
+                },
+                {
+                  "type": "text",
+                  "text": " hi from owner: please reply with exactly the word PONG-1"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "channel": "C0REAL",
+      "event_ts": "1790237755.948599"
+    },
+    "type": "event_callback",
+    "event_id": "Ev0REAL3",
+    "event_time": 1790237755,
+    "authorizations": [
+      {
+        "enterprise_id": null,
+        "team_id": "T0REAL",
+        "user_id": "U0BOT",
+        "is_bot": true,
+        "is_enterprise_install": false
+      }
+    ],
+    "is_ext_shared_channel": false,
+    "event_context": "4-eyJldCI6ImFwcF9tZW50aW9uIiwidGlkIjoiVDFBVTlVRVRCIiwiYWlkIjoiQTBDNDg2VkM2MDQiLCJjaWQiOiJDMEM0MktRTEhHRSJ9"
+  }
+}
