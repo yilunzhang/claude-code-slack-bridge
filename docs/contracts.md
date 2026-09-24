@@ -401,6 +401,12 @@ ListenerCore(...) / InstanceFollower(...)                          # 不变
 
 ## 12. 实现偏差记录(WP5 汇总;正文不改,偏差只在此登记)
 
+- **2026-09-24 新增直发例外 `sendfilectl`**(I2 的例外集合扩为 notify / StopFailure / sendfilectl / probe):
+  把本机文件上传并分享到本 session 绑定会话;门与 notify 完全同款,实现上把 `run_notify` 的步骤 2–8c 抽成
+  `notify.open_gated_context`(两者共用,顺序与拒绝原因不变)。传输:`files.getUploadURLExternal` →
+  POST 字节到 upload_url → `files.completeUploadExternal(files,channel_id,initial_comment)`;前两步失败
+  = `sent:false`(文件确定未出现在会话),第三步不确定 = `sent:"unknown"`。大小上限 20MB;token 不进输出。
+
 - **2026-09-24 真机偏差(传输层)**:Slack 读类方法(`conversations.replies` 实测;`conversations.list`
   等同类方法按官方说明同样)不接受 `application/json` 请求体,返回 `invalid_arguments`(缺 channel/ts)。
   `SlackClient.call` 改为:仅 `constants.JSON_BODY_METHODS` 发 JSON,其余方法表单编码(`slackapi.encode_body`

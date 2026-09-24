@@ -137,5 +137,31 @@ python3 "${CLAUDE_SKILL_DIR}/../../bin/bridgectl.py" probe --chat-id <C…> --wr
 - 绑定期间**不要**在回复文本里输出形如 `[slack-bridge-bind:...]` 的字符串(会被 fail-closed 抑制转发)。
 - **notify 正文绝不含 `<!…>`**(`<!channel>` `<!here>` 等广播 mention,会被拒)。
 - 绑定期间**不要用 AskUserQuestion**(选项 UI 不经桥转发,Slack 那头看不到);用纯文本问。
-- 所有 Slack 侧外发(每轮转发/审批卡/通知)都由 daemon 完成;主动直发例外只有 **notify skill** 与 **StopFailure hook**(同款门控)。除本 skill 列出的命令外,别用任何其它方式往 Slack 发消息。
+- 所有 Slack 侧外发(每轮转发/审批卡/通知)都由 daemon 完成;主动直发例外只有 **notify skill**、**sendfilectl(发文件,见下节)** 与 **StopFailure hook**(同款门控)。除本 skill 列出的命令外,别用任何其它方式往 Slack 发消息。
 - 绝不绑别人的 DM;绝不用 `chats` 列表之外的 chat_id 猜着绑。
+
+## 发文件:sendfilectl(受门控的直发例外之三)
+
+把**本机一个文件**上传并分享到**本 session 绑定的会话**(和每轮转发去同一个地方)。用途:报告、日志、截图
+等成果物需要进 Slack 时。桥本身只转发文字,这是唯一合规的发文件途径。
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/../../bin/sendfilectl.py" --path /abs/path/report.html --title "SEO 报告" --comment "一句说明"
+```
+
+- `--path` 必须是**绝对路径**、普通文件、非空,**大小上限 20MB**(`file-too-large` 会拒)。`--title` 缺省 = 文件名。
+- `--comment` 可省;不给时若 stdin 不是终端会把 stdin 当说明(与 notifyctl 的 `< 文件` 惯例一致)。说明里
+  **不能出现 `<!`**(广播 mention 前缀)。
+- 只发给本 session 三元组精确命中的 active 绑定;门与 notify 完全同款:`chat_allowlist`、`outbound_gate=="ok"`、
+  tokens.json 版本 == daemon 已验证版本、方法级冷却。没绑定 → `not-bound`,如实告诉用户。
+- **不要发含密钥/token/内网凭证的文件**;文件进会话后成员都能下载。你永远不接触 token(它只在子进程里读)。
+- 走 Slack 新接口三步:`files.getUploadURLExternal` → 上传字节 → `files.completeUploadExternal`(分享到绑定会话)。
+
+读返回 JSON(`sent` 是主信号):
+- `{"ok":true,"sent":true,"file_id":"F…","chat_id":"C…"}`(exit 0)→ 已分享。
+- `sent:false`(exit 3/4)→ 确定没出现在会话:`invalid-input` / `file-too-large` / `invalid-mention` /
+  `message-too-long`(输入问题);`not-bound`(exit 0);`gate-degraded` / `credentials-unverified` /
+  `chat-not-allowed`(门);`cooldown` / `ratelimited`(带 `retryable:true`,稍后整体重试);
+  `send-failed` / `upload-failed`(看 `stage` ∈ upload-url / upload / complete 与 `error`,如 `not_in_channel` → 让用户 `/invite`)。
+- `{"ok":false,"sent":"unknown","stage":"complete",...}`(exit 5)→ 文件**可能已分享**;让用户看一眼会话再决定是否重发。
+

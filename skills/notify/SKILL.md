@@ -55,4 +55,4 @@ description: 遇到"需要 owner 决策或授权才能继续"的 blocker 时,主
 - 只对**本 session 用三元组(session_id + 进程实例 + active)精确命中的绑定**发;不会误发到别的 session 或旧绑定。
 - 发前尊重与普通桥出站同款的门:`chat_allowlist`、出站身份门(`outbound_gate=="ok"`)、**凭据版本**(`tokens.json` 当前版本必须等于 daemon 验证过的 `outbound_gate_tokens_version`)、方法级冷却。门不通=不发、如实返回。
 - 正文进会话会被成员看到:**不要把密钥/token/内网凭证写进通知正文**。
-- 这是 daemon 唯一发送者之外的**受门控显式直发例外**之一(另一个是 StopFailure API 错误告警 hook,底座同为 `lib/notify.py`);别用任何其它方式往 Slack 发消息。
+- 这是 daemon 唯一发送者之外的**受门控显式直发例外**之一(另两个是 StopFailure API 错误告警 hook 与 `sendfilectl` 发文件,门同为 `lib/notify.py` 的 `open_gated_context`);别用任何其它方式往 Slack 发消息。

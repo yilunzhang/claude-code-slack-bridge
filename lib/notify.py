@@ -95,11 +95,116 @@ def classify_send(res, chat_id):
              "message": "网络/服务端结果不确定,可能已发送,重试前先看会话"}, 5)
 
 
+class GateContext:
+    """open_gated_context 的结果:已打开的 conn(调用方负责 close)+ 本 session 绑定的 chat_id + 凭据快照。"""
+
+    def __init__(self, conn, chat_id, cfg, owner, tokens, file_version, session_id):
+        self.conn = conn
+        self.chat_id = chat_id
+        self.cfg = cfg
+        self.owner = owner
+        self.tokens = tokens
+        self.file_version = file_version
+        self.session_id = session_id
+
+
+def open_gated_context(*, environ, prober, start_pid, secrets):
+    """notify / sendfile 共用的出站门(contracts §0 I2 / §7),顺序固定:
+    session id → config → cc 实例 → db 存在 → schema → 三元组 + active 绑定 → allowlist → tokens 快照
+    → 身份门 + 凭据版本(一条 SELECT 联合读,R1-M4)→ owner 格式 → chat_id 格式。
+    返回 `(ctx, None)`(ctx.conn 已打开,**调用方负责 close**)或 `(None, (obj, exit_code))`(conn 已关)。
+    读到的 token 追加进 `secrets`(供调用方遮蔽异常文本)。ConfigError / SchemaMismatch / 其它异常原样抛出,
+    由调用方统一映射(抛出前 conn 已关)。"""
+    session_id = environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session_id:
+        return None, ({"ok": False, "sent": False, "reason": "session-unresolved",
+                       "detail": "环境缺 CLAUDE_CODE_SESSION_ID,无法锁定本 session"}, 3)
+
+    cfg = configmod.require_config()
+
+    inst = procs.find_cc_instance(prober, start_pid)
+    if inst is None:
+        return None, ({"ok": False, "sent": False, "reason": "instance-unresolved",
+                       "detail": "无法从进程树解析 CC 实例"}, 3)
+    cc_pid, cc_start = inst
+
+    db_file = paths.db_path()
+    if not db_file.exists():
+        return None, ({"ok": False, "sent": False, "reason": "not-bound",
+                       "detail": "本 session 未绑定任何 Slack 会话(无 bridge.db)"}, 0)
+    conn = db.connect(db_file)
+    try:
+        ctx, err = _gate_in_conn(conn, cfg, session_id, cc_pid, cc_start, secrets)
+    except BaseException:
+        conn.close()
+        raise
+    if err is not None:
+        conn.close()
+        return None, err
+    return ctx, None
+
+
+def _gate_in_conn(conn, cfg, session_id, cc_pid, cc_start, secrets):
+    db.check_schema(conn)
+    row = conn.execute(
+        "SELECT chat_id, binding_id FROM bindings "
+        "WHERE session_id=? AND cc_pid=? AND cc_start=? AND status='active'",
+        (session_id, cc_pid, cc_start)).fetchone()
+    if row is None:
+        return None, ({"ok": False, "sent": False, "reason": "not-bound",
+                       "detail": "本 session 未绑定任何 Slack 会话"}, 0)
+    chat_id = row["chat_id"]
+
+    allow = cfg.get("chat_allowlist")
+    if allow is None:
+        pass
+    elif not isinstance(allow, list) or not all(isinstance(x, str) for x in allow):
+        return None, ({"ok": False, "sent": False, "reason": "invalid-config",
+                       "detail": "chat_allowlist 畸形(须为字符串列表)"}, 3)
+    elif allow and chat_id not in allow:
+        return None, ({"ok": False, "sent": False, "reason": "chat-not-allowed",
+                       "detail": "绑定会话不在 chat_allowlist 内"}, 3)
+
+    try:
+        tokens, file_version = configmod.load_tokens(allow_env=False)
+    except configmod.ConfigError as e:
+        return None, ({"ok": False, "sent": False, "reason": "credentials-unverified",
+                       "detail": "tokens.json 不可用:%s" % util.redact_secrets(str(e), secrets)}, 3)
+    secrets.extend(v for v in tokens.values() if isinstance(v, str))
+
+    st = db.get_states(conn, (constants.GATE_KEY, constants.GATE_VERSION_KEY,
+                              constants.TOKENS_VERSION_SEEN_KEY))
+    gate = st.get(constants.GATE_KEY)
+    gate_version = st.get(constants.GATE_VERSION_KEY)
+    if gate != "ok":
+        return None, ({"ok": False, "sent": False, "reason": "gate-degraded",
+                       "detail": "出站身份门非 ok(%r,绑定版本 %r);身份未验证,拒绝直发"
+                                 % (gate, gate_version)}, 3)
+    if not gate_version or gate_version != file_version:
+        return None, ({"ok": False, "sent": False, "reason": "credentials-unverified",
+                       "detail": ("tokens.json 版本与 daemon 已验证版本不一致"
+                                  "(文件 %s ≠ outbound_gate_tokens_version %s);"
+                                  "等 daemon 重验后再试" % (file_version, gate_version))}, 3)
+
+    owner = cfg.get("owner_user_id")
+    if not isinstance(owner, str) or not OWNER_RE.fullmatch(owner):
+        return None, ({"ok": False, "sent": False, "reason": "invalid-owner",
+                       "detail": "owner_user_id 非法(防 @全员/注入)"}, 3)
+
+    if not isinstance(chat_id, str) or not CHAT_RE.fullmatch(chat_id):
+        return None, ({"ok": False, "sent": False, "reason": "invalid-binding",
+                       "detail": "绑定 chat_id 格式非法"}, 3)
+
+    return GateContext(conn, chat_id, cfg, owner, tokens, file_version, session_id), None
+
+
 def run_notify(*, stdin_text, environ, prober, start_pid, make_client):
     """纯逻辑(全依赖注入,零真实网络/进程副作用外呼)→ (obj, exit_code)。
     线性化点 = `may_have_sent`:进 client.call 前所有参数源已校验干净才置位;此后任何未分类异常
     一律 `sent:"unknown"`(绝不降 sent:false 免重复 @);置位前异常 = 确定未发 → internal-error。
-    `make_client(tokens, version, cooldown_store) -> client`(生产 = default_make_client)。"""
+    `make_client(tokens, version, cooldown_store) -> client`(生产 = default_make_client)。
+    出站门(session → 绑定 → allowlist → 凭据版本 → owner/chat)由 `open_gated_context` 提供,
+    与 sendfile 共用同一硬化路径。"""
     may_have_sent = False
     secrets = []   # 已读到的 token(仅用于遮蔽异常文本;R1-M5)
 
@@ -127,100 +232,21 @@ def run_notify(*, stdin_text, environ, prober, start_pid, make_client):
             return ({"ok": False, "sent": False, "reason": "message-too-long",
                      "detail": "正文超过 %d 字符,请精简后重发" % MAX_BODY_CHARS}, 3)
 
-        # 2. session id(锁定"本 session")。
-        session_id = environ.get("CLAUDE_CODE_SESSION_ID")
-        if not session_id:
-            return ({"ok": False, "sent": False, "reason": "session-unresolved",
-                     "detail": "环境缺 CLAUDE_CODE_SESSION_ID,无法锁定本 session"}, 3)
-
-        # 3. config(ConfigError=缺文件/缺 REQUIRED_KEY;malformed JSON/IO 错 → 外层兜 internal-error)。
-        cfg = configmod.require_config()
-
-        # 4. cc 实例(从进程树上溯)。
-        inst = procs.find_cc_instance(prober, start_pid)
-        if inst is None:
-            return ({"ok": False, "sent": False, "reason": "instance-unresolved",
-                     "detail": "无法从进程树解析 CC 实例"}, 3)
-        cc_pid, cc_start = inst
-
-        # 5. db 文件不存在 → not-bound(**connect 前判**——connect 会建空库)。
-        db_file = paths.db_path()
-        if not db_file.exists():
-            return ({"ok": False, "sent": False, "reason": "not-bound",
-                     "detail": "本 session 未绑定任何 Slack 会话(无 bridge.db)"}, 0)
-        conn = db.connect(db_file)
+        # 2–8. 出站门(共用)。
+        ctx, err = open_gated_context(environ=environ, prober=prober, start_pid=start_pid,
+                                      secrets=secrets)
+        if err is not None:
+            return err
         try:
-            # 5b. schema 门(只读;绝不 init_schema 建空库)。
-            db.check_schema(conn)
-            # 6. 三元组 + status='active' 查绑定(session_id ∧ cc_pid ∧ cc_start ∧ active 缺一不可)。
-            row = conn.execute(
-                "SELECT chat_id, binding_id FROM bindings "
-                "WHERE session_id=? AND cc_pid=? AND cc_start=? AND status='active'",
-                (session_id, cc_pid, cc_start)).fetchone()
-            if row is None:
-                return ({"ok": False, "sent": False, "reason": "not-bound",
-                         "detail": "本 session 未绑定任何 Slack 会话"}, 0)
-            chat_id = row["chat_id"]
-
-            # 7. allowlist 重查(**类型优先、后看空值** —— 别写 `if allow:`)。
-            allow = cfg.get("chat_allowlist")
-            if allow is None:
-                pass
-            elif not isinstance(allow, list) or not all(isinstance(x, str) for x in allow):
-                return ({"ok": False, "sent": False, "reason": "invalid-config",
-                         "detail": "chat_allowlist 畸形(须为字符串列表)"}, 3)
-            elif allow and chat_id not in allow:
-                return ({"ok": False, "sent": False, "reason": "chat-not-allowed",
-                         "detail": "绑定会话不在 chat_allowlist 内"}, 3)
-
-            # 8. 凭据快照(contracts §7):**先**读 tokens.json(文件是真相,allow_env=False)——
-            #    之后要发送就用这份快照,门的判定也针对这份快照的版本。
-            try:
-                tokens, file_version = configmod.load_tokens(allow_env=False)
-            except configmod.ConfigError as e:
-                return ({"ok": False, "sent": False, "reason": "credentials-unverified",
-                         "detail": "tokens.json 不可用:%s" % _detail(e)}, 3)
-            secrets.extend(v for v in tokens.values() if isinstance(v, str))
-
-            # 8a. 身份门 + 凭据版本门,**一条 SELECT 同一读快照**联合判定(R1-M4)。
-            #     分两次读会有跨版本拼接竞态:先读到旧版本的 `ok`,随后 token 轮换、daemon 原子写入
-            #     新版本的 `mismatch`,再读到新版本号恰好等于文件版本 → 放行。联合读取后 (gate, version)
-            #     要么同属旧版本(版本 ≠ 文件 → 拒),要么同属新版本(gate 非 ok → 拒)。
-            #     fail-closed,**不给默认值**——缺行也拒。
-            st = db.get_states(conn, (constants.GATE_KEY, constants.GATE_VERSION_KEY,
-                                      constants.TOKENS_VERSION_SEEN_KEY))
-            gate = st.get(constants.GATE_KEY)
-            gate_version = st.get(constants.GATE_VERSION_KEY)
-            if gate != "ok":
-                return ({"ok": False, "sent": False, "reason": "gate-degraded",
-                         "detail": "出站身份门非 ok(%r,绑定版本 %r);身份未验证,拒绝直发"
-                                   % (gate, gate_version)}, 3)
-            if not gate_version or gate_version != file_version:
-                return ({"ok": False, "sent": False, "reason": "credentials-unverified",
-                         "detail": ("tokens.json 版本与 daemon 已验证版本不一致"
-                                    "(文件 %s ≠ outbound_gate_tokens_version %s);"
-                                    "等 daemon 重验后再试" % (file_version, gate_version))}, 3)
-
-            # 8b. owner 校验(防前缀自身 @全员/注入)。
-            owner = cfg.get("owner_user_id")
-            if not isinstance(owner, str) or not OWNER_RE.fullmatch(owner):
-                return ({"ok": False, "sent": False, "reason": "invalid-owner",
-                         "detail": "owner_user_id 非法(防 @全员/注入)"}, 3)
-
-            # 8c. chat_id 格式(bind 不验格式;先拦免错归 unknown)。
-            if not isinstance(chat_id, str) or not CHAT_RE.fullmatch(chat_id):
-                return ({"ok": False, "sent": False, "reason": "invalid-binding",
-                         "detail": "绑定 chat_id 格式非法"}, 3)
-
-            params = build_wire_params(chat_id, owner, msg)
+            params = build_wire_params(ctx.chat_id, ctx.owner, msg)
 
             # 9. 发送(线性化点)。冷却存储 = daemon_state(与 daemon/probe 同一份)。
-            client = make_client(tokens, file_version, DaemonStateCooldownStore(conn))
+            client = make_client(ctx.tokens, ctx.file_version, DaemonStateCooldownStore(ctx.conn))
             may_have_sent = True
             res = client.call("chat.postMessage", params, timeout_s=SEND_TIMEOUT_S)
-            return classify_send(res, chat_id)
+            return classify_send(res, ctx.chat_id)
         finally:
-            conn.close()
+            ctx.conn.close()
     except configmod.ConfigError as e:
         return ({"ok": False, "sent": False, "reason": "config", "detail": _detail(e)}, 3)
     except db.SchemaMismatch as e:

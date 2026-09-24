@@ -33,7 +33,7 @@ Slack ──Socket Mode WS── bin/slack_consumer.py(daemon 子进程;slack_sd
     入站:drain slack_events → inbound / approval → deliveries
     出站:outbound_jobs 状态机 → chat.postMessage / chat.update / reactions.add;结果不确定只核验,最多自动重发一次
     门:FingerprintGate(每 tick stat tokens.json,变了就重验 auth.test;门控结果绑定凭据版本)
-              ▲ hooks:Stop/SessionEnd 只写库;StopFailure 走 notify 直发(同款门控)
+              ▲ hooks:Stop/SessionEnd 只写库;StopFailure / notify / sendfilectl 直发(同款门控)
               ▼ listener(plugin monitor,跟随本 CC 实例)领取 deliveries → NDJSON 进 session
 ```
 
@@ -114,6 +114,8 @@ python3 …/bridgectl.py probe --chat-id C0TESTCHAN --write-config
 - 非 owner 的消息 → 会话里出现审批卡(线程内),owner 点「投递给 session」或「忽略」;带附件的批准会先显示
   「已批准,附件处理中」再「已投递」。owner 可让 agent 把某人加入直投白名单(`bridgectl allow add --chat-id C… --user-id U…`)。
 - `/slack-bridge:notify`:agent 主动 @你 推送需要你拍板的事(Block Kit;正文 markdown)。
+- 发文件:`python3 …/bin/sendfilectl.py --path /abs/file [--title …] [--comment …]` 把本机文件上传并分享到本 session
+  绑定的会话(同款门控;20MB 上限;见 `skills/bridge/SKILL.md`「发文件」)。
 - `/slack-bridge:bridge unbind` 立即解绑(敏感操作前的逃生门);随时可 rebind。
 
 手动运维命令(任意 cwd):
@@ -127,6 +129,7 @@ python3 …/bridgectl.py probe --chat-id C0TESTCHAN --write-config
 | `bridgectl probe/doctor --chat-id C…` | 能力探测 / + daemon 健康 |
 | `bridgectl allow list\|add\|remove --chat-id C… --user-id U…` | 成员直投白名单(chat+user 双精确匹配) |
 | `notifyctl < body.md` | 给本 session 绑定会话发 @owner 通知(见 `skills/notify/SKILL.md`) |
+| `sendfilectl --path /abs/file [--title …] [--comment …]` | 把本机文件上传并分享到本 session 绑定会话(`files.getUploadURLExternal` → 上传 → `files.completeUploadExternal`;同款门控) |
 
 ## 数据目录与文件
 

@@ -10,7 +10,7 @@
       "name": "slack-bridge",
       "description": "把本地 Claude Code session 与一个 Slack 会话(频道或 owner DM)一一绑定的 build-in-public 桥:频道内 @bot 的消息投递进 session,每轮最终输出自动转发回去;owner 消息直投,其他成员消息由 owner 点按钮审批。",
       "source": "./",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "category": "productivity",
       "tags": ["slack", "bridge", "build-in-public", "messaging"],
       "homepage": "https://github.com/yilunzhang/claude-code-slack-bridge",
